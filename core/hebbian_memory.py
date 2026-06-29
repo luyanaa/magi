@@ -27,23 +27,23 @@ class OjaUpdate(nn.Module):
     This keeps the weight matrix symmetric and with spectral radius <= 1/eta.
     """
 
-    def __init__(self, hidden_dim: int = 2048, eta: float = 0.01):
+    def __init__(self, hidden_dim: int = 1024, eta: float = 0.01):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.eta = eta
 
     def forward(
         self,
-        W: torch.Tensor,
         pre: torch.Tensor,
+        W: torch.Tensor,
         post: torch.Tensor,
     ) -> torch.Tensor:
         """
         Apply Oja's rule to update weight matrix.
 
         Args:
-            W: (d, d) current weight matrix
             pre: (B, d) pre-synaptic activations
+            W: (d, d) current weight matrix
             post: (B, d) post-synaptic activations (or target)
         Returns:
             (d, d) updated weight matrix
@@ -54,12 +54,10 @@ class OjaUpdate(nn.Module):
         if W.shape != (d, d):
             W = W.reshape(d, d)
 
-        outer = torch.matmul(post.t(), pre)
-        W_change = self.eta * (outer / B)
-
         post_pred = torch.matmul(W, pre.t()).t()
-        correction = torch.matmul((post - post_pred).t(), post) / B
-        W_change = W_change - self.eta * correction
+        outer = torch.matmul(post_pred.t(), pre) / B
+        y_sq = torch.matmul(post_pred.t(), post_pred) / B
+        W_change = self.eta * (outer - torch.matmul(y_sq, W))
 
         W_new = W + W_change
         return W_new
@@ -75,7 +73,7 @@ class SpectralNormalizedHebbianWeight(nn.Module):
 
     def __init__(
         self,
-        dim: int = 2048,
+        dim: int = 1024,
         eta_oja: float = 0.01,
         spectral_bound: float = 0.99,
         use_orthogonal_init: bool = True,
@@ -152,7 +150,7 @@ class HebbianAssociativeMemory(nn.Module):
 
     def __init__(
         self,
-        hidden_dim: int = 2048,
+        hidden_dim: int = 1024,
         memory_dim: int = 512,
         eta_oja: float = 0.01,
         spectral_bound: float = 0.95,
@@ -169,11 +167,16 @@ class HebbianAssociativeMemory(nn.Module):
             spectral_bound=spectral_bound,
         )
 
-        self.kda_state = None
+        self.kda_state = None  # Not a buffer: variable batch dim, reset per phase
+        self._kda_state_shape = (1, hidden_dim)
 
         self.query_proj = nn.Linear(hidden_dim, memory_dim)
         self.key_proj = nn.Linear(hidden_dim, memory_dim)
         self.value_proj = nn.Linear(hidden_dim, hidden_dim)
+
+    def reset_kda(self):
+        """Reset KDA state at sequence/phase boundaries."""
+        self.kda_state = None
 
     def update_kda_state(self, z: torch.Tensor):
         """Update KDA state with exponential decay. Stored in FP32."""
@@ -253,7 +256,7 @@ class EngramLandscape(nn.Module):
 
     def __init__(
         self,
-        hidden_dim: int = 2048,
+        hidden_dim: int = 1024,
         num_attractors: int = 1024,
         attractor_dim: int = 64,
     ):
@@ -302,7 +305,12 @@ class EngramLandscape(nn.Module):
         return force
 
     def consolidate(self):
-        """Consolidate high-frequency traces into new attractors if needed."""
+        """Consolidate high-frequency traces into new attractors.
+        
+        TODO: Implement attractor creation from accumulated traces.
+        Currently a no-op — medium-term memory consolidation is a future feature
+        (see plan §2.4, Engram Landscape).
+        """
         if len(self.recent_traces) >= self.accumulation_threshold:
             pass
 
@@ -333,7 +341,7 @@ class StructuralPlasticity(nn.Module):
             requires_grad=False,
         )
 
-        self.step_counter = 0
+        self.register_buffer("step_counter", torch.tensor(0, dtype=torch.long))
 
     def update_co_activation(self, expert_indices: torch.Tensor):
         """
@@ -342,13 +350,14 @@ class StructuralPlasticity(nn.Module):
         Args:
             expert_indices: (B, top_k) selected expert indices per sample
         """
-        B = expert_indices.shape[0]
-        for b in range(B):
-            for i in range(expert_indices.shape[1]):
-                for j in range(expert_indices.shape[1]):
-                    e_i = expert_indices[b, i].item()
-                    e_j = expert_indices[b, j].item()
-                    self.co_activation_stats[e_i, e_j] += 1
+        flat_indices = expert_indices.reshape(-1)
+        num_elements = flat_indices.shape[0]
+        coo_i = flat_indices.unsqueeze(1).expand(-1, num_elements).reshape(-1)
+        coo_j = flat_indices.unsqueeze(0).expand(num_elements, -1).reshape(-1)
+        self.co_activation_stats.index_put_(
+            (coo_i, coo_j), torch.ones(coo_i.shape[0], device=coo_i.device, dtype=self.co_activation_stats.dtype),
+            accumulate=True,
+        )
 
     def restructure_connectivity(self):
         """
@@ -384,9 +393,9 @@ class StructuralPlasticity(nn.Module):
         if expert_indices is not None:
             self.update_co_activation(expert_indices)
 
-        self.step_counter += 1
+        self.step_counter.data += 1
 
-        if self.step_counter % self.update_interval == 0:
+        if self.step_counter.item() % self.update_interval == 0:
             self.restructure_connectivity()
 
         return {
@@ -407,7 +416,7 @@ class HippocampalIndex(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         time_dim: int = 64,
         num_phi: int = 8,
     ):
@@ -425,9 +434,8 @@ class HippocampalIndex(nn.Module):
         self.phase_vectors = nn.Parameter(
             torch.randn(num_phi, time_dim) * 0.1
         )
-        self.frequency_bands = nn.Parameter(
-            torch.tensor([1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0])
-        )
+        freq_bands = torch.tensor([1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0])
+        self.register_buffer("frequency_bands", freq_bands)
 
     def encode_time(self, t: torch.Tensor) -> torch.Tensor:
         """
@@ -480,14 +488,14 @@ class HippocampalIndex(nn.Module):
 if __name__ == "__main__":
     print("Testing Hebbian Memory components...")
 
-    ham = HebbianAssociativeMemory(hidden_dim=2048)
+    ham = HebbianAssociativeMemory(hidden_dim= 1024)
     z = torch.randn(4, 2048)
     out = ham(z, update=True)
     print(f"  z_augmented shape: {out['z_augmented'].shape}")
     print(f"  hebbian_output norm: {out['hebbian_output'].norm().item():.4f}")
 
     print("\nTesting EngramLandscape...")
-    engram = EngramLandscape(hidden_dim=2048, num_attractors=1024)
+    engram = EngramLandscape(hidden_dim= 1024, num_attractors=1024)
     force = engram.compute_attractor_force(z)
     print(f"  attractor force shape: {force.shape}")
 
@@ -498,7 +506,7 @@ if __name__ == "__main__":
     print(f"  connectivity shape: {out_struct['connectivity'].shape}")
 
     print("\nTesting HippocampalIndex...")
-    hippo = HippocampalIndex(latent_dim=2048, time_dim=64)
+    hippo = HippocampalIndex(latent_dim= 1024, time_dim=64)
     t = torch.tensor([0.0, 0.5, 1.0, 1.5])
     out_hippo = hippo(z, t)
     print(f"  z_indexed shape: {out_hippo['z_indexed'].shape}")

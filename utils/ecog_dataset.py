@@ -355,12 +355,11 @@ class ECoGDataset(Dataset):
                 channel_info = self._extract_channel_info(raw)
             
             # Preprocess
-            data, channel_info = preprocess_ecog(
+            raw, coords, channel_types = preprocess_ecog(
                 raw=raw,
-                channel_info=channel_info,
-                target_sfreq=self.sample_rate,
-                max_channels=self.max_channels,
+                target_srate=self.sample_rate,
             )
+            channel_info = {"coords": coords, "types": channel_types}
             
             # Extract MNI coordinates if available
             mni_coords = None
@@ -378,7 +377,7 @@ class ECoGDataset(Dataset):
                 channel_names.append(ch_name)
                 
                 # Map channel type
-                ctype = map_channel_type(ch_info)
+                ctype = map_channel_type(ch_info.get('kind', 'unknown'))
                 channel_types.append(ctype)
             
             # Prepare metadata

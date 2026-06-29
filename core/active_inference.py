@@ -16,6 +16,12 @@ import torch.nn.functional as F
 from typing import Optional, Dict, Tuple
 import math
 
+from ..utils.device_utils import get_device as _get_device
+
+
+def _resolve_device():
+    return _get_device()
+
 
 class ValueFunction(nn.Module):
     """
@@ -34,7 +40,7 @@ class ValueFunction(nn.Module):
 
     def __init__(
         self,
-        hidden_dim: int = 2048,
+        hidden_dim: int = 1024,
         energy_entropy_net: Optional[nn.Module] = None,
     ):
         super().__init__()
@@ -141,7 +147,7 @@ class EfferenceCopy(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         hidden_dim: int = 512,
     ):
         super().__init__()
@@ -221,7 +227,7 @@ class SmithPredictor(nn.Module):
 
     def __init__(
         self,
-        hidden_dim: int = 2048,
+        hidden_dim: int = 1024,
         tau_delay: float = 0.5,
         prediction_horizon: int = 5,
         oscillation_tolerant: bool = True,
@@ -414,7 +420,7 @@ class PrecisionGate(nn.Module):
 
     def __init__(
         self,
-        hidden_dim: int = 2048,
+        hidden_dim: int = 1024,
         delay_dim: int = 64,
         action_dim: int = 64,
     ):
@@ -502,7 +508,7 @@ class ClosedLoopFeedback(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         tau_delay: float = 0.5,
         feedback_strength: float = 0.1,
     ):
@@ -518,7 +524,7 @@ class ClosedLoopFeedback(nn.Module):
             tau_delay=tau_delay,
         )
 
-        self.precision_gate = PrecisionGate(latent_dim=latent_dim)
+        self.precision_gate = PrecisionGate(hidden_dim=latent_dim)
 
         self.feedback_fusion = nn.Sequential(
             nn.Linear(latent_dim * 2, latent_dim),
@@ -652,7 +658,7 @@ class ActiveInferenceController(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         use_counterfactual: bool = True,
         use_feedback: bool = True,
         tau_delay: float = 0.5,
@@ -774,7 +780,7 @@ if __name__ == "__main__":
     print("Testing Active Inference components...")
 
     B, D = 2, 2048
-    device = torch.device("cpu")
+    device = _resolve_device()
 
     print("\n1. Testing ValueFunction...")
     from .velocity_brain import EnergyEntropyFields
@@ -805,7 +811,7 @@ if __name__ == "__main__":
     print(f"  stability_loss: {stability_loss.item():.4f}")
 
     print("\n4. Testing PrecisionGate...")
-    pg = PrecisionGate(latent_dim=D)
+    pg = PrecisionGate(hidden_dim=D)
     delay = torch.full((B,), 0.5)
     action = torch.randn(B, D)
     precision, p_metrics = pg(delay, action)

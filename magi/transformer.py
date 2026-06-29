@@ -456,8 +456,9 @@ class MultiHeadAttention(nn.Module):
         col_idx = torch.cat(col_indices)
         
         # Create sparse-like mask with batch dimension
-        mask = torch.zeros(1, L, L, device=device, dtype=torch.float)
-        mask[0, row_idx, col_idx] = float("-inf")
+        # Start with all-masked, then unmask positions within the sliding window
+        mask = torch.full((1, L, L), float("-inf"), device=device, dtype=torch.float)
+        mask[0, row_idx, col_idx] = 0.0
         
         # Handle global tokens: global tokens can attend to all positions
         if global_tokens_mask is not None:

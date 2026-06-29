@@ -25,7 +25,7 @@ class EEGDecoder(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         hidden_dim: int = 768,
         output_channels: int = 19,
         patch_size_time: int = 256,
@@ -77,7 +77,7 @@ class fMRIDecoder(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         hidden_dim: int = 768,
         num_regions: int = 400,
         time_patches: int = 20,
@@ -119,6 +119,49 @@ class fMRIDecoder(nn.Module):
         return out
 
 
+class MEGDecoder(nn.Module):
+    """
+    MEG decoder from latent state.
+
+    Similar to EEG decoder but typically reconstructs more channels
+    (e.g. 306 Neuromag sensors).
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 1024,
+        hidden_dim: int = 768,
+        output_channels: int = 306,
+        patch_size_time: int = 256,
+        num_layers: int = 2,
+    ):
+        super().__init__()
+        self.output_channels = output_channels
+        self.patch_size_time = patch_size_time
+
+        layers = []
+        prev_dim = latent_dim
+        for i in range(num_layers):
+            next_dim = hidden_dim if i < num_layers - 1 else hidden_dim
+            layers.extend([
+                nn.Linear(prev_dim, next_dim),
+                nn.LayerNorm(next_dim),
+                nn.GELU(),
+                nn.Dropout(0.1),
+            ])
+            prev_dim = next_dim
+
+        self.decoder = nn.Sequential(*layers)
+        self.channel_proj = nn.Linear(hidden_dim, output_channels * patch_size_time)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        B = z.shape[0]
+        h = self.decoder(z)
+        out = self.channel_proj(h)
+        out = out.view(B, self.output_channels, self.patch_size_time)
+        return out
+
+
 class ModalityDecoderRouter(nn.Module):
     """
     Routes latent state to correct modality decoder based on Hub Token identity.
@@ -130,15 +173,19 @@ class ModalityDecoderRouter(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         eeg_hidden: int = 768,
         fmri_hidden: int = 768,
+        meg_hidden: int = 768,
         output_channels: int = 19,
         num_regions: int = 400,
+        meg_channels: int = 306,
         patch_size_time: int = 256,
         time_patches: int = 20,
+        use_meg: bool = False,
     ):
         super().__init__()
+        self.use_meg = use_meg
         self.eeg_decoder = EEGDecoder(
             latent_dim=latent_dim,
             hidden_dim=eeg_hidden,
@@ -151,9 +198,22 @@ class ModalityDecoderRouter(nn.Module):
             num_regions=num_regions,
             time_patches=time_patches,
         )
+        if use_meg:
+            self.meg_decoder = MEGDecoder(
+                latent_dim=latent_dim,
+                hidden_dim=meg_hidden,
+                output_channels=meg_channels,
+                patch_size_time=patch_size_time,
+            )
+            gate_in = latent_dim * 3
+            gate_out = 3
+        else:
+            self.meg_decoder = None
+            gate_in = latent_dim * 2
+            gate_out = 2
 
         self.gate = nn.Sequential(
-            nn.Linear(latent_dim * 2, 2),
+            nn.Linear(gate_in, gate_out),
             nn.Softmax(dim=-1),
         )
 
@@ -162,6 +222,7 @@ class ModalityDecoderRouter(nn.Module):
         z: torch.Tensor,
         hub_eeg: torch.Tensor,
         hub_fmri: torch.Tensor,
+        hub_meg: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Generate modality-specific decodings from shared latent state.
@@ -170,24 +231,33 @@ class ModalityDecoderRouter(nn.Module):
             z: (B, latent_dim) latent state at t+1
             hub_eeg: (B, latent_dim) EEG hub token
             hub_fmri: (B, latent_dim) fMRI hub token
+            hub_meg: (B, latent_dim) optional MEG hub token
         Returns:
-            dict with 'eeg_recon' and 'fmri_recon'
+            dict with 'eeg_recon', 'fmri_recon', and optionally 'meg_recon'
         """
         eeg_out = self.eeg_decoder(z)
         fmri_out = self.fmri_decoder(z)
-
-        gate_weights = self.gate(torch.cat([hub_eeg, hub_fmri], dim=-1))
-
-        weighted_eeg = eeg_out * gate_weights[:, 0:1].unsqueeze(-1)
-        weighted_fmri = fmri_out * gate_weights[:, 1:2].unsqueeze(-1)
-
-        return {
+        out = {
             "eeg_recon": eeg_out,
             "fmri_recon": fmri_out,
-            "weighted_eeg": weighted_eeg,
-            "weighted_fmri": weighted_fmri,
-            "gate_weights": gate_weights,
         }
+
+        gate_input = [hub_eeg, hub_fmri]
+        if self.use_meg and hub_meg is not None and self.meg_decoder is not None:
+            meg_out = self.meg_decoder(z)
+            out["meg_recon"] = meg_out
+            gate_input.append(hub_meg)
+
+        gate_weights = self.gate(torch.cat(gate_input, dim=-1))
+        out["gate_weights"] = gate_weights
+
+        weighted_eeg = eeg_out * gate_weights[:, 0:1].unsqueeze(-1)
+        out["weighted_eeg"] = weighted_eeg
+        out["weighted_fmri"] = fmri_out * gate_weights[:, 1:2].unsqueeze(-1)
+        if self.use_meg and gate_weights.shape[-1] == 3:
+            out["weighted_meg"] = out["meg_recon"] * gate_weights[:, 2:3].unsqueeze(-1)
+
+        return out
 
 
 if __name__ == "__main__":

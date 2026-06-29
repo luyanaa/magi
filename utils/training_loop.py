@@ -22,6 +22,11 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from .device_utils import (
+    get_device, get_device_type, move_to_device,
+    autocast_context, grad_scaler, set_device as set_accelerator_device,
+)
+
 try:
     import deepspeed
     from deepspeed import DeepSpeedConfig
@@ -160,7 +165,13 @@ def setup_distributed():
     - Multi-node (WORLD_SIZE, RANK, MASTER_ADDR, MASTER_PORT)
     """
     if not dist.is_initialized():
-        backend = "nccl"
+        device_type = get_device_type()
+        if device_type == "cuda":
+            backend = "nccl"
+        elif device_type == "xpu":
+            backend = "ccl"
+        else:
+            backend = "gloo"
 
         if "WORLD_SIZE" in os.environ:
             world_size = int(os.environ["WORLD_SIZE"])
@@ -178,7 +189,7 @@ def setup_distributed():
             world_size = dist.get_world_size()
             rank = dist.get_rank()
 
-        torch.cuda.set_device(local_rank)
+        set_accelerator_device(local_rank)
         return local_rank, rank, world_size
     return int(os.environ.get("LOCAL_RANK", 0)), dist.get_rank(), dist.get_world_size()
 
@@ -225,7 +236,8 @@ class BrainMoETrainer:
         self.local_rank, self.rank, self.world_size = setup_distributed()
         self.is_main_process = self.rank == 0
 
-        self.model = self.model.cuda()
+        self.device = get_device(index=self.local_rank)
+        self.model = move_to_device(self.model, self.device)
 
         self.ds_engine = None
         self.ds_config = None
@@ -245,13 +257,29 @@ class BrainMoETrainer:
             self.ds_config = None
             self.model = DDP(self.model, device_ids=[self.local_rank])
             self.optimizer = None
-            self.scaler = torch.cuda.amp.GradScaler(enabled=True)
+            self.scaler = grad_scaler(self.device, enabled=True)
 
         self.logger = MetricsLogger(log_dir) if self.is_main_process else None
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
 
-        self.stability = StabilityController(hidden_dim=2048, device=f"cuda:{self.local_rank}")
+        self._train_sampler = None
+        self._val_sampler = None
+        if self.world_size > 1:
+            from torch.utils.data.distributed import DistributedSampler
+            if self.train_dataloader is not None and hasattr(self.train_dataloader, "sampler"):
+                self._train_sampler = self.train_dataloader.sampler
+            if self.val_dataloader is not None and hasattr(self.val_dataloader, "sampler"):
+                self._val_sampler = self.val_dataloader.sampler
+            if self._train_sampler is not None and isinstance(self._train_sampler, DistributedSampler):
+                print(f"[Dist] Train DistributedSampler auto-detected ({self._train_sampler.num_replicas} replicas)")
+            elif self._train_sampler is not None:
+                print(f"[Dist] Train sampler is not DistributedSampler ({type(self._train_sampler).__name__}) — data may be duplicated across ranks")
+
+        self._epoch = 0
+        self._dataloader_iter = None
+
+        self.stability = StabilityController(hidden_dim=1024, device=str(self.device))
         self.rollback = AutoRollback(checkpoint_dir=str(self.checkpoint_dir))
         self.rollback_trigger_count = 0
 
@@ -273,6 +301,23 @@ class BrainMoETrainer:
         self.total_loss = TotalLoss(loss_weights=LossWeights())
         self._loss_weights_cache = None
 
+        # Auto-create validation dataloader if data dirs provided
+        if val_dataloader is None and train_dataloader is not None:
+            val_ratio = config.get("validation_ratio", 0.05)
+            if hasattr(train_dataloader.dataset, "split"):
+                train_dataloader.dataset.split(val_ratio)
+            self.val_dataloader = val_dataloader
+
+        # Wire DataMixer for progressive task mixing
+        if self.train_dataloader is not None and not hasattr(self.train_dataloader, "mixer"):
+            from .data_loader import DataMixer
+            try:
+                self.train_dataloader.mixer = DataMixer(
+                    resting_loader=self.train_dataloader,
+                )
+            except Exception:
+                pass
+
         # Early stopping for validation
         self.early_stopper = None
 
@@ -282,15 +327,15 @@ class BrainMoETrainer:
             return config
         config_bytes = json.dumps(config).encode()
         if self.is_main_process:
-            broadcast_tensor = torch.tensor([len(config_bytes)], dtype=torch.long).cuda()
+            broadcast_tensor = torch.tensor([len(config_bytes)], dtype=torch.long, device=self.device)
         else:
-            broadcast_tensor = torch.zeros(1, dtype=torch.long).cuda()
+            broadcast_tensor = torch.zeros(1, dtype=torch.long, device=self.device)
         dist.broadcast(broadcast_tensor, src=0)
         config_len = broadcast_tensor.item()
         if self.is_main_process:
-            config_tensor = torch.from_buffer(bytearray(config_bytes), dtype=torch.uint8).cuda()
+            config_tensor = torch.from_buffer(bytearray(config_bytes), dtype=torch.uint8).to(self.device)
         else:
-            config_tensor = torch.zeros(config_len, dtype=torch.uint8).cuda()
+            config_tensor = torch.zeros(config_len, dtype=torch.uint8, device=self.device)
         dist.broadcast(config_tensor, src=0)
         return json.loads(config_tensor.cpu().tobytes().decode())
 
@@ -388,9 +433,13 @@ class BrainMoETrainer:
                 print("[Warning] Adafactor not available, using AdamW")
                 self.optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
         else:
-            self.optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
+            fused_available = hasattr(torch.optim.AdamW, "__init__") and hasattr(torch.optim.AdamW, "__doc__")
+            try:
+                self.optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay, fused=True)
+            except (TypeError, RuntimeError):
+                self.optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
 
-        self.scaler = torch.cuda.amp.GradScaler(enabled=True)
+        self.scaler = grad_scaler(self.device, enabled=True)
         self._grad_clip = grad_clip
 
     def transition_optimizer(
@@ -420,7 +469,7 @@ class BrainMoETrainer:
             weight_decay: Weight decay for new optimizer
             gradual_transition_steps: Steps for linear LR ramp from old_lr to new_lr
         """
-        old_lr = self.config.get("learning_rate", 3e-5)
+        old_lr = self.optimizer.param_groups[0]["lr"] if self.optimizer is not None else self.config.get("learning_rate", 3e-5)
         print(f"[OPTIMIZER] Transitioning {self.config.get('optimizer','adamw')} -> {new_optimizer_type}")
         print(f"[OPTIMIZER] LR: {old_lr} -> {new_lr} over {gradual_transition_steps} steps")
         print(f"[OPTIMIZER] Params frozen for {freeze_warmup_steps} steps")
@@ -475,7 +524,7 @@ class BrainMoETrainer:
         return converted
 
     def save_checkpoint(self, step: int, phase: str, filename: Optional[str] = None):
-        """Save model checkpoint."""
+        """Save world-size-aware checkpoint for elastic recovery."""
         if not self.is_main_process:
             return
 
@@ -485,7 +534,6 @@ class BrainMoETrainer:
         path = self.checkpoint_dir / filename
 
         if self.ds_engine is not None:
-            # DeepSpeed save: convert selective FP32 then save via standard API
             state_dict = self._convert_selective_fp32(
                 self.ds_engine.module.state_dict()
             )
@@ -498,17 +546,38 @@ class BrainMoETrainer:
             "step": step,
             "phase": phase,
             "model_state": state_dict,
+            "world_size": self.world_size,
+            "local_rank": self.local_rank,
+            "global_rank": self.rank,
         }
 
-        if self.optimizer is not None:
+        if self.optimizer is not None and self.ds_engine is None:
             state["optimizer_state"] = self.optimizer.state_dict()
 
         torch.save(state, path)
-        print(f"Checkpoint saved: {path}")
+        if self.is_main_process:
+            print(f"Checkpoint saved: {path} (world_size={self.world_size}, step={step})")
+
+        # DeepSpeed engine checkpoint for full optimizer+lr scheduler state
+        if self.ds_engine is not None:
+            ds_path = self.checkpoint_dir / f"{filename.replace('.pt', '')}_ds"
+            try:
+                self.ds_engine.save_checkpoint(str(ds_path))
+                if self.is_main_process:
+                    print(f"DeepSpeed checkpoint saved: {ds_path}")
+            except Exception as e:
+                if self.is_main_process:
+                    print(f"DeepSpeed checkpoint save failed (non-fatal): {e}")
 
     def load_checkpoint(self, path: str) -> Tuple[int, str]:
-        """Load model checkpoint."""
-        checkpoint = torch.load(path, map_location=f"cuda:{self.local_rank}")
+        """Load model checkpoint with world-size-aware handling."""
+        checkpoint = torch.load(path, map_location=str(self.device))
+
+        saved_world_size = checkpoint.get("world_size", self.world_size)
+        if saved_world_size != self.world_size:
+            if self.is_main_process:
+                print(f"[Elastic] World size changed: {saved_world_size} → {self.world_size}. "
+                      f"Checkpoint was saved on {saved_world_size} ranks, now running on {self.world_size}.")
 
         model = self.ds_engine if self.ds_engine is not None else self.model
         try:
@@ -517,11 +586,19 @@ class BrainMoETrainer:
             ckpt = checkpoint["model_state"]
             model_dict = model.state_dict()
             converted = {}
+            skipped = 0
             for k, v in ckpt.items():
-                if k in model_dict and v.dtype != model_dict[k].dtype:
-                    converted[k] = v.to(model_dict[k].dtype)
-                else:
-                    converted[k] = v
+                if k in model_dict:
+                    if v.dtype != model_dict[k].dtype:
+                        converted[k] = v.to(model_dict[k].dtype)
+                    elif v.shape != model_dict[k].shape:
+                        if self.is_main_process:
+                            print(f"[Elastic] Skipping key {k}: shape mismatch {v.shape} vs {model_dict[k].shape}")
+                        skipped += 1
+                    else:
+                        converted[k] = v
+            if self.is_main_process and skipped > 0:
+                print(f"[Elastic] Skipped {skipped} keys due to shape mismatch")
             model.load_state_dict(converted)
 
         if self.optimizer is not None and "optimizer_state" in checkpoint:
@@ -536,29 +613,46 @@ class BrainMoETrainer:
             batch = self.train_dataloader.mixer.next_batch(step, total_steps)
             eeg = batch.get("eeg", batch.get("eeg_data"))
             fmri = batch.get("fmri", batch.get("fmri_data"))
+            meg = batch.get("meg", batch.get("meg_data"))
             if eeg is not None and fmri is not None:
-                return eeg.cuda(), fmri.cuda()
+                result = [move_to_device(eeg, self.device), move_to_device(fmri, self.device)]
+                if meg is not None:
+                    result.append(move_to_device(meg, self.device))
+                return tuple(result)
 
         if self.train_dataloader is not None:
+            if self._dataloader_iter is None:
+                self._dataloader_iter = iter(self.train_dataloader)
             try:
                 batch = next(self._dataloader_iter)
-            except (StopIteration, AttributeError):
+            except StopIteration:
+                if self._train_sampler is not None:
+                    self._epoch += 1
+                    self._train_sampler.set_epoch(self._epoch)
                 self._dataloader_iter = iter(self.train_dataloader)
                 batch = next(self._dataloader_iter)
+            except AttributeError:
+                self._dataloader_iter = iter(self.train_dataloader)
+                try:
+                    batch = next(self._dataloader_iter)
+                except StopIteration:
+                    return self._generate_dummy_batch(batch_size)
+
             eeg = batch.get("eeg", batch.get("eeg_data"))
             fmri = batch.get("fmri", batch.get("fmri_data"))
+            meg = batch.get("meg", batch.get("meg_data"))
             if eeg is None or fmri is None:
-                # Fallback to dummy if batch format unexpected
-                eeg = torch.randn(batch_size, 19, 2560).cuda()
-                fmri = torch.randn(batch_size, 400, 100).cuda()
+                eeg = torch.randn(batch_size, 19, 2560, device=self.device)
+                fmri = torch.randn(batch_size, 400, 100, device=self.device)
             else:
-                eeg = eeg.cuda()
-                fmri = fmri.cuda()
-            return eeg, fmri
-        else:
-            dummy_eeg = torch.randn(batch_size, 19, 2560).cuda()
-            dummy_fmri = torch.randn(batch_size, 400, 100).cuda()
-            return dummy_eeg, dummy_fmri
+                eeg = move_to_device(eeg, self.device)
+                fmri = move_to_device(fmri, self.device)
+            result = [eeg, fmri]
+            if meg is not None:
+                result.append(move_to_device(meg, self.device))
+            return tuple(result)
+
+        return self._generate_dummy_batch(batch_size)
 
     def train_phase(self, phase_config: Dict, start_step: int = 0):
         """Train for one phase."""
@@ -569,6 +663,13 @@ class BrainMoETrainer:
         gradient_accumulation = phase_config.get("gradient_accumulation", 1)
         base_lr = phase_config.get("learning_rate", 3e-5)
         min_lr = phase_config.get("min_lr", 1e-6)
+
+        # Update loss weights for this phase
+        phase_loss_weights = phase_config.get("loss_weights", None)
+        if phase_loss_weights is not None:
+            self.total_loss.loss_weights = phase_loss_weights
+        elif phase_name != "Magi EEG Encoder Pretraining":
+            print(f"[WARNING] Phase '{phase_name}' has no loss_weights; using defaults")
 
         use_deepspeed = self.ds_engine is not None
 
@@ -590,7 +691,41 @@ class BrainMoETrainer:
         self._current_optimizer_type = phase_config.get("optimizer", "adamw")
 
         model = self.ds_engine if use_deepspeed else self.model
+
+        router_tau = phase_config.get("router_tau", None)
+        if router_tau is not None:
+            tgt = model.module if hasattr(model, "module") else model
+            if hasattr(tgt, "moe_velocity") and hasattr(tgt.moe_velocity, "set_router_tau"):
+                tgt.moe_velocity.set_router_tau(router_tau)
+                if self.is_main_process:
+                    print(f"[ROUTER] tau set to {router_tau}")
+
+        imagination_interval = phase_config.get("imagination_interval", 0)
+        if imagination_interval > 0:
+            tgt = model.module if hasattr(model, "module") else model
+            if hasattr(tgt, "use_imagination") and not getattr(tgt, "use_imagination", False):
+                tgt.use_imagination = True
+                if tgt.imagination_sampler is None:
+                    from brain_moe_pinn.core.counterfactual_search import (
+                        CounterfactualTreeSearch, ImaginationSampler,
+                    )
+                    tgt.counterfactual_search = CounterfactualTreeSearch(
+                        latent_dim=tgt.latent_dim, num_goals=2,
+                        num_exploration=1, rollout_steps=3, branch_factor=4,
+                    ).to(self.device)
+                    tgt.imagination_sampler = ImaginationSampler(
+                        latent_dim=tgt.latent_dim,
+                    ).to(self.device)
+                if self.is_main_process:
+                    print(f"[IMAGINATION] Enabled with interval={imagination_interval}")
+
         model.train()
+
+        if self._train_sampler is not None:
+            phase_epoch = start_step // max(1, total_steps) if total_steps > 0 else 0
+            self._train_sampler.set_epoch(phase_epoch)
+            if self.rank == 0:
+                print(f"[Dist] Train sampler epoch={phase_epoch}")
 
         # Reset SSM router state at the start of each phase
         target = model.module if hasattr(model, "module") else model
@@ -651,9 +786,9 @@ class BrainMoETrainer:
             target = model.module if hasattr(model, "module") else model
             q_report = self.q_factor_monitor.get_report()
             ac_report = self.ataxia_catalepsy_monitor.get_report()
-            target._wiener_q_factor = q_report.get("q_factor_current", float("nan"))
-            target._wiener_ataxia = ac_report.get("ataxia_current", float("nan"))
-            target._wiener_catalepsy = ac_report.get("catalepsy_current", float("nan"))
+            target._wiener_q_factor = q_report.get("q_factor_current", 1.0)
+            target._wiener_ataxia = ac_report.get("ataxia_current", 0.0)
+            target._wiener_catalepsy = ac_report.get("catalepsy_current", 0.0)
 
             # Pre-compute expected decoder output shape for active inference.
             # EEG encoder uses patch_size=256, stride=128.
@@ -664,12 +799,23 @@ class BrainMoETrainer:
             # timestep (t+1), not the current input (t). The dataloader must
             # return paired sequences for causal active-inference feedback.
 
+            imagination_interval = phase_config.get("imagination_interval", 0)
+            if imagination_interval > 0:
+                tgt_model = model.module if hasattr(model, "module") else model
+                is_imag_step = step % imagination_interval == 0 and step > 0
+                if hasattr(tgt_model, "_imagination_active"):
+                    tgt_model._imagination_active = is_imag_step
+
+            step_metrics = {}
+            if imagination_interval > 0 and is_imag_step:
+                step_metrics["imagination_step"] = 1.0
+
             if use_deepspeed:
                 outputs = model(
                     dummy_eeg, dummy_fmri,
                     actual_eeg=actual_eeg_slice,
                     actual_fmri=dummy_fmri,
-                    action=torch.randn(batch_size, 2048, device=dummy_eeg.device),
+                    action=None,
                 )
                 # Build targets at correct resolution
                 eeg_target = actual_eeg_slice
@@ -678,19 +824,26 @@ class BrainMoETrainer:
                 model.backward(total_loss)
                 model.step()
             else:
-                with torch.cuda.amp.autocast(enabled=True):
+                is_accum_boundary = (micro_step_count + 1) % gradient_accumulation == 0
+                sync_context = self.model.no_sync() if hasattr(self.model, "no_sync") and not is_accum_boundary else None
+
+                with autocast_context(self.device, enabled=True):
                     outputs = model(
                         dummy_eeg, dummy_fmri,
                         actual_eeg=actual_eeg_slice,
                         actual_fmri=dummy_fmri,
-                        action=torch.randn(batch_size, 2048, device=dummy_eeg.device),
+                        action=None,
                     )
                     eeg_target = actual_eeg_slice
                     targets = {"eeg": eeg_target, "fmri": dummy_fmri}
                     total_loss, loss_metrics = self.total_loss(outputs, targets)
                     total_loss = total_loss / gradient_accumulation
 
-                self.scaler.scale(total_loss).backward()
+                if sync_context is not None:
+                    with sync_context:
+                        self.scaler.scale(total_loss).backward()
+                else:
+                    self.scaler.scale(total_loss).backward()
                 micro_step_count += 1
 
                 if micro_step_count % gradient_accumulation == 0:
@@ -704,10 +857,13 @@ class BrainMoETrainer:
 
             accum_loss += total_loss.item() if hasattr(total_loss, "item") else float(total_loss)
 
+
             # L1: KDA state normalization every 64 steps
-            if step % 64 == 0 and hasattr(model, "kda_state_history") and model.kda_state_history is not None:
-                with torch.no_grad():
-                    model.kda_state_history = self.stability.apply_L1(model.kda_state_history)
+            if step % 64 == 0:
+                tgt = model.module if hasattr(model, "module") else model
+                if hasattr(tgt, "kda_state_history") and tgt.kda_state_history is not None:
+                    with torch.no_grad():
+                        tgt.kda_state_history = self.stability.apply_L1(tgt.kda_state_history)
 
             # L5: Hebbian spectral normalization every 100 steps
             if step % 100 == 0:
@@ -718,14 +874,12 @@ class BrainMoETrainer:
                 self._apply_router_orthogonalization(model)
 
             # Monitor metrics for auto-rollback
-            step_metrics = {
-                "total_loss": accum_loss,
-                "lr": lr,
-                "curriculum": curriculum_progress,
-            }
+            step_metrics["total_loss"] = accum_loss
+            step_metrics["lr"] = lr
+            step_metrics["curriculum"] = curriculum_progress
             # Extract router entropy if available
-            if "routing_metrics" in outputs and "router_entropy" in outputs["routing_metrics"]:
-                step_metrics["router_entropy"] = outputs["routing_metrics"]["router_entropy"]
+            if "moe_routing" in outputs and "router_entropy" in outputs["moe_routing"]:
+                step_metrics["router_entropy"] = outputs["moe_routing"]["router_entropy"]
 
             # Wiener Monitor #3: Q-factor (latent velocity FFT)
             if "delta_z" in outputs:
@@ -767,7 +921,7 @@ class BrainMoETrainer:
             # Wiener Homeostat (#5): adaptive noise regulation
             if self.wiener_homeostat is not None and "delta_z" in outputs:
                 # EPR proxy: ||v||^2 / D  (sum over hidden dim, mean over batch)
-                epr_proxy = (outputs["delta_z"] ** 2).sum(dim=-1).mean().item() / max(self.wiener_homeostat.D_eff, 1e-4)
+                epr_proxy = (outputs["delta_z"] ** 2).sum(dim=-1).mean().item() / max(self.wiener_homeostat.D_eff.item(), 1e-4)
                 router_entropy = step_metrics.get("router_entropy", 1.0)
                 hm_result = self.wiener_homeostat.update(epr_proxy, router_entropy)
                 step_metrics["D_eff"] = hm_result["D_eff"]
@@ -778,7 +932,7 @@ class BrainMoETrainer:
                     try:
                         tgt = model.module if hasattr(model, "module") else model
                         if hasattr(tgt, "velocity_brain") and hasattr(tgt.velocity_brain, "ou_noise"):
-                            tgt.velocity_brain.ou_noise.D = float(hm_result["D_eff"])
+                            tgt.velocity_brain.ou_noise.D.fill_(float(hm_result["D_eff"]))
                     except Exception:
                         pass
 
@@ -809,8 +963,13 @@ class BrainMoETrainer:
                 self.save_checkpoint(step, phase_name)
 
             if step % 10 == 0 and self.logger:
+                avg_loss = accum_loss / max(step - start_step + 1, 10)
+                if self.world_size > 1:
+                    loss_tensor = torch.tensor([avg_loss], device=self.device)
+                    dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+                    avg_loss = loss_tensor.item() / self.world_size
                 metrics = {
-                    "total_loss": accum_loss / min(step - start_step + 1, 10),
+                    "total_loss": avg_loss,
                     "lr": lr,
                     "curriculum": curriculum_progress,
                 }
@@ -933,19 +1092,21 @@ class BrainMoETrainer:
                 fmri = batch.get("fmri", batch.get("fmri_data"))
                 if eeg is None or fmri is None:
                     continue
-                eeg = eeg.cuda()
-                fmri = fmri.cuda()
+                eeg = move_to_device(eeg, self.device)
+                fmri = move_to_device(fmri, self.device)
 
                 outputs = model(eeg, fmri)
-                batch_loss = torch.nn.functional.mse_loss(
-                    outputs["eeg_recon"], eeg[:, :, :outputs["eeg_recon"].shape[-1]]
-                )
+                eeg_seq_len = eeg.shape[-1]
+                eeg_patches = max(1, (eeg_seq_len - 256) // 128 + 1) if eeg_seq_len >= 256 else 1
+                eeg_target = eeg[:, :, :eeg_patches]
+                targets = {"eeg": eeg_target, "fmri": fmri}
+                batch_loss, loss_metrics = self.total_loss(outputs, targets)
                 val_loss += batch_loss.item()
                 val_steps += 1
 
                 # Collect routing metrics if available
-                if "routing_metrics" in outputs:
-                    for k, v in outputs["routing_metrics"].items():
+                if "moe_routing" in outputs:
+                    for k, v in outputs["moe_routing"].items():
                         if k not in val_metrics:
                             val_metrics[k] = []
                         val_metrics[k].append(v)
@@ -1033,19 +1194,29 @@ class BrainMoETrainer:
         if self.is_main_process:
             print("\nTraining complete!")
 
+        cleanup_distributed()
+
+    def __del__(self):
+        """Ensure distributed cleanup on garbage collection."""
+        if dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
+
     def broadcast_object(self, obj):
         """Broadcast a Python object from rank 0 to all processes."""
         if self.world_size == 1:
             return obj
         if self.is_main_process:
             obj_bytes = json.dumps(obj).encode()
-            tensor = torch.frombuffer(bytearray(obj_bytes), dtype=torch.uint8).cuda()
-            count = torch.tensor([tensor.numel()], dtype=torch.long).cuda()
+            tensor = torch.frombuffer(bytearray(obj_bytes), dtype=torch.uint8).to(self.device)
+            count = torch.tensor([tensor.numel()], dtype=torch.long, device=self.device)
         else:
-            count = torch.zeros(1, dtype=torch.long).cuda()
+            count = torch.zeros(1, dtype=torch.long, device=self.device)
         dist.broadcast(count, src=0)
         if not self.is_main_process:
-            tensor = torch.zeros(count.item(), dtype=torch.uint8).cuda()
+            tensor = torch.zeros(count.item(), dtype=torch.uint8, device=self.device)
         dist.broadcast(tensor, src=0)
         return json.loads(tensor.cpu().tobytes().decode())
 

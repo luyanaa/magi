@@ -207,7 +207,7 @@ def main():
     parser.add_argument("--eeg_channels", type=int, default=64,
                         help="Number of EEG channels (default 64 for ECoG)")
     parser.add_argument("--fmri_regions", type=int, default=400)
-    parser.add_argument("--latent_dim", type=int, default=2048)
+    parser.add_argument("--latent_dim", type=int, default=1024)
     
     # Magi v2
     parser.add_argument("--use_magi_v2", action="store_true", default=True,
@@ -265,85 +265,67 @@ def main():
     # Set random seed
     torch.manual_seed(args.seed)
     
-    # Parse phases
+    # Parse phases - train_v2 uses the same parse function as train.py
     try:
-        phases = parse_phases(args.phase, args.use_moe_stage0)
+        from train import parse_phases as _parse_phases
+        phases = _parse_phases(args.phase)
     except ValueError as e:
         print(f"Error parsing phases: {e}")
         return 1
-    
+
     print(f"[train_v2] Running phases: {args.phase}")
     print(f"[train_v2] Using Magi v2: {args.use_magi_v2}")
     print(f"[train_v2] MoE Stage 0: {args.use_moe_stage0}")
     print(f"[train_v2] ECoG support: max_channels={args.max_channels}, scale={args.ecog_amplitude_scale}")
-    
-    # Check for DeepSpeed
-    if "deepspeed" in sys.modules or "deepspeed" in sys.argv[0]:
-        import deepspeed
-        print(f"[train_v2] DeepSpeed detected")
-    
+
     # Create directories
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    
+
+    # Create model
+    model, use_v2 = create_model(args, phase_config=phase_configs[0])
+
+    # Create trainer - match BrainMoETrainer.__init__ signature
+    ds_cfg = json.load(open(args.deepspeed_config)) if args.deepspeed_config else None
+    trainer = BrainMoETrainer(
+        model=model,
+        config=vars(args),
+        log_dir=args.log_dir,
+        checkpoint_dir=args.checkpoint_dir,
+        deepspeed_config=ds_cfg,
+    )
+
+    # Resume if specified
+    if args.resume and os.path.exists(args.resume):
+        print(f"[train_v2] Resuming from: {args.resume}")
+        trainer.load_checkpoint(args.resume)
+
     # Run each phase
     for phase_idx, phase_config in enumerate(phases):
         phase_name = phase_config.get("name", f"phase_{phase_idx}")
         print(f"\n{'='*60}")
         print(f"Starting phase: {phase_name}")
         print(f"{'='*60}")
-        
-        # Create model for this phase
-        model, use_v2 = create_model(args, phase_config)
-        
-        # Create trainer
-        trainer = BrainMoETrainer(
-            model=model,
-            phase_config=phase_config,
-            log_dir=Path(args.log_dir) / phase_name,
-            checkpoint_dir=Path(args.checkpoint_dir) / phase_name,
-            local_rank=args.local_rank,
-            deepspeed_config=args.deepspeed_config if args.deepspeed_config else None,
-            use_v2=use_v2,  # Pass v2 flag for context expansion
-        )
-        
-        # Resume if specified
-        if args.resume and os.path.exists(args.resume):
-            print(f"[train_v2] Resuming from: {args.resume}")
-            trainer.resume(args.resume)
-        
-        # Train phase
+
         try:
-            trainer.train_phase(max_epochs=args.epochs)
+            trainer.train_phase(phase_config)
         except KeyboardInterrupt:
             print(f"[train_v2] Phase {phase_name} interrupted")
-            # Save checkpoint before exit
-            checkpoint_path = trainer.save_checkpoint(f"interrupted_{phase_name}")
+            checkpoint_path = trainer.save_checkpoint(step=trainer._current_step if hasattr(trainer, '_current_step') else 0, phase=phase_name)
             print(f"[train_v2] Saved checkpoint: {checkpoint_path}")
             break
         except Exception as e:
             print(f"[train_v2] Error in phase {phase_name}: {e}")
             import traceback
             traceback.print_exc()
-            
-            # Try to save checkpoint on error
             try:
-                checkpoint_path = trainer.save_checkpoint(f"error_{phase_name}")
+                checkpoint_path = trainer.save_checkpoint(step=0, phase=f"error_{phase_name}")
                 print(f"[train_v2] Saved checkpoint after error: {checkpoint_path}")
-            except:
-                pass
-            
-            # Check if we should continue to next phase
-            if phase_config.get("continue_on_error", False):
-                print(f"[train_v2] Continuing to next phase despite error")
-                continue
-            else:
-                raise
-    
-    print(f"\n{'='*60}")
-    print(f"Training completed!")
-    print(f"{'='*60}")
-    
+            except Exception:
+                print(f"[train_v2] Could not save checkpoint after error")
+            break
+
+    print(f"[train_v2] Training complete")
     return 0
 
 

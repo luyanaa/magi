@@ -76,7 +76,7 @@ class BrainMoEPINNConfig:
         # Architecture
         eeg_hidden_dim: int = 1024,  # Magi v2: 1024 vs v1: 768
         eeg_num_layers: int = 24,    # Magi v2: 24 vs v1: 12
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         fmri_regions: int = 400,
         
         # Modality support
@@ -310,10 +310,9 @@ class BrainMoEPINNV2(nn.Module):
         """Initialize core dynamics modules."""
         self.moe_velocity = MoEVelocityField(
             hidden_dim=self.config.latent_dim,
-            num_core=self.config.moe_num_experts,
-            num_salience=2,
-            num_specialized=10,
-            top_k=self.config.moe_top_k,
+            num_shared=self.config.moe_num_experts,
+            num_routed=6,
+            top_k=3,
         )
         
         self.velocity_brain = VelocityBrain(
@@ -570,39 +569,38 @@ class BrainMoEPINNV2(nn.Module):
             if ai_out.get("corrected_z") is not None:
                 z_t = ai_out["corrected_z"]
                 # Re-decode after correction
-                if self.config.use_kda_decoder:
-                    decoder_out = self.decoder_router(
-                        z_t, hub_eeg, hub_fmri,
-                        eeg_seq_length=eeg_seq_len,
-                        fmri_seq_length=fmri.shape[-1],
-                    )
-                else:
-                    decoder_out = self.decoder_router(z_t, hub_eeg, hub_fmri)
-                eeg_recon = decoder_out["eeg_recon"]
-                fmri_recon = decoder_out["fmri_recon"]
+            if self.config.use_kda_decoder:
+                decoder_out = self.decoder_router(
+                    z_t, hub_eeg, hub_fmri,
+                    eeg_seq_length=eeg_seq_len,
+                    fmri_seq_length=fmri.shape[-1],
+                )
+            else:
+                decoder_out = self.decoder_router(z_t, hub_eeg, hub_fmri)
+            eeg_recon = decoder_out["eeg_recon"]
+            fmri_recon = decoder_out["fmri_recon"]
             pred_error = ai_out.get("feedback_metrics", {}).get("prediction_error")
 
         # Counterfactual search (imagination mode)
         elif mode == "imagination" and hasattr(self, 'counterfactual_search'):
-            # Generate counterfactual trajectories
-            trajectories = self.counterfactual_search.search(
-                initial_state=z_t,
-                horizon=10,
+            cfts_result = self.counterfactual_search(
+                z_t,
+                goal_attractors=goal_attractors,
+                task_cue=task_cue,
             )
-
-            # Use best trajectory
-            if len(trajectories) > 0:
-                z_t = trajectories[0]['final_state']
-                if self.config.use_kda_decoder:
-                    decoder_out = self.decoder_router(
-                        z_t, hub_eeg, hub_fmri,
-                        eeg_seq_length=eeg_seq_len,
-                        fmri_seq_length=fmri.shape[-1],
-                    )
-                else:
-                    decoder_out = self.decoder_router(z_t, hub_eeg, hub_fmri)
-                eeg_recon = decoder_out["eeg_recon"]
-                fmri_recon = decoder_out["fmri_recon"]
+            z_t = cfts_result.get("selected_trajectory", torch.zeros_like(z_t))
+            if z_t.dim() == 3 and z_t.shape[1] > 0:
+                z_t = z_t[:, -1, :]
+            if self.config.use_kda_decoder:
+                decoder_out = self.decoder_router(
+                    z_t, hub_eeg, hub_fmri,
+                    eeg_seq_length=eeg_seq_len,
+                    fmri_seq_length=fmri.shape[-1],
+                )
+            else:
+                decoder_out = self.decoder_router(z_t, hub_eeg, hub_fmri)
+            eeg_recon = decoder_out["eeg_recon"]
+            fmri_recon = decoder_out["fmri_recon"]
 
         # Cross-modal alignment: hub token consistency
         # At initialization these should be near-zero (modalities are independent).
@@ -610,7 +608,7 @@ class BrainMoEPINNV2(nn.Module):
         # A high value at step 0 means the hub is NOT distinguishing modalities — a bug.
         eeg_norm = hub_eeg / (hub_eeg.norm(dim=-1, keepdim=True) + 1e-8)
         fmri_norm = hub_fmri / (hub_fmri.norm(dim=-1, keepdim=True) + 1e-8)
-        cross_modal_corr = (eeg_norm * fmri_norm).sum(dim=-1).mean().item()
+        cross_modal_corr = (eeg_norm * fmri_norm).sum(dim=-1).mean()
 
         # Prepare output
         output = {
@@ -729,7 +727,7 @@ def test_brain_moe_pinn_v2():
             use_magi_v2=True,
             eeg_hidden_dim=1024,
             eeg_num_layers=24,
-            latent_dim=2048,
+            latent_dim= 1024,
             max_channels=256,
             ecog_amplitude_scale=20.0,
             use_channel_type_embed=True,

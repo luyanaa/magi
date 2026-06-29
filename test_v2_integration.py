@@ -18,7 +18,7 @@ def test_magi_v2_import():
     
     try:
         # Test 1: Magi v2 modules
-        from magi.src.model.magi_v2 import (
+        from brain_moe_pinn.magi.magi_v2 import (
             RotaryPositionEmbedding,
             GeGLU,
             FactorizedAttentionV2,
@@ -66,7 +66,7 @@ def test_eeg_encoder_wrapper_v2():
     print("\nTesting EEGEncoderWrapperV2...")
     
     try:
-        from encoders.eeg_encoder_v2 import EEGEncoderWrapperV2
+        from brain_moe_pinn.encoders.eeg_encoder_v2 import EEGEncoderWrapperV2
         
         # Create wrapper
         wrapper = EEGEncoderWrapperV2(
@@ -124,7 +124,7 @@ def test_brain_moe_pinn_v2():
     print("\nTesting BrainMoEPINNV2...")
     
     try:
-        from brain_moe_pinn_v2 import BrainMoEPINNV2, BrainMoEPINNConfig
+        from brain_moe_pinn.brain_moe_pinn_v2 import BrainMoEPINNV2, BrainMoEPINNConfig
         
         # Create config
         config = BrainMoEPINNConfig(
@@ -210,7 +210,7 @@ def test_ecog_dataset():
     print("\nTesting ECoGDataset...")
     
     try:
-        from utils.ecog_dataset import ECoGDataset
+        from brain_moe_pinn.utils.ecog_dataset import ECoGDataset
         
         # Create a temporary test directory
         import tempfile
@@ -273,10 +273,10 @@ def test_training_script_v2():
     print("\nTesting training script v2...")
     
     try:
-        from scripts.train_v2 import parse_phases, create_model
+        from brain_moe_pinn.scripts.train_v2 import parse_phases, create_model
         
         # Test phase parsing
-        phases = parse_phases("-1,0,1,2,3", use_moe_stage0=True)
+        phases = parse_phases("-1,1,2,3")
         print(f"✓ Phase parsing: {len(phases)} phases")
         
         for i, phase in enumerate(phases):

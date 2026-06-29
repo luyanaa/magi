@@ -89,9 +89,11 @@ echo "============================================"
 TRAIN_SCRIPT=${TRAIN_SCRIPT:-"scripts/train.py"}
 DS_CONFIG=${DS_CONFIG:-"configs/ds_config_zero2_multinode.json"}
 
-# Option 1: srun + torchrun (most portable)
+# Option 1: srun + torchrun (elastic, with automatic restart on node failure)
 echo ""
-echo "Launching via srun + torch.distributed.run..."
+echo "Launching via srun + torch.distributed.run (elastic)..."
+ELASTIC_RESTARTS=${ELASTIC_RESTARTS:-3}
+ELASTIC_MONITOR=${ELASTIC_MONITOR:-5}
 srun --ntasks=$NTASKS \
     --ntasks-per-node=$GPUS_PER_NODE \
     --gpus-per-task=1 \
@@ -104,10 +106,12 @@ srun --ntasks=$NTASKS \
         --rdzv_id=brain_moe_pinn_${SLURM_JOB_ID} \
         --rdzv_backend=c10d \
         --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+        --max_restarts=$ELASTIC_RESTARTS \
+        --monitor_interval=$ELASTIC_MONITOR \
         $TRAIN_SCRIPT \
         --deepspeed_config $DS_CONFIG \
         --epochs 100 \
-        --phase "-1,0,1,2,3" \
+        --phase "-1,1,2,3" \
         "$@"
 
 # Option 2: DeepSpeed launcher (alternative, uncomment if preferred)

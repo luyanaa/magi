@@ -1,6 +1,6 @@
 # Brain MoE-PINN: Known Remaining Mismatches Log
 # Generated: 2026-05-11
-# Updated: 2026-05-11 (after alignment fix session)
+# Updated: 2026-05-21 (second-round architecture audit)
 # This file tracks design-level mismatches between the training plan and
 # implementation that are deferred for future analysis / refactoring.
 
@@ -45,6 +45,20 @@
 | 34 | EEG Encoder Wrapper v2 | Magi v1 wrapper only | `encoders/eeg_encoder_v2.py`: EEGEncoderWrapperV2 with Magi v2, channel type embedding, amplitude normalization, variable channel count | HIGH | **IMPLEMENTED** |
 | 35 | Brain MoE-PINN v2 | v1 model with 12L×768d EEG | `brain_moe_pinn_v2.py`: BrainMoEPINNV2 with Magi v2 support, ECoG multi-modality, MoE Stage 0, context expansion | HIGH | **IMPLEMENTED** |
 | 36 | Training Script v2 | train.py for v1 only | `scripts/train_v2.py`: supports Magi v2, ECoG datasets, MoE Stage 0, revised token budgets | HIGH | **IMPLEMENTED** |
+
+
+| 37 | Duplicate imagination block | Single perception+imagination path | Two identical blocks; CFTS + ImaginationSampler ran twice | — | **DONE (2026-05-21)** |
+| 38 | z_sequence cross-batch contamination | Single trajectory PSD | List accumulated 128 states from different subjects — meaningless spectral slope | — | **DONE (2026-05-21)** — removed; spectrum on eeg_recon |
+| 39 | SpectralSlopeLoss on latent z | 1/f on latent trajectory | 1/f slope is an observable signature (He et al., 2010), not a dynamical state invariant | — | **DONE (2026-05-21)** — rewired to eeg_recon + meg_recon |
+| 40 | _imagination_active timing | Set before forward | Was set after forward, causing one-step lag and step-0 incorrect activation | — | **DONE (2026-05-21)** |
+| 41 | z_sequence shape | (B, T, d) standard | torch.stack(dim=0) produced (T, B, d) — dims misinterpreted by losses | — | **DONE (2026-05-21)** — mechanism removed |
+| 42 | PoissonSSMRouter._state plain attr | Registered buffer | Won't survive .to(device) or state_dict() | — | **DONE (2026-05-21)** — register_buffer + .data updates |
+| 43 | MT-KDA states as nn.Parameter | Registered buffer | Optimizer wastes memory on mutable state; manual .to(device) workaround | — | **DONE (2026-05-21)** |
+| 44 | No MEG reconstruction loss | recon_meg in TotalLoss | MEG decoder weights received no direct supervision | — | **DONE (2026-05-21)** |
+| 45 | reset_history() incomplete | Clear _replay_buffer | _replay_buffer persisted across phases | — | **DONE (2026-05-21)** |
+| 46 | action dimension mismatch | 1024 (match latent_dim) | Hardcoded 2048 in training loop | — | **DONE (2026-05-21)** |
+| 47 | B_bar discretization bug | dt * B_proj(z) | B_proj(z) * dt.unsqueeze(-1) caused broadcast failure | — | **DONE (2026-05-21)** |
+| 48 | Spectrum on MEG missing | SpectralSlopeLoss on eeg_recon + meg_recon | Only eeg_recon; MEG shares same physics | — | **DONE (2026-05-21)** |
 
 ## Action Plan by Priority
 
@@ -96,7 +110,29 @@ _No remaining open MEDIUM items. All have been addressed._
 - **Item 13 (TPT in forward pass)**: `NeuroSTORMPromptTuning` now applied in `forward_roi()` and `forward_voxel()`: prompt tokens prepended before backbone, stripped after.
 - **Item 1 partial (load_pretrained infrastructure)**: `load_pretrained()` added to `NeuroSTORMEncoder`, `BrainLMEncoder`, `EEGEncoderWrapper`, and `BrainMoEPINN`. CLI `--eeg_checkpoint` and `--fmri_checkpoint` added to `train.py`. Supports `.pt` and `.safetensors` formats.
 
+## Completed in This Session (2026-05-21) — Architecture Audit Round 2
+
+- **Items 37-48 (all 12 items)**: Second-round audit found 6 critical/high + 6 medium/low issues. All resolved:
+  - Deleted duplicate imagination block (CFTS ×2 waste)
+  - Removed `_z_sequence` cross-batch contamination (SpectralSlopeLoss migrated to eeg_recon)
+  - Fixed `_imagination_active` timing (before forward, not after)
+  - Registered `PoissonSSMRouter._state` as buffer (survives .to(device))
+  - Converted `MultiTimeScaleKDA` states from `nn.Parameter` → `register_buffer`
+  - Added `meg_recon` loss term to TotalLoss + ReconstructionLoss
+  - Added `_replay_buffer` cleanup to `reset_history()`
+  - Fixed `action` dimension 2048 → 1024
+  - Fixed `B_bar` discretization: `dt * B_proj(z)` (standard Mamba)
+  - Extended SpectralSlopeLoss to `meg_recon` (EEG+MEG, fMRI excluded)
+  - 16 smoke tests pass on CPU; 19 active loss terms verified
+
+**Design Decisions:**
+- Spectral slope now computed on **reconstructed signal** (EEG/MEG), not latent z — aligns with He et al. (2010)
+- fMRI excluded from spectral slope: BOLD operates at 0.01–0.1 Hz, too few temporal samples in reconstruction
+- KSEntropyLoss preserved but dormant until sequence-level training
+- SpectralSlopeLoss on eeg_recon partially overlaps with BandPowerLoss._one_over_f_loss — weights should be tuned to avoid double-counting
+
 ## Notes
+
 
 - All **runtime CRITICAL bugs** have been fixed (shape mismatches, undefined variables, wrong paths).
 - All **physics losses** have been implemented and wired into `TotalLoss`.

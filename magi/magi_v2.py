@@ -159,13 +159,14 @@ class FactorizedAttentionV2(nn.Module):
         # Scale factor for attention
         self.scale = self.head_dim ** -0.5
         
-    def _apply_rope(self, x: torch.Tensor, seq_dim: int = -2) -> torch.Tensor:
+    def _apply_rope(self, x: torch.Tensor, seq_dim: int = -2, num_heads: int = None) -> torch.Tensor:
         """Apply RoPE to query and key tensors."""
         if not self.use_rope:
             return x
         
-        # Reshape to (..., seq_len, num_heads, head_dim)
-        x = rearrange(x, '... (h d) -> ... h d', h=self.num_heads)
+        if num_heads is None:
+            num_heads = self.num_heads
+        x = rearrange(x, '... (h d) -> ... h d', h=num_heads)
         x = self.rope(x, seq_dim=seq_dim)
         x = rearrange(x, '... h d -> ... (h d)')
         return x
@@ -205,8 +206,8 @@ class FactorizedAttentionV2(nn.Module):
                             h=self.spatial_heads, d=self.head_dim)
         
         # Apply RoPE to spatial dimension (channel positions)
-        q_spatial = self._apply_rope(q_spatial, seq_dim=-2)
-        k_spatial = self._apply_rope(k_spatial, seq_dim=-2)
+        q_spatial = self._apply_rope(q_spatial, seq_dim=-2, num_heads=self.spatial_heads)
+        k_spatial = self._apply_rope(k_spatial, seq_dim=-2, num_heads=self.spatial_heads)
         
         # Spatial attention scores
         attn_spatial = torch.einsum('bthcd,bthkd->bthck', q_spatial, k_spatial) * self.scale
@@ -226,8 +227,8 @@ class FactorizedAttentionV2(nn.Module):
                              h=self.temporal_heads, d=self.head_dim)
         
         # Apply RoPE to temporal dimension
-        q_temporal = self._apply_rope(q_temporal, seq_dim=-2)
-        k_temporal = self._apply_rope(k_temporal, seq_dim=-2)
+        q_temporal = self._apply_rope(q_temporal, seq_dim=-2, num_heads=self.temporal_heads)
+        k_temporal = self._apply_rope(k_temporal, seq_dim=-2, num_heads=self.temporal_heads)
         
         # Temporal attention scores
         attn_temporal = torch.einsum('bchtd,bchkd->bchtk', q_temporal, k_temporal) * self.scale
@@ -253,10 +254,9 @@ class FactorizedAttentionV2(nn.Module):
     ) -> torch.Tensor:
         """Sliding Window Attention with configurable window size."""
         B, N, D = q.shape
-        
-        # Reshape to (B, num_windows, window_size, D)
-        num_windows = math.ceil(num_times / self.window_size)
-        pad_len = num_windows * self.window_size - num_times
+
+        num_windows = math.ceil(N / self.window_size)
+        pad_len = num_windows * self.window_size - N
         
         if pad_len > 0:
             q = F.pad(q, (0, 0, 0, pad_len))
@@ -273,8 +273,8 @@ class FactorizedAttentionV2(nn.Module):
         v_windows = rearrange(v_windows, 'b w s (h d) -> b w h s d', h=self.num_heads, d=self.head_dim)
         
         # Apply RoPE within windows
-        q_windows = self._apply_rope(q_windows, seq_dim=-2)
-        k_windows = self._apply_rope(k_windows, seq_dim=-2)
+        q_windows = self._apply_rope(q_windows, seq_dim=-2, num_heads=self.num_heads)
+        k_windows = self._apply_rope(k_windows, seq_dim=-2, num_heads=self.num_heads)
         
         # Window attention
         attn = torch.einsum('bwhsd,bwhkd->bwhsk', q_windows, k_windows) * self.scale

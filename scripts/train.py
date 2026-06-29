@@ -24,6 +24,7 @@ import os
 import sys
 import argparse
 import json
+import signal
 from pathlib import Path
 
 import torch
@@ -39,6 +40,33 @@ from brain_moe_pinn.utils.training_phases import (
     STAGE_TWO_PHASE,
     STAGE_THREE_PHASE,
 )
+
+# Slurm preemption signal handler
+_trainer_ref = None
+_preemption_received = False
+
+def _preemption_handler(signum, frame):
+    global _preemption_received
+    _preemption_received = True
+    print(f"\n[PREEMPTION] Received signal {signum} (SIGTERM={signal.SIGTERM}). Saving checkpoint...")
+    if _trainer_ref is not None:
+        try:
+            step = getattr(_trainer_ref, '_current_step', 0) or 0
+            _trainer_ref.save_checkpoint(step=step, phase="preemption")
+            print("[PREEMPTION] Checkpoint saved successfully")
+        except Exception as e:
+            print(f"[PREEMPTION] Failed to save checkpoint: {e}")
+    sys.exit(128 + signum)
+
+
+def _install_preemption_handler(trainer):
+    global _trainer_ref
+    _trainer_ref = trainer
+    for sig in [signal.SIGTERM, getattr(signal, 'SIGINT', 2), getattr(signal, 'SIGUSR1', 10)]:
+        try:
+            signal.signal(sig, _preemption_handler)
+        except (ValueError, AttributeError):
+            pass
 
 
 def parse_phases(phase_str: str):
@@ -64,8 +92,8 @@ def main():
     parser.add_argument("--deepspeed_config", type=str, default="configs/ds_config_zero2.json",
                         help="DeepSpeed config JSON file")
     parser.add_argument("--epochs", type=int, default=100, help="Max epochs (per phase)")
-    parser.add_argument("--phase", type=str, default="-1,0,1,2,3",
-                        help="Training phases to run, e.g. '-1,0,1,2,3'")
+    parser.add_argument("--phase", type=str, default="-1,1,2,3",
+                        help="Training phases to run, e.g. '-1,1,2,3'")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from checkpoint path")
     parser.add_argument("--log_dir", type=str, default="./logs",
@@ -76,7 +104,7 @@ def main():
                         help="Local rank (set by torchrun/deepspeed)")
     parser.add_argument("--eeg_channels", type=int, default=19)
     parser.add_argument("--fmri_regions", type=int, default=400)
-    parser.add_argument("--latent_dim", type=int, default=2048)
+    parser.add_argument("--latent_dim", type=int, default=1024)
     parser.add_argument("--use_kda_decoder", action="store_true", default=True,
                         help="Use KDA-based decoders")
     parser.add_argument("--no_kda_decoder", action="store_false", dest="use_kda_decoder",
@@ -91,6 +119,14 @@ def main():
     parser.add_argument("--mamba2_kwargs", type=str, default=None,
                         help="JSON string with Mamba-2 kwargs (e.g. '{\"chunk_size\":256}')")
     parser.add_argument("--tau_delay", type=float, default=0.5)
+    parser.add_argument("--use_torch_compile", action="store_true", default=False,
+                        help="Enable torch.compile for MoE experts and encoder")
+    parser.add_argument("--use_deep_experts", action="store_true", default=False,
+                        help="Use DeepExpertNetwork (50-layer) instead of ExpertNetwork (2-layer)")
+    parser.add_argument("--shared_depth", type=int, default=50,
+                        help="Number of layers in shared deep experts")
+    parser.add_argument("--routed_depth", type=int, default=14,
+                        help="Number of layers in routed deep experts")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eeg_checkpoint", type=str, default=None,
                         help="Path to pretrained Magi EEG encoder checkpoint (.pt)")
@@ -99,8 +135,9 @@ def main():
 
     args = parser.parse_args()
 
-    # Set seed
     torch.manual_seed(args.seed)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 
     # Load DeepSpeed config
     ds_config_path = Path(args.deepspeed_config)
@@ -132,6 +169,10 @@ def main():
         use_mamba2=args.use_mamba2,
         mamba2_kwargs=mamba2_kwargs,
         tau_delay=args.tau_delay,
+        use_torch_compile=args.use_torch_compile,
+        use_deep_experts=args.use_deep_experts,
+        shared_depth=args.shared_depth,
+        routed_depth=args.routed_depth,
     )
     model = config.to_model()
 
@@ -149,6 +190,9 @@ def main():
         checkpoint_dir=args.checkpoint_dir,
         deepspeed_config=deepspeed_config,
     )
+
+    # Install preemption handler for SLURM SIGTERM/USR1
+    _install_preemption_handler(trainer)
 
     # Run training
     trainer.train(phases=phases, resume_from=args.resume)

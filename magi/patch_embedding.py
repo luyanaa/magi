@@ -121,7 +121,7 @@ class EEGPatchEmbedding(nn.Module):
         return max(L, 0)
 
 
-class EEGMasking:
+class EEGMasking(nn.Module):
     """
     Advanced masking strategies for EEG: random, block, and channel-wise masking.
     """
@@ -136,6 +136,7 @@ class EEGMasking:
         channel_ratio: float = 0.3,  # Ratio of channels to mask for channel masking
         hybrid_probs: Tuple[float, float, float] = (0.4, 0.3, 0.3),  # Probabilities for (random, block, channel)
     ):
+        super().__init__()
         self.mask_ratio = mask_ratio
         self.masking_type = masking_type
         self.block_size = block_size

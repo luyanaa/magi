@@ -1,0 +1,46 @@
+# EEG Clinical Preprocessing Config
+# Full clinical-grade preprocessing with ICA + ASR + bad channel interpolation
+
+pipeline: clinical
+device: cpu
+batch_size: 16
+
+resample:
+  target_sfreq: 256
+  method: torchaudio
+
+filter:
+  bandpass: [0.1, 100.0]
+  notch: [50, 60]
+  method: fir
+  fir_design: firwin
+  numtaps: 101
+
+reference: average
+
+quality:
+  bad_channel_corr_threshold: 0.1
+  bad_channel_var_min: 1.0e-6
+  bad_channel_var_max_factor: 100.0
+  artifact_z_threshold: 5.0
+  min_good_channels: 4
+
+artifact_handling:
+  mode: repair
+  ica_components: 20
+  ica_max_iter: 200
+  asr_cutoff: -3.5
+
+normalization:
+  method: zscore
+  per_channel: true
+
+montage:
+  target: standard_1020
+  virtual_montage: true
+  idw_k: 4
+
+output:
+  format: both
+  save_format: npy
+  save_quality_report: true

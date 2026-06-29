@@ -145,6 +145,13 @@ class BIOTStyleEmbedding(nn.Module):
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
     
+    def get_embedding(self, channel_name: str) -> Optional[torch.Tensor]:
+        """Get embedding for a single channel name. Returns None if not found."""
+        idx, found = self.get_position_index(channel_name)
+        if not found:
+            return None
+        return self.position_embedding.weight[idx]
+
     def get_position_index(self, channel_name: str) -> Tuple[int, bool]:
         """Get the index for a channel name. Returns (index, found) tuple."""
         if channel_name in self.channel_to_idx:
@@ -220,8 +227,10 @@ class BIOTStyleEmbedding(nn.Module):
             
             # Project back to embedding_dim if needed
             if embeds.shape[-1] != self.embedding_dim:
-                proj = nn.Linear(embeds.shape[-1], self.embedding_dim, device=device)
-                embeds = proj(embeds)
+                if not hasattr(self, '_coord_proj'):
+                    self._coord_proj = nn.Linear(embeds.shape[-1], self.embedding_dim)
+                self._coord_proj = self._coord_proj.to(device)
+                embeds = self._coord_proj(embeds)
         
         # Apply fallback for invalid channels
         if not valid_mask.all():
@@ -398,8 +407,10 @@ class EEG2DPatchEmbedding(nn.Module):
                 channels=channels,
                 embedding_dim=hidden_dim // 4,  # Partial dim for spatial
             )
-            # Project spatial embedding to hidden_dim
-            self.spatial_proj = nn.Linear(hidden_dim // 4, hidden_dim)
+            # MontageAwareEmbedding outputs: embedding_dim + 2*(embedding_dim//4)
+            # = hidden_dim//4 + hidden_dim//8 = 3*hidden_dim//8
+            montage_out_dim = (hidden_dim // 4) + 2 * ((hidden_dim // 4) // 4)
+            self.spatial_proj = nn.Linear(montage_out_dim, hidden_dim)
         else:
             self.montage_embed = None
             self.spatial_proj = None

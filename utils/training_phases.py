@@ -1,12 +1,17 @@
 """
-Training Phases and Stage Definitions for Brain MoE-PINN.
+Training Phases and Stage Definitions for Brain MoE-PINN (Revised 2026-05-16).
 
 Defines the multi-stage training schedule:
-- Phase -1: Magi EEG encoder standalone pretraining
-- Stage 0: Dual-encoder alignment with frozen backbones
-- Stage 1: Full model training with MoE (P1-P5)
-- Stage 2: Cross-modal bridging
-- Stage 3: Online adaptation with Hebbian memory
+- Phase -1: Magi EEG encoder standalone pretraining (8L×512d BERT-medium)
+- Stage 1: Full model training with Shared+Routed MoE (P1-P6)
+  - P1: Alignment + routing differentiation (tau=2.0)
+  - P2: Dissipation constraint + L_spectrum activation
+  - P3: L_TV weight decay (0.1→0.02), criticality triple constraint
+  - P4: Routing tightening (tau→0.7), EMA startup, lr bump
+  - P5: Full physics constraints + EPR audit
+  - P6: Long context (seq=4096)
+- Stage 2: Cross-modal latent HRF bridge (L_cross + L_cross_soft)
+- Stage 3: Online adaptation with Hebbian memory + active inference
 
 Each stage has specific learning rates, freeze strategies, and loss weights.
 """
@@ -30,25 +35,29 @@ class TrainingStage(Enum):
 
 @dataclass
 class LossWeights:
-    """Loss weight configuration for each stage."""
+    """Loss weight configuration for each stage (20 fields)."""
     recon_eeg: float = 1.0
     recon_fmri: float = 1.0
-    velocity_smooth: float = 0.1
+    velocity_smooth: float = 0.1    # L_TV: anti-explosion (decays 0.1→0.02 over P1-P3)
     generic_constraint: float = 0.5
     moe_load_balance: float = 0.01
     hebbian_reg: float = 0.0
     grassmannian_reg: float = 0.001
     jacobi_reg: float = 0.001
     nsp: float = 0.1
-    cross_modal: float = 0.1
+    cross_modal: float = 0.1       # Legacy modal_align (P1 early)
     dissip: float = 0.1
-    epr: float = 0.05
-    spectrum: float = 0.01
-    tsallis: float = 0.05
-    ks: float = 0.01
-    action: float = 0.1
-    replay: float = 0.02
+    epr: float = 0.05              # Entropy Production Rate (Second Law)
+    spectrum: float = 0.01          # 1/f PSD, activates post-NSP decay (P2+)
+    tsallis: float = 0.05            # Latent sparsity
+    ks: float = 0.005               # Anti-collapse guard (complements L_TV + L_spectrum)
+    action: float = 0.0
+    replay: float = 0.0
+    cross: float = 0.05             # Latent HRF alignment (Stage 2, sync data only)
+    cross_soft: float = 0.02        # Async subject contrastive (Stage 2)
     bandpower: float = 0.0
+    sigreg: float = 0.0             # Weak-SIGReg covariance regularization
+    sigreg_sketch_dim: int = 64     # SIGReg sketch dimension
 
 
 @dataclass
@@ -81,6 +90,11 @@ class TrainingPhase:
     freeze_config: FreezeConfig = field(default_factory=FreezeConfig)
     lr_schedule: str = "cosine"
     optimizer: str = "adamw"
+    router_tau: Optional[float] = None
+    imagination_interval: int = 0
+    imagination_num_samples: int = 4
+    imagination_rollout_steps: int = 3
+    context_expansion_schedule: Optional[List[Tuple[int, int]]] = None
     description: str = ""
 
 
@@ -114,14 +128,16 @@ def get_phase_neg_1() -> TrainingPhase:
             ks=0.0,
             action=0.0,
             replay=0.0,
+            sigreg=0.1,
         ),
         freeze_config=FreezeConfig(
-            eeg_encoder=True,
+            eeg_encoder=False,
             fmri_encoder=True,
             eeg_epochs_thawed=1,
             fmri_epochs_thawed=1,
         ),
         description="MoE E=4 Top-1, encoder alignment + NSP + modal_align, no physics",
+        router_tau=None,
     )
 
 
@@ -156,12 +172,14 @@ def get_stage_1_p1() -> TrainingPhase:
             ks=0.0,
             action=0.0,
             replay=0.0,
+            sigreg=0.05,
         ),
         freeze_config=FreezeConfig(
             eeg_encoder=True,
             fmri_encoder=True,
         ),
         description="Merged Stage 0 + P1: MoE from start, frozen encoders 1 epoch, no physics",
+        router_tau=2.0,
     )
 
 
@@ -194,12 +212,15 @@ def get_stage_1_p2() -> TrainingPhase:
             ks=0.0,
             action=0.0,
             replay=0.0,
+            bandpower=0.01,
+            sigreg=0.05,
         ),
         freeze_config=FreezeConfig(
             eeg_encoder=True,
             fmri_encoder=True,
         ),
-        description="Add L_dissip + nullspace, encoders partially thawed",
+        description="Add L_dissip + nullspace, encoders remain frozen",
+        router_tau=2.0,
     )
 
 
@@ -231,10 +252,12 @@ def get_stage_1_p3() -> TrainingPhase:
             tsallis=0.03,
             ks=0.0,
             action=0.0,
-            replay=0.01,
+            replay=0.0,
+            bandpower=0.01,
+            sigreg=0.05,
         ),
-        freeze_config=FreezeConfig(),
         description="L_EPR >= 0 constraint, encoders fully thawed",
+        router_tau=2.0,
     )
 
 
@@ -265,11 +288,13 @@ def get_stage_1_p4() -> TrainingPhase:
             spectrum=0.01,
             tsallis=0.05,
             ks=0.01,
-            action=0.05,
-            replay=0.02,
+            action=0.0,
+            replay=0.0,
+            bandpower=0.02,
+            sigreg=0.0,
         ),
-        freeze_config=FreezeConfig(),
         description="Top-2 routing, E=8, LR 5e-4 flat",
+        router_tau=0.7,
     )
 
 
@@ -300,11 +325,13 @@ def get_stage_1_p5() -> TrainingPhase:
             spectrum=0.01,
             tsallis=0.05,
             ks=0.01,
-            action=0.1,
-            replay=0.02,
+            action=0.0,
+            replay=0.0,
+            bandpower=0.02,
+            sigreg=0.0,
         ),
-        freeze_config=FreezeConfig(),
         description="Full physical constraints (Jarzynski, Landauer, spectrum, EPR audit)",
+        router_tau=0.7,
     )
 
 
@@ -335,11 +362,13 @@ def get_stage_1_p6() -> TrainingPhase:
             spectrum=0.01,
             tsallis=0.05,
             ks=0.01,
-            action=0.1,
-            replay=0.02,
+            action=0.0,
+            replay=0.0,
+            bandpower=0.02,
+            sigreg=0.0,
         ),
-        freeze_config=FreezeConfig(),
         description="Sequence length 4096, LR restart to 1e-4",
+        router_tau=0.7,
     )
 
 
@@ -353,6 +382,8 @@ def get_all_phases() -> List[TrainingPhase]:
         get_stage_1_p4(),
         get_stage_1_p5(),
         get_stage_1_p6(),
+        STAGE_TWO_PHASE,
+        STAGE_THREE_PHASE,
     ]
 
 
@@ -401,6 +432,8 @@ STAGE_TRANSITION_RULES = [
 ]
 
 # Flat phase configs for CLI parsing
+# NOTE: NEGATIVE_ONE_PHASE intentionally has no loss_weights — Phase -1 uses
+# Magi's own loss functions (masked reconstruction, MoCo, PSD) not TotalLoss.
 NEGATIVE_ONE_PHASE = {
     "name": "Phase -1: Magi EEG Pretraining",
     "stage": "phase_neg_1",
@@ -416,7 +449,7 @@ NEGATIVE_ONE_PHASE = {
 STAGE_ONE_PHASE = {
     "name": "Stage 1 P1-P6: Pre-Training",
     "stage": "stage_1",
-    "total_steps": 195000,
+    "total_steps": 235000,
     "learning_rate": 1e-4,
     "min_lr": 1e-6,
     "warmup_steps": 500,
@@ -429,53 +462,60 @@ STAGE_ONE_PHASE = {
         velocity_smooth=0.1, generic_constraint=1.0, moe_load_balance=0.01,
         hebbian_reg=0.0, grassmannian_reg=0.005, jacobi_reg=0.0,
         dissip=0.1, epr=0.05, spectrum=0.01, tsallis=0.05,
-        ks=0.01, action=0.1, replay=0.02,
+        ks=0.01, action=0.0, replay=0.0, bandpower=0.01,
     ),
 }
 
-STAGE_TWO_PHASE = {
-    "name": "Stage 2: Cross-Modal Bridging",
-    "stage": "stage_2",
-    "total_steps": 20000,
-    "learning_rate": 1e-4,
-    "min_lr": 1e-5,
-    "warmup_steps": 2000,
-    "weight_decay": 0.1,
-    "grad_clip": 0.5,
-    "batch_size": 16,
-    "gradient_accumulation": 1,
-    "lr_schedule": "cosine",
-    "optimizer": "adafactor",
-    "loss_weights": LossWeights(
+STAGE_TWO_PHASE = TrainingPhase(
+    name="Stage 2: Cross-Modal Bridging",
+    stage=TrainingStage.STAGE_2,
+    total_steps=20000,
+    learning_rate=1e-4,
+    min_lr=1e-5,
+    warmup_steps=2000,
+    batch_size=16,
+    gradient_accumulation=1,
+    grad_clip=0.5,
+    lr_schedule="cosine",
+    optimizer="adafactor",
+    loss_weights=LossWeights(
         recon_eeg=1.0, recon_fmri=1.0, cross_modal=0.3,
         velocity_smooth=0.1, generic_constraint=0.5, moe_load_balance=0.01,
         hebbian_reg=0.0, grassmannian_reg=0.005, jacobi_reg=0.0,
         dissip=0.05, epr=0.03, spectrum=0.01, tsallis=0.03,
-        ks=0.01, action=0.05, replay=0.01,
+        ks=0.01, action=0.0, replay=0.0,
+        cross=0.05, cross_soft=0.02, bandpower=0.01,
     ),
-}
+    router_tau=0.7,
+    context_expansion_schedule=[(0, 4096), (5000, 8192), (15000, 16384)],
+)
 
-STAGE_THREE_PHASE = {
-    "name": "Stage 3: Online Adaptation",
-    "stage": "stage_3",
-    "total_steps": 50000,
-    "learning_rate": 1e-4,
-    "min_lr": 5e-6,
-    "warmup_steps": 2000,
-    "weight_decay": 0.05,
-    "grad_clip": 0.5,
-    "batch_size": 16,
-    "gradient_accumulation": 1,
-    "lr_schedule": "cosine",
-    "optimizer": "adafactor",
-    "loss_weights": LossWeights(
+STAGE_THREE_PHASE = TrainingPhase(
+    name="Stage 3: Online Adaptation",
+    stage=TrainingStage.STAGE_3,
+    total_steps=50000,
+    learning_rate=1e-4,
+    min_lr=5e-6,
+    warmup_steps=2000,
+    batch_size=16,
+    gradient_accumulation=1,
+    grad_clip=0.5,
+    lr_schedule="cosine",
+    optimizer="adafactor",
+    loss_weights=LossWeights(
         recon_eeg=1.0, recon_fmri=1.0, cross_modal=0.2,
         velocity_smooth=0.05, generic_constraint=0.3, moe_load_balance=0.01,
         hebbian_reg=0.0, grassmannian_reg=0.01, jacobi_reg=0.0,
         dissip=0.05, epr=0.02, spectrum=0.01, tsallis=0.02,
-        ks=0.01, action=0.1, replay=0.05,
+        ks=0.01, action=0.05, replay=0.02,
+        cross=0.03, cross_soft=0.01, bandpower=0.01,
     ),
-}
+    router_tau=0.7,
+    imagination_interval=100,
+    imagination_num_samples=2,
+    imagination_rollout_steps=3,
+    context_expansion_schedule=[(0, 16384), (20000, 32768), (40000, 65536)],
+)
 
 
 if __name__ == "__main__":

@@ -35,6 +35,14 @@ MNI_X_RANGE = (-90, 90)
 MNI_Y_RANGE = (-126, 90)
 MNI_Z_RANGE = (-72, 108)
 
+# Channel type constants for ChannelTypeEmbedding
+CHANNEL_TYPES = {
+    0: "scalp_EEG",
+    1: "ecog_grid", 
+    2: "seeg_depth",
+    3: "unknown"
+}
+
 # Channel type mapping for ChannelTypeEmbedding
 def map_channel_type(ch_type: str) -> int:
     """

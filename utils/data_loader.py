@@ -81,7 +81,7 @@ class EEGDataset(Dataset):
                 elif fpath.endswith(".npz"):
                     data = np.load(fpath)["data"]
                 elif fpath.endswith(".pth"):
-                    data = torch.load(fpath).numpy()
+                    data = torch.load(fpath, weights_only=True).numpy()
                 else:
                     continue
                 self.data_cache.append(data)
@@ -190,9 +190,9 @@ class fMRIDataset(Dataset):
                 elif fpath.endswith(".npz"):
                     data = np.load(fpath)["data"]
                 elif fpath.endswith(".pth"):
-                    data = torch.load(fpath).numpy()
+                    data = torch.load(fpath, weights_only=True).numpy()
                 elif fpath.endswith(".csv"):
-                    data = np.loadtxt(fpath, delimiter=",")
+                    data = np.loadtxt(fpath, delimiter=",", skiprows=1)
                 else:
                     continue
                 self.data_cache.append(data)
@@ -215,7 +215,7 @@ class fMRIDataset(Dataset):
             elif fpath.endswith(".pth"):
                 fmri_data = torch.load(fpath).numpy()
             elif fpath.endswith(".csv"):
-                fmri_data = np.loadtxt(fpath, delimiter=",")
+                fmri_data = np.loadtxt(fpath, delimiter=",", skiprows=1)
             else:
                 raise ValueError(f"Unsupported file format: {fpath}")
 
@@ -239,6 +239,96 @@ class fMRIDataset(Dataset):
             "fmri": fmri_data,
             "num_regions": self.num_regions,
             "tr": self.tr,
+            "file_idx": idx,
+        }
+
+
+class MEGDataset(Dataset):
+    """
+    MEG dataset for 306-channel Neuromag systems.
+
+    Args:
+        data_dir: Directory containing MEG recordings (.npy, .npz, .fif)
+        num_channels: Number of MEG sensors (default 306 for Elekta Neuromag)
+        sample_rate: Target sample rate (Hz)
+        seq_duration: Sequence duration in seconds
+        preload: Whether to load all data into memory
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        num_channels: int = 306,
+        sample_rate: int = 1000,
+        seq_duration: float = 10.0,
+        transform: Optional[Callable] = None,
+        preload: bool = False,
+    ):
+        self.data_dir = Path(data_dir)
+        self.num_channels = num_channels
+        self.sample_rate = sample_rate
+        self.seq_duration = seq_duration
+        self.seq_length = int(seq_duration * sample_rate)
+        self.transform = transform
+        self.preload = preload
+
+        self.file_list = []
+        self._scan_data_dir()
+
+        if self.preload:
+            self.data_cache = []
+            self._preload_data()
+
+    def _scan_data_dir(self):
+        supported_formats = [".npy", ".npz", ".pth"]
+        for ext in supported_formats:
+            self.file_list.extend(list(self.data_dir.glob(f"**/*{ext}")))
+        self.file_list = [str(f) for f in self.file_list if f.is_file()]
+        print(f"[MEGDataset] Found {len(self.file_list)} MEG files in {self.data_dir}")
+
+    def _preload_data(self):
+        print(f"[MEGDataset] Preloading {len(self.file_list)} files...")
+        for fpath in self.file_list:
+            try:
+                if fpath.endswith(".npy"):
+                    data = np.load(fpath)
+                elif fpath.endswith(".npz"):
+                    data = np.load(fpath)["data"]
+                elif fpath.endswith(".pth"):
+                    data = torch.load(fpath, weights_only=True).numpy()
+                else:
+                    continue
+                self.data_cache.append(data)
+            except Exception as e:
+                print(f"[MEGDataset] Warning: Failed to load {fpath}: {e}")
+        print(f"[MEGDataset] Preloaded {len(self.data_cache)} files")
+
+    def __len__(self) -> int:
+        return len(self.file_list) if not self.preload else len(self.data_cache)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        if self.preload:
+            meg_data = self.data_cache[idx]
+        else:
+            fpath = self.file_list[idx]
+            if fpath.endswith(".npy"):
+                meg_data = np.load(fpath)
+            elif fpath.endswith(".npz"):
+                meg_data = np.load(fpath)["data"]
+            elif fpath.endswith(".pth"):
+                meg_data = torch.load(fpath).numpy()
+            else:
+                raise ValueError(f"Unsupported MEG file format: {fpath}")
+
+        meg_tensor = torch.FloatTensor(meg_data)
+
+        if self.transform:
+            meg_tensor = self.transform(meg_tensor)
+
+        return {
+            "meg": meg_tensor,
+            "num_channels": self.num_channels,
+            "sample_rate": self.sample_rate,
             "file_idx": idx,
         }
 
@@ -293,8 +383,8 @@ class PairedBrainDataset(Dataset):
             print("[PairedBrainDataset] Warning: No aligned data found, using unaligned mode")
             return
 
-        eeg_files = {f.stem: str(f) for f in eeg_dir.glob("*.npy")}
-        fmri_files = {f.stem: str(f) for f in fmri_dir.glob("*.npy")}
+        eeg_files = {f.stem: str(f) for f in eeg_dir.glob("*") if f.suffix in (".npy", ".npz", ".pth")}
+        fmri_files = {f.stem: str(f) for f in fmri_dir.glob("*") if f.suffix in (".npy", ".npz", ".pth", ".csv")}
 
         common_keys = set(eeg_files.keys()) & set(fmri_files.keys())
         for key in common_keys:
@@ -309,8 +399,8 @@ class PairedBrainDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         if not self.pair_list:
             return {
-                "eeg": torch.zeros(19, 2560),
-                "fmri": torch.zeros(400, 100),
+                "eeg": torch.zeros(self.eeg_dataset.num_channels, self.eeg_dataset.seq_length),
+                "fmri": torch.zeros(self.fmri_dataset.num_regions, self.fmri_dataset.seq_length),
                 "is_paired": False,
             }
 

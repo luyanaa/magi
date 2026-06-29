@@ -103,7 +103,7 @@ def compute_functional_connectivity(z_sequence: torch.Tensor) -> torch.Tensor:
 def evaluate_resting_state(
     model: nn.Module,
     num_steps: int = 1024,
-    latent_dim: int = 2048,
+    latent_dim: int = 1024,
 ) -> Dict[str, float]:
     """
     Run model in imagination mode and evaluate resting-state metrics.

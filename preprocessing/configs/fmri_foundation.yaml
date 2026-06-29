@@ -1,0 +1,25 @@
+# fMRI Foundation Preprocessing Config
+# Assumes fMRIPrep derivatives are available for spatial preprocessing
+# GPU accelerates temporal + parcellation steps
+
+atlas: schaefer_400
+tr: 2.0
+n_dummy_scans: 5
+slice_timing_correction: true
+
+confound_regression:
+  types: [trans_x, trans_y, trans_z, rot_x, rot_y, rot_z]
+
+temporal:
+  bandpass: [0.008, 0.1]
+
+smoothing:
+  fwhm: 4.0
+  voxel_size: 2.0
+
+normalization: zscore
+
+use_voxelmorph: false
+
+device: cpu
+output_format: both

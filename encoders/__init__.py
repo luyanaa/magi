@@ -4,6 +4,8 @@ from .fmri_encoder import (
     BrainLMEncoder,
     create_fmri_encoder,
 )
+from .meg_encoder import MEGEncoderWrapper, MEGProjection
+from .hub_fusion import HubTokenFusion, CrossModalAdapter, SlowManifoldProjector, LatentHRFBridge
 
 __all__ = [
     "EEGEncoderWrapper",
@@ -11,4 +13,10 @@ __all__ = [
     "NeuroSTORMEncoder",
     "BrainLMEncoder",
     "create_fmri_encoder",
+    "MEGEncoderWrapper",
+    "MEGProjection",
+    "HubTokenFusion",
+    "CrossModalAdapter",
+    "SlowManifoldProjector",
+    "LatentHRFBridge",
 ]

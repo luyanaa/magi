@@ -17,6 +17,7 @@ from .losses import (
     HebbianRegularization,
     NSPLoss,
     CrossModalAlignmentLoss,
+    WeakSIGRegLoss,
     TotalLoss,
 )
 from .training_loop import (
@@ -53,6 +54,7 @@ __all__ = [
     "HebbianRegularization",
     "NSPLoss",
     "CrossModalAlignmentLoss",
+    "WeakSIGRegLoss",
     "TotalLoss",
     # Training
     "BrainMoETrainer",

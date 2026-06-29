@@ -97,8 +97,10 @@ python -m torch.distributed.run \
     --rdzv_id=brain_moe_pinn_$$ \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+    --max_restarts=3 \
+    --monitor_interval=5 \
     $TRAIN_SCRIPT \
     --deepspeed_config $DS_CONFIG \
     --epochs 100 \
-    --phase "-1,0,1,2,3" \
+    --phase "-1,1,2,3" \
     ${@:3}

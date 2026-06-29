@@ -67,7 +67,7 @@ class EEGEncoderWrapperV2(nn.Module):
     def __init__(
         self,
         hidden_dim: int = 1024,
-        output_dim: int = 2048,
+        output_dim: int = 1024,
         num_layers: int = 24,
         num_heads: int = 16,
         freeze_encoder: bool = True,
@@ -446,7 +446,7 @@ def test_eeg_encoder_v2():
     try:
         encoder = EEGEncoderWrapperV2(
             hidden_dim=1024,
-            output_dim=2048,
+            output_dim= 1024,
             num_layers=24,
             freeze_encoder=False,
             use_biot_embedding=True,

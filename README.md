@@ -1,294 +1,280 @@
-# Brain MoE-PINN: Physics-Informed Neural Dynamics Model
+# Brain MoE-PINN: A Learned Generative Dynamical System for Multimodal Brain Data
 
-**System**: 7–10B total / 1–3B active parameters, Mixture-of-Experts (MoE), Physics-Informed Neural Network (PINN)  
-**Hardware**: 64× NVIDIA V100 16GB SXM2 (16 nodes × 4 GPUs), unified across all stages  
-**Training budget**: ~372B tokens over ~90 days  
-**Code**: `/home/yanlu/Documents/a/brain_moe_pinn/` — 30+ Python files, fully self-contained (Magi encoder migrated in)
+**A technical introduction for computational neuroscience and bioinformatics researchers.**
 
+Brain MoE-PINN is a ~770-million-parameter model (default configuration; up to ~1.2B+ with deep experts enabled) that learns to *generate* brain dynamics from multimodal neuroimaging data — EEG, fMRI, and optionally MEG — while obeying physical constraints from nonequilibrium thermodynamics. Unlike a conventional encoder that maps brain data to a static embedding, this model learns a **velocity field** over a latent state space: given the current brain state, it predicts how the state will *evolve*. This lets it both *represent* brain activity (like a foundation model) and *simulate* its temporal evolution (like a biophysical model). The architecture sits at the intersection of representation learning and dynamical systems theory, targeting a regime — mesoscopic whole-brain dynamics with learned physics — that neither tradition currently addresses.
 
-## 1. Related Work: Brain Simulation vs Brain Representation Learning
+---
 
-It is essential to distinguish two fundamentally different research programs, because our project intentionally merges them.
+## 1. The Problem: Representation vs. Simulation
 
-**Brain simulation** builds a *generative forward model* whose dynamics produce observable neural or behavioral data. Such a model supports inference (estimating hidden states from observations) and in-silico experimentation. **Brain representation learning** trains an encoder that maps brain data to a latent space — useful for decoding and transfer learning, but the model does not *generate* dynamics intrinsically. Representations embeddings; simulations evolve.
+Two research traditions dominate computational brain modeling, and they rarely speak to each other.
 
-### 1.1 Brain Simulation with Inference
+**Brain simulation** solves differential equations for each neuron or neural population. Projects like The Virtual Brain (TVB) use connectome-based neural mass models at 200–1000 brain regions, supporting in-silico lesion experiments and inference via Dynamical Causal Modeling. At the extreme, spiking network simulations on supercomputers (Hygon Exascale, K Computer cerebellar models) integrate Hodgkin-Huxley equations for billions of neurons. These models are *generative* — you can run them forward without external input — but their parameters are hand-tuned or sampled from priors. They do not learn from data.
 
-**Spiking neural networks on supercomputers**. Since the IBM BlueGene/L era (2005), researchers have simulated increasingly large spiking networks: cat-scale cortex columns on BlueGene, cerebellar OKR circuits on the K Computer (Yamazaki & Nagao, 2012), and most recently the Hygon Exascale prototype (2022–26) claiming 86B neurons × 47.8T synapses on 14,012 GPUs. These projects solve ODEs for each neuron (Hodgkin-Huxley or Izhikevich), with all-to-all spike communication. The Hygon team added a Bayesian inference layer: an observation operator (Balloon-Windkessel hemodynamic model) maps hidden neural states X to observable BOLD Y, and a particle/Ensemble Kalman Filter estimates P(X_t | Y_{1:t}). This is genuine brain simulation with inference — you can assimilate real fMRI and correct the hidden trajectory.
+**Brain representation learning** trains encoders that map brain recordings to a latent space. BrainLM (2024) applies masked autoencoding to 6,700 hours of fMRI; NeuroSTORM (2026) scales this to 50,000+ subjects using a Shifted-Window Mamba backbone. For EEG, Magi provides a BERT-style encoder with 3D electrode embeddings. These models support decoding and transfer learning, but they do not *generate dynamics* — they produce a static embedding for each time window, with no notion of temporal evolution.
 
-*Limitations*: Phenomenologically detailed but computationally brutal — only tractable on top supercomputers after years of HPC optimization. No mechanism for learning from data: parameters are hand-tuned or sampled from priors. The Bayesian inference adds enormous overhead on top of expensive simulation.
+**Brain MoE-PINN bridges this gap.** It combines an encoder stack (representation learning) with a physics-structured velocity field (simulation), enabling both encoding *and* generation in a single model. The velocity field obeys the GENERIC (General Equation for Non-Equilibrium Reversible-Irreversible Coupling) formalism from nonequilibrium thermodynamics — a structured decomposition into conservative (energy-preserving) and dissipative (entropy-producing) components. This is not an arbitrary neural network: the dynamics are architecturally constrained to satisfy energy conservation and the Second Law of Thermodynamics.
 
-**The Virtual Brain (TVB)** takes a different approach: connectome-based neural mass models (Jansen-Rit, Wong-Wang) at each of 200–1000 brain regions. TVB supports inference via DCM-like variational methods, lesion simulations, and pharmacological in-silico experiments. It is the most mature platform bridging simulation and clinical application. *Limitation*: fixed biophysical models with hand-tuned parameters; no large-scale learning.
+---
 
-**Procedural connectivity** (Knight & Nowotny, *Nature Computational Science*, 2020) addresses the GPU-friendliness problem: instead of storing large sparse connectivity matrices, compute synaptic weights on the fly from neuron coordinates and distance rules. This trades memory for computation, achieving real-time simulation of ~10⁵ neurons on a single GPU.
+## 2. Architecture Overview
 
-### 1.2 Brain Representation Learning
-
-**fMRI foundation models**. BrainLM (ICLR 2024) is a 4-layer transformer masked autoencoder trained on 77K sessions (6,700 hrs fMRI). It supports zero-shot functional network identification and in-silico perturbation. NeuroSTORM (*Nature Biomedical Engineering*, 2026) scales to 28.65M frames from 50K+ subjects using a Shifted-Window Mamba backbone with Spatiotemporal Redundancy Dropout (STRD). Both produce latent embeddings from fMRI — they do *not* generate fMRI time series or support state-space inference.
-
-**EEG foundation models**. Magi (our BERT-base encoder, 12L × 768d, Hybrid SWA + RoPE + BIOT 3D electrode embeddings) was developed alongside this project. DeeperBrain (2026) introduced the Neurodynamics Statistics Prediction (NSP) loss — predicting power spectra and functional connectivity from latent representations — which directly inspired our NSP auxiliary loss. BIOT (Yuan et al.) and Brain-OF (2026) provide flexible electrode positioning and resolution handling.
-
-**Multimodal fusion**. Brain Harmony (2025) introduced Hub Token cross-attention for EEG ↔ fMRI fusion — the design we adopt. CineBrain (Gao, Feng, Fu, 2025, arXiv:2503.06940) provides the first large-scale synchronous fMRI-EEG dataset (6h of TV episodes), enabling our Stage 2 cross-modal bridging. CineSync uses this for video reconstruction from brain signals, but does *not* model dynamics — temporal structure comes from the video, not from learned neural dynamics.
-
-### 1.3 Hybrid Approaches (Representation + Dynamics)
-
-Very few projects bridge the gap.
-
-**Spisak & Friston** (2025, arXiv:2505.22749) formalized how attractor neural networks emerge from the Free Energy Principle: orthogonalized attractor representations arise from minimizing model complexity; sequential data produces asymmetric couplings and nonequilibrium steady-state dynamics. This provides a principled justification for our Grassmannian attractor regularization.
-
-**Metriplector** (Oprisa & Toth, 2026, arXiv:2603.29496) uses metriplectic dynamics as the computation primitive — input configures fields, sources, and operators, and the dynamics *is* the computation. The metriplectic structure (Poisson bracket + dissipative gradient) is mathematically identical to GENERIC. Metriplector achieves strong results on vision, language, and control. *Key difference*: Metriplector is architecture-first (metriplectic dynamics as universal neural primitive); we are neuroscience-first (GENERIC as physically meaningful brain dynamics with interpretable energy/entropy potentials).
-
-**Brain MoE-PINN (this project)** sits at the intersection:
+The model processes EEG and fMRI simultaneously, with optional MEG — EEG (19–128 channels at 256 Hz), fMRI (400 brain regions at ~0.5 Hz), and MEG (306 channels at 256 Hz, `use_meg=True`) — through a pipeline with five stages:
 
 ```
-EEG → Magi BERT ─┐
-                   ├──→ Hub Fusion → z_global → VelocityBrain (GENERIC Δz) → Decoder → x̂
-fMRI → NeuroSTORM ─┘
+EEG → Magi encoder ──────────┐
+fMRI → NeuroSTORM encoder ───┼──→ Hub Token Fusion → z_global
+MEG → BERT-medium encoder ───┘ (optional)                        │
+                                                                    ▼
+                                               Velocity Field (GENERIC + MoE)
+                                                                    │
+                                                                    ▼
+                                               Decoder → EEĜ, fMRÎ, MEĜ (if enabled)
 ```
 
-A **learned generative dynamical system** at mesoscopic (brain-region) scale. Encoders map observations to a latent state (representation learning). VelocityBrain evolves this state via GENERIC dynamics (simulation). The decoder maps back to observations (generative model). Active inference corrects the state using prediction errors (inference). The model can both *represent* brain states and *simulate* their evolution — a combination no existing project achieves.
+### 2.1 Encoders
 
-### 1.4 Comparative Summary
+**EEG — Magi (8 layers, 512 dimensions).** A BERT-medium transformer with Sliding Window Attention, RoPE position encoding, GeGLU activations, and BIOT-style 3D electrode embeddings that encode the physical electrode positions. Optionally pretrained during Phase -1 on ~800M EEG+MEG tokens before integration. The encoder is frozen during early training and gradually thawed.
 
-| Dimension | Spiking HPC | TVB | Foundation models | **Brain MoE-PINN** |
-|-----------|-------------|-----|-------------------|---------------------|
-| Generative dynamics? | ✅ ODE integration | ✅ Neural mass ODE | ❌ Encoder only | ✅ GENERIC Δz |
-| Supports inference? | ⚠️ Bayesian (expensive) | ✅ DCM | ❌ | ✅ Active inference |
-| Learns from data? | ❌ Hand-tuned | ❌ Some DCM fitting | ✅ Pretrained | ✅ End-to-end |
-| Scale (accessible) | 86B neurons (top supercomputer) | 200-1000 regions | Billions params | 7-10B params (64×V100) |
-| Physical constraints? | ✅ Built-in biophysics | ✅ Built-in neural mass | ❌ None | ✅ GENERIC thermodynamics |
-| Can "imagine"? (free-run) | ✅ | ✅ | ❌ | ✅ |
-| Multimodal? | ❌ Single modality typically | ❌ Single modality | ⚠️ fMRI or EEG only | ✅ EEG + fMRI |
-| Online adaptation? | ❌ | ❌ | ❌ | ✅ Hebbian + active inference |
+**fMRI — NeuroSTORM (frozen backbone).** A Shifted-Window Mamba backbone pretrained on 28.65 million frames from 50,000+ subjects. We freeze the backbone and train only a small adapter projection (~5M parameters). Task-specific Prompt Tuning (TPT) prepends learnable prompt vectors to the token sequence, enabling task-conditioned processing without modifying the backbone weights.
 
-**Is this not just a dressed-up transformer?** The fundamental difference: standard transformers learn a static input-output mapping. Our model learns a **dynamical system** — it predicts how brain states *evolve over time*, and this evolution obeys structured equations (GENERIC) rather than being an arbitrary function of inputs.
+**MEG — Shared BERT-medium backbone (optional).** No pretrained MEG foundation model exists, so we share the EEG encoder's architecture and initialize from EEG weights via `load_from_eeg()`. This is justified by Maxwell's equations: EEG and MEG both arise from the same post-synaptic currents, differing only in measurement physics (volume conduction vs. magnetic induction). Sharing the backbone enforces this physical correspondence. MEG is disabled by default (`use_meg=False`); when enabled, the hub fusion expands from two to three tokens and the decoder gains a MEG reconstruction head.
 
+### 2.2 Hub Token Fusion
 
-## 2. Core Architectural Decisions
+Each encoder produces a sequence of token embeddings. Two learnable *hub tokens* — one per active modality (EEG and fMRI by default) — attend to these sequences via cross-attention, producing modality-aligned representations. A final fusion step produces a single global latent state $z_{\text{global}} \in \mathbb{R}^{1024}$ that integrates information from all available modalities. When MEG is enabled, a third hub token is added. The hub tokens are also preserved for downstream decoding.
 
-### 2.1 Irreversibility by Design
+### 2.3 The Velocity Field: GENERIC + Mixture of Experts
 
-The model predicts **velocity** $\Delta z$ (state change) rather than absolute next state $z_{t+1}$. Combined with causal masking in the decoder, this makes time reversal architecturally impossible. This is **intentional**: biological time is irreversible (Bergsonian *durée*, not Newtonian clock time). Only irreversible dynamics can maintain nonequilibrium steady states, learn, and adapt. Crooks fluctuation theorem is not used (requires reverse trajectories); Jarzynski equality is used only as a monitoring-side thermodynamic consistency check for the learned GENERIC dynamics ($\S 4.5$, monitoring-only, not a training loss).
+This is the core of the model. Given a latent state $z$, we predict its velocity $\dot{z}$ — how fast and in which direction the state changes:
 
-### 2.2 Dual-Modal Encoding
+$$\dot{z} = \underbrace{L(z)\nabla E}_{\text{conservative}} + \underbrace{M(z)\nabla S}_{\text{dissipative}} + \underbrace{\text{MoE}(z)}_{\text{learned experts}}$$
 
-EEG (fast electrical, low spatial resolution) and fMRI (slow hemodynamic, high spatial resolution) differ by 3 orders of magnitude in temporal resolution and 2–3 in spatial resolution. They need separate encoders:
+**The GENERIC contribution** comes from three scalar fields defined over the latent space:
+- $E(z)$: an **energy** potential. The conservative term $L(z)\nabla E$ rotates the state without changing its energy, powered by an antisymmetric Poisson operator $L(z)$.
+- $S(z)$: an **entropy** potential. The dissipative term $M(z)\nabla S$ drives the state toward higher entropy, powered by a positive-semidefinite mobility matrix $M(z)$.
+- The decomposition is constrained by two **degeneracy conditions**: $L(z)\nabla S = 0$ (the Poisson bracket is orthogonal to entropy) and $M(z)\nabla E = 0$ (mobility is orthogonal to energy). These are enforced via gradient projection at every step, keeping the GENERIC structure valid throughout training.
 
-**EEG — Magi BERT-base** (migrated into `brain_moe_pinn/magi/`):
-- 12-layer Transformer, 768d hidden, 12 heads, RoPE position encoding
-- Sliding Window Attention ($W=512$, $O(nW)$ instead of $O(n^2)$)
-- BIOT-style 3D electrode position embeddings (any montage, implicit volume conduction)
-- Patchify EEG at 1-second windows (patch_size=256, stride=128)
-- **v2 variant**: 24-layer × 1024d, GeGLU activation, ECoG/sEEG channel-type embedding
+The energy and entropy potentials are *learned* scalar fields — they are not claimed to correspond to physiological energy or entropy. They are effective potentials, validated by whether the resulting dynamics match observed brain activity (spectral slopes, functional connectivity, band-power statistics), not by their interpretability as physical quantities. This is a standard approach in physics-informed neural networks: the structure constrains the dynamics, and the learned fields capture whatever representations produce correct behavior.
 
-**fMRI — NeuroSTORM** (frozen backbone) or **BrainLM** (lighter fallback):
-- Shifted-Window Mamba backbone, pretrained on 50K+ subjects
-- Supports ROI time series, voxel 4D, functional connectivity inputs
-- Only the adapter projection (~5M params) is trained
+**The MoE contribution** adds learned complexity. Eight *shared experts* (50-layer residual MLPs, 52.5M parameters each) are always active, providing a dense backbone. Six *routed experts* (14-layer residual MLPs) are selectively activated via a Top-3 gating mechanism, giving the model the capacity to learn specialized dynamical modes — perhaps one expert for resting-state dynamics, another for visual task processing, etc.
 
-**Hub Token Fusion**: Two learnable tokens (EEG/fMRI identity) attend to encoder outputs via cross-attention, producing $z_{\text{global}} \in \mathbb{R}^{2048}$ — a modality-aligned latent state.
+The router is a **recurrent selective state-space model** (a Mamba S6 core with 64-dimensional hidden state), not a stateless MLP. This is important: expert routing at time $t$ depends on the entire history of latent states $z_{<t}$, not just the current state. A stateful router produces smoother, more contextually appropriate expert allocation. The router's state is a registered PyTorch buffer, surviving device transfers and checkpoint save/load. A temperature parameter $\tau$ controls routing softness, annealed from 2.0 (near-uniform, encouraging exploration) to 0.7 (sharp, encouraging specialization) over the course of training.
 
-### 2.3 Latent Dynamics: GENERIC + MoE
+The Poisson operator $L(z)$ uses a **low-rank factorization**: $L(z) = U(z) \cdot J \cdot U(z)^\top$ where $U(z) \in \mathbb{R}^{1024 \times 64}$ and $J$ is a fixed antisymmetric symplectic matrix. This reduces $L(z)$ from 4M parameters (dense) to 131K (rank-64), a 30× reduction, and forces the conservative dynamics onto a low-dimensional symplectic submanifold. An important consequence: the rank constraint reduces the Jacobi identity violation space from $\sim d^3 \approx 10^9$ directions (for a dense antisymmetric matrix) to $\sim 3dr \approx 2 \times 10^5$ directions — a 5000× reduction. Each $\partial L/\partial z_m$ is rank at most $2r$ because it decomposes as $(\partial U/\partial z_m) J U^\top + U J (\partial U/\partial z_m)^\top$, keeping the entire $L(z)$ trajectory on a rank-$r$ manifold. The $L(z)$ MLP is unconstrained, but $L(z)$ itself always lands on this manifold.
 
-The core innovation: the latent velocity field $\dot{z}$ is computed by combining two complementary mechanisms:
+### 2.4 Multi-Time-Scale Dynamics
 
-**GENERIC dynamics** (via `VelocityBrain`):
-$$\dot{z} = \underbrace{L(z)\nabla E}_{\text{conservative}} + \underbrace{M(z)\nabla S}_{\text{dissipative}} + \underbrace{v_0 e(\theta)}_{\text{arousal}} + \underbrace{\sqrt{2D}\xi}_{\text{noise}}$$
+The velocity field operates at multiple timescales through three mechanisms:
 
-- $L(z)$ is an antisymmetric Poisson operator (conservative, energy-preserving)
-- $M(z)$ is a diagonal mobility matrix (dissipative, entropy-producing)
-- $E(z)$ and $S(z)$ are learned scalar potentials (energy and entropy)
-- Two **degeneracy conditions** enforced via gradient projection every step: $L\nabla S = 0$ and $M\nabla E = 0$
+**Multi-Time-Scale KDA (MT-KDA)** — not to be confused with the decoder's Kimi Delta Attention — maintains three parallel exponential moving averages of the velocity with decay rates $\alpha = 0.1, 0.5, 0.9$, corresponding to fast (synaptic, ~10ms), medium (working memory, ~100ms), and slow (contextual, ~1s) dynamics. A learned gating network combines these, and the running states are registered as buffers (not optimizer parameters) to avoid polluting the optimizer with mutable state.
 
-**On identifiability**: $E(z)$ and $S(z)$ are **effective potentials** — they are not claimed to correspond to physiological energy or entropy. The GENERIC structure constrains the dynamics enough to satisfy energy conservation and the Second Law, but different $(E, S, L, M)$ tuples can produce the same trajectories (a fundamental limitation of all learned GENERIC models — cf. Stat-PINN literature). The learned potentials are validated by whether they produce correct dynamics (spectral slopes, FC correlation, band-power statistics), not by their interpretability as physical quantities.
+**Slow Manifold Projector** extracts sub-0.25 Hz ultra-slow dynamics via a learned 256×1024 projection. This is where cross-modal alignment between EEG and fMRI lives — the fast electrical signals and slow hemodynamic signals meet on this manifold through a physics-structured Latent HRF Bridge.
 
-**MoE velocity field** (via `MoEVelocityField` + `PoissonSSMRouter`):
-- 16 experts (4 Core Shared + 2 Salience + 10 Specialized), top-2 routing
-- Router is a **recurrent selective SSM** (Mamba S6 core, 64D hidden state), not a stateless MLP. Why? Brain routing decisions depend on temporal context — which experts were recently active, what task is being performed. A recurrent router produces smoother, context-aware expert allocation.
-- Grassmannian regularization encourages orthogonal expert attractor subspaces (principled by FEP)
+**OU-Structured Noise** injects colored (Ornstein-Uhlenbeck) noise with a learnable diffusion coefficient $D$, regulated by a Wiener Homeostat that continuously adapts the noise level to maintain criticality — balancing exploration (noise) against exploitation (signal).
 
-The two mechanisms are **independent** — $L(z)$ handles physics, the Router handles routing. They share only the antisymmetric structure inspiration.
+### 2.5 Decoders
 
-### 2.4 Memory & Active Inference
+The decoder uses **KDA (Kimi Delta Attention)**, a linear-complexity attention mechanism from Kimi (arXiv:2510.26692). Unlike standard softmax attention, KDA uses a delta rule — the attention output is computed as an incremental update to a recurrent hidden state, with per-key-dimension gating for selective state-tracking. This makes it ideal for autoregressive generation: each new token updates the state in $O(d)$ rather than $O(n^2)$. In our architecture, KDA layers are interleaved with standard linear layers in a 1:3 ratio (25% KDA, 75% linear), following the Kimi Linear hybrid design. On CPU, the FLA library's `causal_conv1d` component requires CUDA, so a fallback decoder (`ModalityDecoderRouter`) is available for CPU-only development.
 
-**Three-tier memory**: Synaptic Engram (KDA + Hebbian Oja weights, fast), Engram Landscape (Gaussian potential wells, medium), Structural Plasticity (connectomic reorganization, slow).
+The decoder gate concatenates hub tokens from all active modalities. For a model with EEG + fMRI + MEG enabled, this produces a 3072-dimensional gate input (3 × 1024), enabling cross-modal information to influence reconstruction of each modality.
 
-**Dual modes**: Perception (encoder-driven, forced ODE) and Imagination (internal simulation, no external input).
+EEG and fMRI are always reconstructed; MEG is reconstructed only when enabled. The MEG reconstruction loss closes a gradient gap that would otherwise leave the MEG decoder supervised only through the cross-modal hub fusion path.
 
-**Online correction** via efference copy / reafference: decoder output $\hat{x}$ predicts sensation, actual input $x$ provides error signal to correct latent state. Smith Predictor compensates for feedback delays using KDA history. Precision Gate weights error by delay and action magnitude.
+### 2.6 Active Inference and Imagination
 
-### 2.5 Wiener Cybernetics Guardrails (Monitoring-Only in Stage 1)
+The model operates in two modes:
 
-Four monitors run every step, no backward path modification:
+**Perception mode** processes real sensor data through the encoders. After predicting $z_{t+1}$ via the velocity field, an active inference loop compares the decoder's reconstruction $\hat{x}_{t+1}$ against the actual observation $x_{t+1}$ and corrects the latent state using the prediction error. A Smith Predictor compensates for feedback delays using a history of KDA states (stored in FP32 for numerical stability), and a Precision Gate weights corrections by delay and action magnitude.
 
-| Monitor | What it measures | Health range |
-|---------|-----------------|--------------|
-| **Bergson** | Irreversibility gap $\mathcal{I}_{\text{B}} = \langle\beta\Delta W\rangle - \log\langle e^{-\beta\Delta W}\rangle$ | > 0 positive |
-| **Q-Factor** | Oscillation resonance: $Q = f_0 / \Delta f$ (FFT on $\Delta z$) | [0.5, 2.0] |
-| **Ataxia** | Prediction-actual mismatch: $\mathbb{E}[\|\hat{x} - x\|] / \mathbb{E}[\|x\|]$ | < 0.5 |
-| **Catalepsy** | Latent entropy collapse via k-NN differential entropy | < 3.0 |
+**Imagination mode** runs the model forward without external input — the velocity field drives the dynamics autonomously. A Counterfactual Tree Search (depth 3, branch factor 4) explores possible futures, and Expected Free Energy (EFE) scores each trajectory. The best trajectory's endpoint biases the velocity field, creating a closed action-perception loop: imagination directly improves perception.
 
-**Wiener Homeostat**: Continuously adapts noise coefficient $D$ to maintain criticality:
-$$D_{\text{eff}} = D_0 \cdot \text{clamp}(\text{health}, 0.3, 3.0)$$
+During training, imagination runs on designated steps (controlled by an `imagination_interval` curriculum) to manage computational cost. Imagination components are gated behind a `use_imagination` flag — when disabled, they consume no memory.
 
-**Note on monitor naming**: The names Bergson, Q-Factor, Ataxia, and Catalepsy are **analogies** drawing on Norbert Wiener's *Cybernetics* (1948), where he argued neurological disorders are computational feedback failures. Each monitor tracks a well-defined dynamical quantity (irreversibility gap, oscillation resonance, normalized prediction error, latent entropy). The clinical names serve as mnemonics for the type of dynamical pathology detected — they are not claims of clinical validity without independent experimental validation.
+### 2.7 Memory Systems
 
-**AutoRollback** (4 levels, no dense fallback): Reacts to EPR negativity, energy divergence, router entropy collapse, and KS entropy explosion. Recovery increases balance weight → resets router → force top-1 → rollback checkpoint.
+**Hebbian Associative Memory** stores latent states via Oja's rule — a biologically plausible Hebbian update that maintains normalized weights ($W^\top W \approx I$). The engram trace provides a long-term reference for replay loss, comparing imagined states against stored memories. Hebbian weights are spectrally normalized every 100 steps to prevent runaway growth.
 
+A **replay buffer** accumulates imagined states (capacity 256) and provides temporal pairs for replay loss computation. The buffer is cleared alongside other state when `reset_history()` is called at phase boundaries.
 
-## 3. Training Pipeline
+---
 
-### 3.1 Stages
+## 3. The Loss Function: Physics Through Supervision
 
-| Stage | Tokens | Days | Active params | Key |
-|-------|--------|------|---------------|-----|
-| Phase -1 | 10B | ~2 | 110M (Magi only) | EEG encoder pretraining |
-| **Stage 1 P1** | 0–30B | | ~2B (E=4 T-1) | MoE from start, encoder alignment, no physics |
-| P2 | 30–60B | | ~3B (T-2) | +$\mathcal{L}_{\text{dissip}}$ |
-| P3 | 60–90B | | ~3B | +$\mathcal{L}_{\text{EPR}}$ (Second Law) |
-| P4 | 90–120B | | E=8 T-2 | MoE expansion + AdamW→Adafactor transition |
-| P5 | 120–200B | | ~3B | +full physics (Jarzynski, spectral, etc.) |
-| P6 | 200–260B | | ~3B | Seq 512→4096, LR restart |
-| Stage 2 | 74B | ~24 | ~3B | Long context (4096→65K), cross-modal bridging |
-| Stage 3 | 30B | ~5 | ~2B frozen shared | Specialized fine-tune + Hebbian injection |
+The total loss combines 22 terms, each with a stage-dependent weight:
 
-Stage 0 (originally a separate priming phase) has been **merged into P1**. MoE runs from step 1 — no dense pre-training.
+$$\mathcal{L}_{\text{total}} = \sum_{\ell=1}^{22} w_\ell \cdot \tilde{\mathcal{L}}_\ell$$
 
-### 3.2 Loss Function (Stage 1 P2+)
+Where $\tilde{\mathcal{L}}_\ell$ is an EMA-normalized version of each loss (mean/std calibrated over 1,000 warmup steps and frozen thereafter). This prevents one loss from dominating due to scale differences.
 
-$$\mathcal{L}_{\text{total}} = \sum_\ell w_\ell \cdot \tilde{\mathcal{L}}_\ell \quad \text{where} \quad \tilde{\mathcal{L}}_\ell = \frac{\mathcal{L}_\ell - \mu_\ell}{\sigma_\ell + \epsilon}$$
+**Reconstruction losses** (EEG, fMRI, MEG): Standard MSE between decoder output and input signal. These are the primary training signal — all other losses are auxiliary.
 
-The raw loss terms (10 total): reconstruction (MSE), dissipation, EPR, MoE balance, spectral slope, sparsity, KS entropy, total variation, action (EFE), replay. EMA normalization statistics ($\mu_\ell$, $\sigma_\ell$) are calibrated over 1000 warmup steps and then **frozen** to prevent moving-target issues.
-
-**Critical**: In Stage 1 P1, all physics losses are set to weight 0.0. They are **monitoring-only** — we expect dynamics to self-organize through reconstruction pressure + MoE routing competition. Physics losses are gradually activated from P2 onward. This is the **emergence paradigm**: rather than supervising physics, we let it emerge and use Wiener monitors as guardrails.
-
-### 3.3 Key Engineering Details
-
-- **Mixed precision**: FP16 with selective FP32 at runtime for Router, Hebbian, KDA state accumulation (not just save-time)
-- **DeepSpeed ZeRO-2**: gradients/optimizer states sharded across 16 DP nodes (~0.88 GB/GPU)
-- **TP=4, EP=4 co-located** on same 4-GPU NVLink node; only cross-node communication is DP all-reduce
-- **Optimizer transition**: AdamW → Adafactor at P4 entry, 1000-step gradual LR interpolation, 200-step freeze-warmup for cold slot variables
-- **Numerical stability**: 7-layer defense (KDA normalization, degenerate projection, Kahan summation, stable softmax, Hebbian spectral norm, EMA monitoring, energy audit)
-- **Chinchilla ratio**: For MoE, D/N_act ≈ 8–12× (not dense 20×) since only active params matter
+**GENERIC structure losses:**
+- *Generic constraint*: Penalizes violations of the degeneracy conditions $L\nabla S \neq 0$ and $M\nabla E \neq 0$. These are the architectural guarantees that the dynamics remain valid GENERIC.
+- *Jacobi regularization*: Penalizes violations of the Jacobi identity for $L(z)$, ensuring it defines a valid Poisson bracket. **Currently dormant** — all training phases set `jacobi_reg=0.0` because verifying the Jacobi identity at $d=1024$ requires checking ~8.5 billion triple products, making the sampling-based regularizer statistically ineffective. The low-rank factorization of $L(z)$ (rank-64) suppresses violations structurally without an explicit loss.
+- *Grassmannian regularization*: Encourages expert attractor subspaces to be orthogonal, preventing expert collapse. Grounded in the Free Energy Principle (Spisak & Friston, 2025), which predicts attractor orthogonalization emerges naturally from minimizing model complexity.
 
+**Thermodynamic losses:**
+- *Dissipation*: Measures entropy production rate $\dot{S} = \nabla S \cdot M \nabla S$. Must be non-negative (Second Law).
+- *Entropy Production Rate (EPR)*: Monitors the magnitude of dissipative dynamics. Used as an early warning signal — negative EPR triggers AutoRollback.
 
-## 4. Current Status
+**Spectral losses:**
+- *Band-power loss*: Compares power in five frequency bands (delta/theta/alpha/beta/gamma, 0.5–50 Hz) between reconstructed and real EEG. This enforces frequency-domain fidelity beyond pixel-level MSE. Includes a 1/f slope constraint: the reconstructed EEG's power spectral density should follow $P(f) \propto 1/f$, a hallmark of healthy brain dynamics (He et al., *Nature Reviews Neuroscience*, 2010).
+- *Spectral slope loss*: Enforces the same 1/f constraint on reconstructed EEG and MEG via direct Fourier-domain slope fitting, complementing the band-power approach. Operates on the reconstructed signal (not latent states) because the 1/f property is an observable signature, not a dynamical invariant. Requires at least 16 temporal samples for meaningful slope estimation; shorter sequences return zero loss. fMRI is excluded from this loss because the BOLD signal operates at 0.01–0.1 Hz — a fundamentally different timescale where temporal 1/f constraints are not meaningful at our sampling rate.
 
-### 4.1 Codebase Maturity
+**Why spectral constraints operate on reconstructed signals, not latent states.** We initially tracked a rolling buffer of latent states (`z_sequence`) and computed the spectral slope over this trajectory. This was incorrect for two reasons: (1) the buffer mixed states from 128 different batches/subjects, and computing the PSD of a mixed sequence is mathematically meaningless; (2) the 1/f property is an observable signature of neural signals, not a guaranteed property of latent dynamical trajectories. The corrected approach computes spectral constraints on the decoder output — the actual signal a neuroscientist would measure — which is where neurophysiological constraints properly belong.
 
-| Component | Status |
-|-----------|--------|
-| VelocityBrain (GENERIC dynamics + MT-KDA) | ✅ Exposes grad_E, grad_S, degeneracy norms for monitoring |
-| MoE (PoissonSSMRouter, 3-tier experts) | ✅ Recurrent SSM routing, Grassmannian reg |
-| KDA decoder (Kimi Delta Attention) | ✅ FP32 runtime casting |
-| Active inference (EfferenceCopy, SmithPredictor, ClosedLoopFeedback) | ✅ Wired in training loop with actual_eeg slice |
-| Wiener monitors (Bergson, Q-Factor, Ataxia/Catalepsy) | ✅ All 4 run every step |
-| Wiener Homeostat (adaptive noise D) | ✅ Monitoring mode by default |
-| AutoRollback (4-level, no dense fallback) | ✅ |
-| TotalLoss (10-term, frozen normalization) | ✅ All losses computable |
-| Magi encoder (v1 + v2) | ✅ Migrated into repo, PyTorch 2.11 compatible |
-| Training loop (multi-phase, optimizer transition, gradient clipping) | ✅ |
-| v2 model (BrainMoEPINNV2) | ✅ Initialization + forward pass (B=1, B=2) |
-| Low-rank Poisson operator | ✅ `LowRankPoissonOperator` (r=64, 30× parameter reduction at d=2048) |
-| Band-power cross-frequency loss | ✅ `BandPowerLoss` in `TotalLoss` (delta/theta/alpha/beta/gamma) |
-| Expert lesioning interface | ✅ `lesion_experts()` + `set_poisson_enabled()` for causal testing |
+**Auxiliary losses:**
+- *NSP (Neurodynamics Statistics Prediction)*: Predicts band powers and functional connectivity from latent representations, inspired by the DeeperBrain model.
+- *Cross-modal alignment*: Cosine similarity and soft contrastive losses between active hub tokens (EEG/fMRI by default; MEG included when enabled). Synchronous data (from paired EEG-fMRI recordings like CineBrain) receives stronger weight; asynchronous data uses soft contrastive comparison.
+- *Velocity smoothness*: Penalizes sudden jumps in the velocity field (total variation in latent space), encouraging smooth trajectories.
+- *MoE load balancing*: Encourages uniform utilization across routed experts, preventing a single expert from dominating.
+- *Hebbian regularization*: Maintains stable Hebbian weight norms via spectral radius constraints.
+- *Latent sparsity*: Prevents the latent representation from collapsing to a single dimension (Tsallis-type penalty).
+- *Velocity difference regularizer*: Penalizes large velocity differences between consecutive time steps by computing the log-norm of velocity deltas along a trajectory. This encourages smooth temporal dynamics. The name was changed from "KS entropy" to avoid false claims about Lyapunov exponent estimation. Currently preserved in the loss function but dormant — it requires proper temporal sequences (not single-step training) to fire.
+- *Action loss*: Minimizes Expected Free Energy for active inference; active in Stage 3 when imagination is enabled.
+- *Replay loss*: Compares imagined states against engram traces for memory consolidation; active in Stage 3.
 
-### 4.2 Smoke Test Results (14/14 pass, CPU, PyTorch 2.11)
+---
 
-| Test | Status |
-|------|--------|
-| LowRankPoissonOperator forward + antisymmetry + efficient action | ✅ |
-| BandPowerLoss via TotalLoss | ✅ |
-| Lesioning (MoE experts + Poisson + degeneracy) | ✅ |
-| BrainMoEPINNV2 forward (B=1, B=2) | ✅ |
-| VelocityBrain forward + physics state exposure | ✅ |
-| MoE routing + PoissonSSMRouter | ✅ |
-| PoissonRouter antisymmetry | ✅ |
-| GENERIC degeneracy (L·∇S, M·∇E norms) | ✅ |
-| KDA decoder output shape | ⏭️ FLA CPU fallback issue |
-| EPR proxy vs exact correlation | ✅ (|r| > 0.5) |
-| Oja Hebbian update | ✅ |
-| TotalLoss computation | ✅ |
-| Wiener monitors (all 4) | ✅ |
-| Training loop imports + phase configs | ✅ |
+## 4. Training Strategy
 
-### 4.3 Design Decisions
+### 4.1 Phased Curriculum
 
-| Decision | Rationale |
-|------|-------------|
-| MoE from step 1 (no dense pre-training) | No benefit to dense pre-training; E=4 Top-1 works from start, saves weeks of Stage 0 |
-| Jacobi identity not enforced | Requires 8.5B triple checks at d=2048; even 128-sample MC gives 1.5e-8 sampling rate — no gradient signal. Low-rank Poisson operator (r=64) naturally constrains the triple-product space |
-| Degeneracy projection every step (not every 64) | 64-step interval leaves 98% of steps unconstrained; violations compound |
-| Loss normalization statistics frozen after 1000 steps | Moving-target normalization prevents converging losses from improving |
-| EPR proxy: `(v²).sum(dim=-1).mean()` not `.mean()` | Original `.mean()` averaged over hidden dimension, off by factor d=2048 |
-| Magi encoder migrated into repo | Self-contained, no `sys.path` hacks needed |
-| Monitors named as analogies (Bergson, Ataxia...) | Follows Wiener's Cybernetics framing; each measures a well-defined dynamical quantity, not a claim of clinical validity |
-| Cross-modal hub correlation should be near-zero at init | High correlation at step 0 means hub is not distinguishing modalities — a bug detection signal |
+Training proceeds through a single continuous run with nine sub-phases, progressively introducing complexity. No checkpoint save/restore gaps — the schedule is continuous.
 
-### 4.4 Known Limitations
+| Phase | Tokens | Key Changes |
+|-------|--------|-------------|
+| **P0 (warmup)** | 0–0.8B | Encoder warmup. Magi EEG+MEG encoder trained from scratch or loaded from Phase -1. Backbone frozen after warmup. |
+| **P1** | 0.8–30B | Alignment + routing differentiation (τ=2.0). NSP + modal_align + meg_align active. Physics losses are **monitoring-only** (weight=0). |
+| **P2** | 30–60B | Dissipation (`L_dissip`) + spectral losses activated. NSP decays. Physical constraints begin guiding dynamics. |
+| **P3** | 60–90B | TV weight decay 0.1→0.02. EPR enforcement. Velocity difference guard (0.005) active. |
+| **P4** | 90–120B | Router temperature tightens (2.0→0.7). EMA startup. Expert specialization begins. |
+| **P5** | 120–200B | Full physics constraint suite. Jarzynski + Landauer monitoring. EPR audited (not as loss). |
+| **P6** | 200–260B | Long context (seq=4096). Async cross-modal contrastive (`L_cross_soft`) + slow manifold projection. |
+| **P7 (Stage 2)** | 260–334B | Seq→16384. Mamba-2 SSM. Full latent HRF bridge (`L_cross`). Adafactor switch. Grassmannian + Waddington. |
+| **P8 (Stage 3)** | 334–364B | Shared experts frozen. Hebbian Oja + online assimilation. Imagination 50%. Seq returns to 4096. |
 
-1. **FLA CPU fallback**: `fla.utils.custom_device_ctx` calls `torch.cpu.device(index)` which doesn't exist in PyTorch 2.11. Works on GPU. No impact on training.
-2. **Active inference uses same-input slice** (not next-timestep): The training loop passes `actual_eeg = dummy_eeg[:, :, :patches]` rather than data from t+1. True online updating requires a paired-sequence dataloader.
-3. **BrainLM fMRI encoder**: `create_fmri_encoder("brainlm", ...)` returns a functioning encoder, but pretrained weights need to be downloaded from HuggingFace.
+> **Phase -1** (Magi encoder standalone pretraining, ~800M tokens) is optional. If skipped, P0 trains the encoder from scratch.
 
-### 4.5 Research Directions from Literature
+**Total**: ~364B tokens, ~74 days on 64× V100 (16 nodes × 4 GPUs) at ~14.5% effective MFU.
 
-A review of past and concurrent brain simulation projects (*see LITERATURE_REVIEW.md*) suggests several extensions:
+### 4.2 Why MoE From the Start (No Dense Pretraining)
 
-**P1: Low-rank Poisson operator** — Replace the dense 2048×2048 antisymmetric matrix L(z) with a rank-64 factorization L(z) = U(z)·J·U(z)ᵀ - h.c. where U(z) ∈ ℝ^{2048×64} and J is a fixed symplectic kernel. This reduces L(z) from 4M to 131K parameters (30× reduction), forces the conservative dynamics onto a low-dimensional symplectic manifold, and naturally suppresses Jacobi identity violations. Inspired by the procedural connectivity principle (Knight & Nowotny, 2020): compute structure from coordinates rather than storing it explicitly.
+Standard practice in MoE models (e.g., Mixtral) pretrains a dense model and then converts to MoE. MoE scaling laws (Krajewski et al., 2024; Ludziejewski et al., 2025; Zhao et al., 2025) show this is unnecessary for our scale: starting with E=4 MoE from step 1 requires 16B tokens, while dense initialization would need 140B tokens — infeasible on our hardware. We start with 8 shared + 6 routed experts directly, with a temperature curriculum that encourages broad exploration early and sharp specialization later.
 
-**P1: Cross-frequency coupling as validation** — Following the cerebellar OKR simulation tradition (Yamazaki & Nagao, K Computer), compare neurophysiologically meaningful metrics between simulated and real EEG: band-power modulation depth (alpha suppression during visual tasks), phase-amplitude coupling strength, and spectral coherence. Add band-power reconstruction as an auxiliary loss in Stage 1 P2+:
-$$L_{\text{band}} = ||\text{BandPower}(\hat{x}) - \text{BandPower}(x)||^2$$
-This addresses the L2 measurement validity issue: L2 reconstruction cannot capture spectral structure (GPT review §8), and band-power loss provides a frequency-domain complement.
+### 4.3 Hardware and Distributed Training
 
-**P1: Model lesioning for causal testing** — Selectively disable MoE experts (Core Shared, Salience, Specialized) or L(z) components and measure behavioral changes in simulated dynamics. Core Shared lesion → predicted resting-state FC collapse (DMN analogue). Salience lesion → predicted failure to switch between resting and task states. This provides testable causal hypotheses linking architectural components to brain functions.
+- **64× NVIDIA V100 16GB SXM2** (16 nodes × 4 GPUs)
+- **DeepSpeed ZeRO-2**: Gradients and optimizer states sharded across data-parallel nodes (~0.88 GB/GPU)
+- **Mixed precision**: FP16 compute with selective FP32 casting for numerically sensitive operations (router, Hebbian, KDA state accumulation). Non-CUDA backends (Intel XPU, Huawei Ascend NPU, Moore Threads MUSA, Cambricon MLU) default to FP16 in autocast (Ascend NPU is not bf16-friendly).
+- **Device-agnostic design**: All device references are centralized in `utils/device_utils.py` with auto-detection priority CUDA→XPU→NPU→MUSA→MLU→CPU. No hardcoded `torch.cuda` or `.cuda()` calls outside this module.
 
-**P2: Connectome-conditioned dynamics** — Make the Poisson and mobility operators depend on a subject-specific structural connectivity prior (from DTI). This enables zero-shot personalization: given a new subject's DTI, the dynamics automatically adapt without retraining. Also enables in-silico lesion experiments: artificially damage a tract → predict changes in functional connectivity.
+---
 
-**P3: Stress-energy readout** — Following Metriplector (Oprisa & Toth, 2026), use conserved quantities of the GENERIC dynamics (E(z), S(z), Casimir invariants) as additional decoder inputs, forcing the reconstruction to respect the learned physics.
+## 5. Stability and Monitoring
 
-**Questioned: Ensemble Kalman Filter over latent space** — While the Hygon Bayesian approach uses EnKF for state estimation, our active inference loop (efference copy + reafference + Smith predictor + precision gate) already provides a principled, biologically-plausible correction mechanism. EnKF would add N-ensemble computational overhead, observation Jacobian estimation, and covariance inflation tuning for marginal benefit.
+Training a ~770M-parameter model (default) with 22 loss terms and physical constraints requires layered defenses:
 
-### 4.6 Testable Predictions and Verification Protocol
+**Seven-layer stability defense:**
+1. KDA state L1 normalization every 64 steps
+2. Degeneracy projection ($L\nabla S = 0$, $M\nabla E = 0$) every step
+3. Kahan summation for floating-point accumulation
+4. Stable softmax (subtract max before exp)
+5. Hebbian spectral normalization every 100 steps
+6. EMA monitoring of key metrics (energy, EPR, router entropy)
+7. Energy audit: track total energy $E(z)$ to detect divergence
 
-Each model component makes specific predictions that can be falsified via ablation (adapted from DeepSeek GPT review and Stat-PINN methodology). Thresholds are informed by neuroscience literature where available; otherwise set from statistical properties of random baselines.
+**AutoRollback** reacts to four failure modes without a dense fallback: EPR negativity triggers balance weight increase; energy divergence triggers router reset; router entropy collapse forces Top-1 routing; velocity divergence triggers checkpoint rollback.
 
-| Component | Prediction | Test | Metric | Threshold | Significance |
-|-----------|-----------|------|--------|-----------|--------------|
-| Degeneracy projection | Relaxing $L\nabla S=0$ or $M\nabla E=0$ degrades trajectory stability | Set `apply_degeneracy_projection=False` | Delta_z Frobenius norm growth over 1000 steps | > 2× baseline (d_lesioned / d_control > 2.0) | Paired t-test, n=5 seeds |
-| Grassmannian regularization | Without it, expert subspaces become less orthogonal (relative to random baseline) | Ablate `grassmannian_weight → 0`, train 10K steps | Off-diagonal Gram Frobenius norm (`routing_metrics["expert_orthogonality"]`) | At d=256: > 0.05 (random baseline ≈ 0.03). At d=2048: > 0.006 (random baseline ≈ 0.004, high-d random vectors are nearly orthogonal by chance) | Cohen's d > 0.8 relative to control |
-| Closed-loop active inference | Without prediction-error correction, trajectory Lyapunov exponent increases | Model with `actual_eeg=None` vs. `actual_eeg=slice` | Lyapunov exponent $\lambda$ of z trajectory | $\lambda_{\text{open}} / \lambda_{\text{closed}} > 1.5$ | Bootstrap CI, 1000 resamples |
-| Poisson conservative term | Without it, EEG PSD slope flattens (oscillation loss) | `set_poisson_enabled(False)` | PSD slope $\alpha$ (1/f fit, 1-45 Hz) | $\alpha_{\text{lesioned}} < 0.5$ (healthy $0.8 \leq \alpha \leq 1.2$) | Effect size vs. literature band ([He et al. 2010](https://doi.org/10.1038/nrn2904)) |
-| Wiener Homeostat | Fixed D causes EPR drift or criticality loss | Fixed D vs. adaptive D_eff | EPR proxy variance over 10K steps | Adaptive D variance < 0.5 × fixed D variance | F-test for variance ratio |
-| MoE SSM vs. MLP router | SSM router reduces expert switching frequency | Compare `PoissonSSMRouter` vs. `PoissonRouter` | Expert switching frequency (Hz), router entropy temporal autocorrelation (lag-1) | SSM switching < 0.5 × MLP switching; SSM autocorrelation > 0.3 (MLP < 0.1) | Wilcoxon signed-rank, n=10 seeds |
-| BandPowerLoss | High band-power MSE indicates poor spectral fidelity | Compare models with/without bandpower loss | Per-band MSE (delta/theta/alpha/beta/gamma), alpha suppression depth (visual task: power ratio pre/post stimulus) | Alpha suppression ratio: simulated within 20% of real data ratio | Two-one-sided t-test (TOST) for equivalence |
-| Cross-modal hub fusion | Hub tokens encode shared modality-invariant content | Synchronous EEG-fMRI input; measure cosine similarity between hub_eeg and hub_fmri | `cross_modal_correlation` = $(\hat{e} \cdot \hat{f}) / (\|\hat{e}\|\|\hat{f}\|)$ averaged over batch | Should be near 0 at init (modalities independent), > 0.3 after Stage 1 P2+ training. If > 0.1 at step 0, hub is not distinguishing modalities — a bug | Permutation test, 10K shuffles |
-| Ataxia/Catalepsy monitors | Monitor trajectories should track training health | Record Ataxia score, Catalepsy score, Bergson I across all P1-P6 phases | Ataxia AUC (>0.5 sustained = early warning); Catalepsy crossing of threshold 3.0 | Ataxia AUC > 0.7 for predicting validation loss spike (1000-step lead) | ROC-AUC compared to random classifier baseline |
+**Wiener monitors** run every step and report read-only metrics (no backward path modification):
+- Bergson irreversibility gap: measures departure from equilibrium
+- Q-Factor: oscillation resonance in the velocity field
+- Ataxia: normalized prediction-actual mismatch
+- Catalepsy: latent entropy collapse detection
 
-### 4.6a Baseline Comparisons
+### 5.1 Key Fixes for Training Stability
 
-To isolate the contribution of each complex component, define simplified baselines:
+During development, several stability-critical issues were identified and resolved:
 
-**Baseline 1: VAE+Neural ODE** — Remove all physics constraints, GENERIC structure, and Wiener monitors. Keep encoder → hub fusion → Neural ODE (unconstrained MLP velocity field) → decoder. Train with only reconstruction loss. This tests whether the physics constraints improve dynamics quality over a standard latent ODE.
+**State management.** Two components stored mutable running state as plain Python attributes or `nn.Parameter` tensors — patterns that fail under `.to(device)`, `state_dict()`, or distributed training. The **PoissonSSMRouter's recurrent SSM state** (which accumulates temporal context for expert routing) and the **MultiTimeScaleKDA's three timescale states** (which maintain fast/medium/slow velocity averages) were both converted to registered PyTorch buffers with in-place `.data` updates. This ensures they survive device transfers, appear in checkpoints, and are properly synchronized across distributed workers.
 
-**Baseline 2: Graph Neural ODE** — Replace the hub fusion + VelocityBrain with a Graph Neural ODE where each brain region is a node and the structural connectome (from DTI) defines edges. Compare reconstruction fidelity and FC prediction. This tests whether the learned dynamics outperform a connectivity-informed model.
+**Imagination timing.** The joint perception-imagination forward pass (which closes the action-perception loop by running CFTS and EFE computation inside perception mode) was accidentally duplicated — the code block appeared twice, causing CFTS to run twice per step. The duplicate was removed, leaving a single coherent path. Additionally, the `_imagination_active` flag that controls whether imagination runs on a given step was being set *after* the forward call, creating a one-step lag and incorrectly activating imagination on step 0. It now executes before the forward pass, ensuring the flag reflects the current step.
 
-**Baseline 3: Without Hub Token fusion** — Remove the identity tokens; directly average EEG and fMRI encoder outputs. This tests whether Hub Token cross-attention provides measurable improvement over simple fusion.
+**Dimension hygiene.** The `action` tensor passed to the active inference loop was hardcoded at 2048 dimensions while the latent space is 1024-dimensional. This was fixed to match. In the Poisson router, the standard Mamba S6 discretization $B\Delta = \Delta \cdot B_{\text{proj}}(z)$ was incorrectly written as $B_{\text{proj}}(z) \cdot \Delta.\text{unsqueeze}(-1)$, causing a broadcast failure when batch and state dimensions collided.
 
-**Baseline 4: Transformer trajectory model** — Replace VelocityBrain with a standard causal transformer predicting z_{t+1} from z_{1:t} (no GENERIC structure, no ODE). This tests whether the dynamical system formulation is beneficial compared to sequence modeling.
+---
 
-All baselines compared on: (1) EEG/fMRI reconstruction MSE, (2) PSD slope 1/f fit ($R^2$), (3) FC correlation with real data (Pearson $r$), (4) parameter count, (5) training throughput (samples/sec). Multi-objective Pareto dominance across these five metrics determines whether the full model provides net benefit.
+## 6. Validation and Testable Predictions
 
-### 4.7 Next Steps
+The model makes specific, falsifiable predictions that can be tested through ablation experiments:
 
-1. **Real data integration**: Download DANDI EEG datasets + HCP/UKBiobank fMRI → validate dataloader throughput
-2. **Multi-node smoke test**: 2 nodes × 4 GPU with DeepSpeed, verify NCCL + checkpoint save/load
-3. **Confirm GPU** that the FLA KDA decoder runs correctly with CUDA triton kernels
-4. **Implement low-rank Poisson operator** (P1, ~1 week)
-5. **Implement cross-frequency coupling validation** (P1, ~1 week)
-6. **Model lesioning experiment** on trained model (P1, ~1 week post-training)
-7. **Begin training**: Phase -1 (Magi pretraining) → Stage 1 P1
+| Component | Prediction | Test |
+|-----------|-----------|------|
+| Degeneracy projection | Disabling $L\nabla S = 0$ or $M\nabla E = 0$ causes trajectory instability | Delta-z Frobenius norm growth > 2× |
+| Grassmannian regularization | Without it, expert subspaces collapse (become non-orthogonal) | Off-diagonal Gram norm increases |
+| Poisson conservative term | Without it, EEG PSD flattens (loses oscillations) | 1/f slope drops below 0.5 (healthy: 0.8–1.2) |
+| SSM router vs. MLP router | Recurrent routing reduces expert switching frequency | Switching frequency < 0.5× MLP baseline |
+| Band-power + spectral slope loss | Models without these fail to reproduce correct spectral profiles | Per-band MSE; alpha suppression ratio |
 
+**Baseline comparisons** against four simplified architectures (VAE+Neural ODE, Graph Neural ODE, No-hub-token fusion, Transformer trajectory model) on five metrics (reconstruction MSE, PSD slope fit, FC correlation, parameter count, throughput) determine whether each complex component provides net benefit.
 
-*Plan originated: 2026-05-11. Code at `/home/yanlu/Documents/a/brain_moe_pinn/`. Magi encoder migrated into `brain_moe_pinn/magi/`.*  
+---
+
+## 7. Design Principles
+
+Several design choices distinguish this project from conventional deep learning architectures:
+
+**Irreversibility by design.** The model predicts velocity $\Delta z$ (state change), not absolute next state $z_{t+1}$. Combined with causal masking in the decoder, time reversal is architecturally impossible. This is intentional: biological time is irreversible (a Bergsonian *durée*, not a Newtonian clock), and only irreversible dynamics can maintain nonequilibrium steady states.
+
+**Physics constraints as architecture, not loss.** The GENERIC structure is enforced via the architecture itself — the decomposition into $L(z)\nabla E + M(z)\nabla S$ is baked into the forward pass, not imposed as a soft penalty. Loss terms reinforce the constraints but the structure is present regardless of loss weight. This follows the metriplectic dynamics paradigm (Oprisa & Toth, 2026): the dynamics *is* the computation.
+
+**Emergence paradigm.** In Stage 1 P1, all physics losses have zero weight. The model is expected to self-organize through reconstruction pressure and MoE routing competition — complex dynamics should emerge from simple objectives. Physics losses are gradually activated from P2 onward, acting as guardrails rather than hand-holding.
+
+**State is explicit, not hidden.** All temporal state in the model — the router's SSM state, the KDA timescale states, the Hebbian weight matrix, the replay buffer — is registered as named PyTorch buffers. Nothing is stored as a plain Python attribute that would be lost on `.to(device)` or checkpoint save. This is a deliberate engineering choice, not just a fix: in a model where temporal continuity is essential, losing state is losing the computation.
+
+---
+
+## 8. Current Status and Limitations
+
+**What works (verified by smoke test on CPU):**
+- Full forward and backward pass with ~770M parameters (default config) or 147M (reduced-dimension test configuration)
+- All 20 loss terms compute correctly, including the spectral slope loss on reconstructed EEG/MEG
+- Gradient flow verified across all components (encoder stack, velocity field, MoE, decoder)
+- Router state persists correctly across forward calls and resets
+- Multi-Time-Scale KDA states update correctly as buffers
+- Spectral slope guard correctly returns zero loss for sequences with fewer than 16 temporal samples
+
+**Known limitations:**
+- The KDA decoder uses `causal_conv1d` from the Flash Linear Attention (FLA) library, which requires CUDA. A fallback decoder is available for CPU development.
+- The training loop currently passes `actual_eeg` as a slice of the *input* EEG, not data from time $t+1$. True online active inference requires a paired-sequence dataloader.
+- Pretrained NeuroSTORM and BrainLM weights need to be downloaded (loading infrastructure is in place).
+- The VelocityDifferenceRegularizer is preserved in the loss function but will not fire until sequence-level training (multi-timestep batches) is implemented.
+- Spectral slope loss on eeg_recon partially overlaps with BandPowerLoss's built-in 1/f constraint — weight tuning is needed to avoid double-counting.
+
+**Hardware requirements:**
+- 64× V100 16GB SXM2 (16 nodes × 4 GPUs) for full-scale training
+- DeepSpeed ZeRO-2/3 with torchrun elastic training
+- ~74 days estimated training time at full scale
+
+---
+
+## 9. Further Reading
+
+The research directions in `BRAINSTORM.md` explore extensions including:
+- Ensemble Kalman Filtering over latent space for principled uncertainty quantification
+- Connectome-conditioned dynamics for subject-specific personalization from DTI
+- Model lesioning for causal testing of expert function (e.g., does dropping Core Shared experts collapse resting-state FC?)
+- Cross-frequency coupling metrics as neurophysiological validation beyond MSE
+
+**KDA (Kimi Delta Attention)**: arXiv:2510.26692 — the linear-complexity attention mechanism used in our decoder. See `decoder/kda_decoder.py` for the full implementation.
+
+**XMMM Consciousness Algorithm** (Van Schalkwyk, Xzistor LAB, 2026): A control-theoretic architecture for emotion, cognition, and adaptive behavior that aligns closely with the Brain MoE-PINN design — homeostatic drives map to GENERIC dissipative terms, and the Epistemic Isolation Principle has a natural interpretation in GENERIC degeneracy. See §11.11 of the training plan for a detailed mapping.
+
+The literature review in `LITERATURE_REVIEW.md` provides context on the brain simulation and representation learning projects that informed this design.
+
+---
+
+*Code: `/home/yanlu/Documents/a/brain_moe_pinn/` — 65+ Python files, self-contained.*  
 *Fundamental principle: Model velocity $\Delta z$, not absolute position. Irreversibility is a feature, not a bug.*

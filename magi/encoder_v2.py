@@ -45,11 +45,8 @@ class MomentumEncoder(nn.Module):
             param.requires_grad = False
     
     def _clone_model(self, model: nn.Module) -> nn.Module:
-        """Create a deep copy of the model."""
+        """Create a deep copy of the model with the same weights."""
         import copy
-        if hasattr(model, 'init_kwargs'):
-            return type(model)(**model.init_kwargs)
-        # Fallback: deep copy the model state dict and rebuild
         clone = copy.deepcopy(model)
         return clone
     
@@ -243,7 +240,7 @@ class EEGFoundationModelV2(nn.Module):
         tokens, _ = self.forward_embeddings(eeg, channel_names, channel_types)
         
         # Apply masking
-        masked_tokens, mask = self.masking(tokens)
+        masked_tokens, mask, _ = self.masking(tokens)
         
         # Get encoder output on masked tokens
         B, N, D = masked_tokens.shape
@@ -270,7 +267,12 @@ class EEGFoundationModelV2(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for contrastive learning.
-        
+
+        TODO: This currently passes the SAME view to both query and key encoders.
+        V1's forward_contrastive takes two augmented views (eeg1, eeg2).
+        For proper contrastive learning, this should accept two differently
+        augmented views of the same input.
+
         Returns:
             query: (B, projection_dim) query projection
             key: (B, projection_dim) key projection from momentum encoder

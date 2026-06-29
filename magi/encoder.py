@@ -215,6 +215,7 @@ class EEGFoundationModel(nn.Module):
         use_factorized: bool = True,
         channels: Optional[List[str]] = None,
         use_biot_embedding: bool = False,
+        use_momentum_encoder: bool = True,
         **bert_kwargs,
     ):
         super().__init__()
@@ -223,6 +224,7 @@ class EEGFoundationModel(nn.Module):
         self.patch_size_time = patch_size_time
         self.patch_size_channel = patch_size_channel
         self.use_biot_embedding = use_biot_embedding
+        self.use_momentum_encoder = use_momentum_encoder
 
         # BIOT-style arbitrary channel embedding (option)
         # When enabled, uses learnable position embeddings for 100+ 10-5 locations
@@ -271,7 +273,10 @@ class EEGFoundationModel(nn.Module):
             num_types=4, embedding_dim=hidden_dim
         )
 
-        self.momentum_encoder = MomentumEncoder(self.base_encoder, momentum=momentum)
+        if use_momentum_encoder:
+            self.momentum_encoder = MomentumEncoder(self.base_encoder, momentum=momentum)
+        else:
+            self.momentum_encoder = None
         self.masking = EEGMasking(mask_ratio=mask_ratio, hidden_dim=hidden_dim)
 
         # Masked prediction head (reconstruct original patches)
@@ -468,25 +473,27 @@ class EEGFoundationModel(nn.Module):
         )
         q = self.proj_head(pooler1)  # (B, projection_dim)
 
-        # Momentum encoder on view2
+        # Momentum encoder on view2 (or base encoder with no_grad if disabled)
         tokens2, mask2, (C2, T2) = self.patch_embed(eeg2)
-        # For momentum encoder, we need to handle the case where it's factorized
-        if self.use_factorized:
-            last_hidden2, pooler2 = self.momentum_encoder(
-                inputs_embeds=tokens2,
-                num_channels=C2,
-                num_times=T2,
-                attention_mask=mask2,
-            )
-        else:
-            last_hidden2, pooler2 = self.momentum_encoder(inputs_embeds=tokens2, attention_mask=mask2)
+        encoder2 = self.momentum_encoder if self.momentum_encoder is not None else self.base_encoder
+        with torch.no_grad() if self.momentum_encoder is None else torch.enable_grad():
+            if self.use_factorized:
+                last_hidden2, pooler2 = encoder2(
+                    inputs_embeds=tokens2,
+                    num_channels=C2,
+                    num_times=T2,
+                    attention_mask=mask2,
+                )
+            else:
+                last_hidden2, pooler2 = encoder2(inputs_embeds=tokens2, attention_mask=mask2)
         k = self.proj_head(pooler2)  # (B, projection_dim)
 
         return q, k
 
     def update_momentum_encoder(self):
         """Update momentum encoder weights via EMA."""
-        self.momentum_encoder.update()
+        if self.momentum_encoder is not None:
+            self.momentum_encoder.update()
 
 
 if __name__ == '__main__':

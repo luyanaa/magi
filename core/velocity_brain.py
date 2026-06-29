@@ -34,12 +34,12 @@ class OUStructuredNoise(nn.Module):
     tau = 20ms corresponds to typical neural oscillation timescales.
     """
 
-    def __init__(self, dim: int = 2048, tau: float = 0.02, dt: float = 0.001, D: float = 1.0):
+    def __init__(self, dim: int = 1024, tau: float = 0.02, dt: float = 0.001, D: float = 1.0):
         super().__init__()
         self.dim = dim
         self.tau = tau
         self.dt = dt
-        self.D = D
+        self.register_buffer("D", torch.tensor(D, dtype=torch.float32))
         self.noise_proj = nn.Linear(dim, dim)
 
     def forward(self, x: torch.Tensor, noise_state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -60,8 +60,7 @@ class OUStructuredNoise(nn.Module):
         noise_state = noise_state + (self.dt / self.tau) * (-noise_state) + dW
 
         noise = torch.tanh(self.noise_proj(noise_state))
-        # Scale by sqrt(2D) per GENERIC equation: sqrt(2D) * xi
-        noise = math.sqrt(2.0 * self.D) * noise
+        noise = math.sqrt(2.0) * torch.sqrt(torch.abs(self.D)) * noise
         return x + noise, noise_state
 
 
@@ -79,7 +78,7 @@ class GenericPoissonOperator(nn.Module):
 
     def __init__(
         self,
-        hidden_dim: int = 2048,
+        hidden_dim: int = 1024,
         num_layers: int = 3,
         dropout: float = 0.1,
     ):
@@ -150,7 +149,7 @@ class LowRankPoissonOperator(nn.Module):
 
     def __init__(
         self,
-        hidden_dim: int = 2048,
+        hidden_dim: int = 1024,
         rank: int = 64,
         num_layers: int = 2,
         dropout: float = 0.1,
@@ -226,7 +225,7 @@ class GenericMobilityOperator(nn.Module):
         hidden_dim: dimension d of latent space
     """
 
-    def __init__(self, hidden_dim: int = 2048):
+    def __init__(self, hidden_dim: int = 1024):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.salience_gate = nn.Sequential(
@@ -254,15 +253,28 @@ class EnergyEntropyFields(nn.Module):
 
     Both are modeled as neural networks that map latent state z to scalar potentials.
     The gradients of these fields drive the GENERIC dynamics via L(z) and M(z).
+
+    When normalize_gradients=True, grad_E and grad_S are direction-normalized
+    to unit vectors and scaled by learned parameters (energy_scale, entropy_scale).
+    This prevents conservative/dissipative imbalance from diverging gradient
+    magnitudes without destroying the physical meaning of the Ottinger projector,
+    since normalization is applied BEFORE the projection.
     """
 
     def __init__(
         self,
-        hidden_dim: int = 2048,
+        hidden_dim: int = 1024,
         num_layers: int = 3,
         dropout: float = 0.1,
+        normalize_gradients: bool = True,
     ):
         super().__init__()
+        self.hidden_dim = hidden_dim
+        self.normalize_gradients = normalize_gradients
+
+        if normalize_gradients:
+            self.energy_scale = nn.Parameter(torch.tensor(1.0))
+            self.entropy_scale = nn.Parameter(torch.tensor(1.0))
 
         energy_layers = []
         for i in range(num_layers):
@@ -306,16 +318,20 @@ class EnergyEntropyFields(nn.Module):
         """
         Compute gradients of E and S with respect to z.
 
-        Args:
-            z: (B, d) latent state
-        Returns:
-            grad_E: (B, d) energy gradient
-            grad_S: (B, d) entropy gradient
+        When normalize_gradients=True, direction is normalized to unit
+        norm and amplitude is controlled by learned scale parameters.
+        This prevents conservative/dissipative imbalance from landscape
+        geometry without destroying the Ottinger projector's meaning.
         """
         z.requires_grad_(True)
         E, S = self.forward(z)
         grad_E = torch.autograd.grad(E.sum(), z, create_graph=True)[0]
         grad_S = torch.autograd.grad(S.sum(), z, create_graph=True)[0]
+
+        if self.normalize_gradients:
+            grad_E = F.normalize(grad_E, dim=-1) * torch.abs(self.energy_scale) + 1e-4
+            grad_S = F.normalize(grad_S, dim=-1) * torch.abs(self.entropy_scale) + 1e-4
+
         return grad_E, grad_S
 
 
@@ -329,7 +345,7 @@ class GenerickeDegeneracyProjection(nn.Module):
     These are enforced via gradient projection to maintain valid GENERIC structure.
     """
 
-    def __init__(self, hidden_dim: int = 2048, eps: float = 1e-6):
+    def __init__(self, hidden_dim: int = 1024, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
 
@@ -343,15 +359,32 @@ class GenerickeDegeneracyProjection(nn.Module):
         proj = proj / grad_S_norm_sq.unsqueeze(-1)
         return L - proj
 
-    def project_M_orthogonal_to_gradE(self, M_diag: torch.Tensor, grad_E: torch.Tensor) -> torch.Tensor:
+    def project_M_action_onto_gradS(self, M_diag: torch.Tensor, grad_S: torch.Tensor, grad_E: torch.Tensor) -> torch.Tensor:
         """
-        Project diagonal M to make it orthogonal to grad_E:
-        M_diag <- M_diag - (M_diag * grad_E^2) / (grad_E^2 + eps)
+        Project the mobility action M @ grad_S to satisfy degeneracy M @ grad_E = 0.
+
+        For diagonal M, the projected action (P_E @ diag(M) @ P_E) @ grad_S equals:
+            Mv = M_diag * grad_S
+            P_E(Mv) = Mv - (grad_E · Mv) / ||grad_E||^2 * grad_E
+
+        This is O(d), exact, and never materializes a dense matrix.
         """
-        grad_E_sq = grad_E ** 2 + self.eps
-        M_proj = M_diag * grad_E_sq
-        M_proj = M_proj / (grad_E_sq + self.eps)
-        return M_diag - M_proj
+        Mv = M_diag * grad_S
+        grad_E_dot_Mv = (grad_E * Mv).sum(dim=-1, keepdim=True)
+        grad_E_norm_sq = (grad_E ** 2).sum(dim=-1, keepdim=True) + self.eps
+        return Mv - (grad_E_dot_Mv / grad_E_norm_sq) * grad_E
+
+    def compute_M_grad_E_projected(self, M_diag: torch.Tensor, grad_E: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the degeneracy check residual: (P_E @ diag(M) @ P_E) @ grad_E.
+
+        By construction, P_E @ grad_E = 0, so this should be zero.
+        Used for monitoring only.
+        """
+        Mv = M_diag * grad_E
+        grad_E_dot_Mv = (grad_E * Mv).sum(dim=-1, keepdim=True)
+        grad_E_norm_sq = (grad_E ** 2).sum(dim=-1, keepdim=True) + self.eps
+        return Mv - (grad_E_dot_Mv / grad_E_norm_sq) * grad_E
 
     def forward(
         self,
@@ -361,15 +394,15 @@ class GenerickeDegeneracyProjection(nn.Module):
         grad_S: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply both degeneracy projections.
+        Apply GENERIC degeneracy projections.
 
         Returns:
-            L_proj: Projected antisymmetric matrix
-            M_diag_proj: Projected diagonal mobility
+            L_proj: Projected antisymmetric matrix (L @ grad_S ≈ 0)
+            Mv_proj: Projected mobility action (M @ grad_E ≈ 0 via P_E diag(M) P_E)
         """
         L_proj = self.project_L_orthogonal_to_gradS(L, grad_S)
-        M_diag_proj = self.project_M_orthogonal_to_gradE(M_diag, grad_E)
-        return L_proj, M_diag_proj
+        Mv_proj = self.project_M_action_onto_gradS(M_diag, grad_S, grad_E)
+        return L_proj, Mv_proj
 
 
 class VelocityBrain(nn.Module):
@@ -382,12 +415,12 @@ class VelocityBrain(nn.Module):
 
     def __init__(
         self,
-        hidden_dim: int = 2048,
+        hidden_dim: int = 1024,
         num_poisson_layers: int = 3,
         num_energy_layers: int = 3,
         dropout: float = 0.1,
         ou_tau: float = 0.02,
-        noise_dim: int = 2048,
+        noise_dim: int = 1024,
         apply_degeneracy_projection: bool = True,
         degeneracy_check_interval: int = 1,
         use_lowrank_poisson: bool = False,
@@ -450,17 +483,17 @@ class VelocityBrain(nn.Module):
 
         if salience is not None:
             M_diag = self.mobility_op(z, salience)
-            mobility_term = M_diag * grad_S
         else:
             M_diag = torch.ones_like(grad_S) * 0.1
-            mobility_term = M_diag * grad_S
-
-        arousal_term = self.arousal_scale * self.arousal_vector
 
         if (self.apply_degeneracy_projection
                 and self.step_counter % self.degeneracy_check_interval == 0
                 and getattr(self, "_degeneracy_enabled", True)):
-            L_z, M_diag = self.degeneracy_proj(L_z, M_diag, grad_E, grad_S)
+            L_z, mobility_term = self.degeneracy_proj(L_z, M_diag, grad_E, grad_S)
+        else:
+            mobility_term = M_diag * grad_S
+
+        arousal_term = self.arousal_scale * self.arousal_vector
 
         delta_z = poisson_term + mobility_term + arousal_term
 
@@ -475,7 +508,7 @@ class VelocityBrain(nn.Module):
         # L_z is (B, d, d) from poisson_op; grad_S is (B, d)
         L_grad_S = torch.bmm(L_z, grad_S.unsqueeze(-1)).squeeze(-1)
         L_grad_S_norm = torch.norm(L_grad_S, dim=-1).mean()
-        M_grad_E = M_diag * grad_E
+        M_grad_E = self.degeneracy_proj.compute_M_grad_E_projected(M_diag, grad_E)
         M_grad_E_norm = torch.norm(M_grad_E, dim=-1).mean()
 
         metrics = {
@@ -483,8 +516,8 @@ class VelocityBrain(nn.Module):
             "||grad_E||": torch.norm(grad_E, dim=-1).mean(),
             "||grad_S||": torch.norm(grad_S, dim=-1).mean(),
             "||arousal||": torch.norm(self.arousal_vector, dim=-1).mean(),
-            "degeneracy_L_grad_S": L_grad_S_norm.item(),
-            "degeneracy_M_grad_E": M_grad_E_norm.item(),
+            "degeneracy_L_grad_S": L_grad_S_norm,
+            "degeneracy_M_grad_E": M_grad_E_norm,
         }
 
         self.step_counter += 1
@@ -494,6 +527,8 @@ class VelocityBrain(nn.Module):
             "new_noise_state": new_noise_state,
             "grad_E": grad_E,
             "grad_S": grad_S,
+            "L_z": L_z,
+            "M_diag": M_diag,
             "degeneracy_L_grad_S_norm": L_grad_S_norm,
             "degeneracy_M_grad_E_norm": M_grad_E_norm,
             "metrics": metrics,
@@ -534,16 +569,16 @@ class MultiTimeScaleKDA(nn.Module):
 
     def __init__(
         self,
-        hidden_dim: int = 2048,
+        hidden_dim: int = 1024,
         alphas: Tuple[float, float, float] = (0.1, 0.5, 0.9),
     ):
         super().__init__()
         self.alphas = alphas
         self.hidden_dim = hidden_dim
 
-        self.state_a = nn.Parameter(torch.zeros(1, hidden_dim))
-        self.state_b = nn.Parameter(torch.zeros(1, hidden_dim))
-        self.state_c = nn.Parameter(torch.zeros(1, hidden_dim))
+        self.register_buffer("state_a", torch.zeros(1, hidden_dim))
+        self.register_buffer("state_b", torch.zeros(1, hidden_dim))
+        self.register_buffer("state_c", torch.zeros(1, hidden_dim))
 
         self.mix_weights = nn.Sequential(
             nn.Linear(hidden_dim * 3, 3),
@@ -560,11 +595,6 @@ class MultiTimeScaleKDA(nn.Module):
             (B, d) decay-weighted combined output
         """
         B = delta_z.shape[0]
-        device = delta_z.device
-
-        self.state_a.data = self.state_a.data.to(device)
-        self.state_b.data = self.state_b.data.to(device)
-        self.state_c.data = self.state_c.data.to(device)
 
         state_a = self.state_a.expand(B, -1)
         state_b = self.state_b.expand(B, -1)
@@ -583,9 +613,9 @@ class MultiTimeScaleKDA(nn.Module):
 
         output = w_a * state_a + w_b * state_b + w_c * state_c
 
-        self.state_a.data = state_a.detach()
-        self.state_b.data = state_b.detach()
-        self.state_c.data = state_c.detach()
+        self.state_a.data = state_a.mean(dim=0, keepdim=True).detach()
+        self.state_b.data = state_b.mean(dim=0, keepdim=True).detach()
+        self.state_c.data = state_c.mean(dim=0, keepdim=True).detach()
 
         return output
 
@@ -639,11 +669,11 @@ class WienerHomeostat(nn.Module):
         self.ema_decay = ema_decay
         self.clip_min = clip_min
 
-        self.D_eff = D_0
-        self.ema_epr = target_epr
-        self.ema_entropy = target_entropy
-        self.health_ema = 1.0
-        self.step_counter = 0
+        self.register_buffer("D_eff", torch.tensor(D_0, dtype=torch.float64))
+        self.register_buffer("ema_epr", torch.tensor(target_epr, dtype=torch.float64))
+        self.register_buffer("ema_entropy", torch.tensor(target_entropy, dtype=torch.float64))
+        self.register_buffer("health_ema", torch.tensor(1.0, dtype=torch.float64))
+        self.register_buffer("step_counter", torch.tensor(0, dtype=torch.long))
 
         self.D_history: List[float] = []
         self.health_history: List[float] = []
@@ -666,53 +696,52 @@ class WienerHomeostat(nn.Module):
         epr = max(current_epr, self.clip_min)
         entropy = max(router_entropy, self.clip_min)
 
-        self.ema_epr = self.ema_decay * self.ema_epr + (1.0 - self.ema_decay) * epr
-        self.ema_entropy = self.ema_decay * self.ema_entropy + (1.0 - self.ema_decay) * entropy
+        self.ema_epr.fill_(self.ema_decay * self.ema_epr.item() + (1.0 - self.ema_decay) * epr)
+        self.ema_entropy.fill_(self.ema_decay * self.ema_entropy.item() + (1.0 - self.ema_decay) * entropy)
 
         target_epr = max(self.target_epr, self.clip_min)
         target_entropy = max(self.target_entropy, self.clip_min)
 
-        epr_ratio = self.ema_epr / target_epr
-        entropy_ratio = self.ema_entropy / target_entropy
+        epr_ratio = self.ema_epr.item() / target_epr
+        entropy_ratio = self.ema_entropy.item() / target_entropy
 
         health = 0.5 * epr_ratio + 0.5 * entropy_ratio
 
-        self.health_ema = self.ema_decay * self.health_ema + (1.0 - self.ema_decay) * health
+        self.health_ema.fill_(self.ema_decay * self.health_ema.item() + (1.0 - self.ema_decay) * health)
 
-        D_eff = self.D_0 * max(self.clamp_min, min(self.clamp_max, self.health_ema))
+        D_eff = self.D_0 * max(self.clamp_min, min(self.clamp_max, self.health_ema.item()))
 
-        self.D_eff = D_eff
-        self.step_counter += 1
+        self.D_eff.fill_(D_eff)
+        self.step_counter.add_(1)
 
         self.D_history.append(D_eff)
-        self.health_history.append(self.health_ema)
+        self.health_history.append(self.health_ema.item())
         if len(self.D_history) > 10000:
             self.D_history = self.D_history[-5000:]
             self.health_history = self.health_history[-5000:]
 
         return {
             "D_eff": D_eff,
-            "health": self.health_ema,
+            "health": self.health_ema.item(),
             "epr_ratio": epr_ratio,
             "entropy_ratio": entropy_ratio,
-            "ema_epr": self.ema_epr,
-            "ema_entropy": self.ema_entropy,
+            "ema_epr": self.ema_epr.item(),
+            "ema_entropy": self.ema_entropy.item(),
         }
 
     def get_D(self) -> float:
-        """Return current effective noise coefficient."""
-        return self.D_eff
+        return self.D_eff.item()
 
     def get_report(self) -> Dict:
         return {
-            "D_eff": self.D_eff,
+            "D_eff": self.D_eff.item(),
             "D_0": self.D_0,
-            "health": self.health_ema,
-            "ema_epr": self.ema_epr,
-            "ema_entropy": self.ema_entropy,
+            "health": self.health_ema.item(),
+            "ema_epr": self.ema_epr.item(),
+            "ema_entropy": self.ema_entropy.item(),
             "target_epr": self.target_epr,
             "target_entropy": self.target_entropy,
-            "steps": self.step_counter,
+            "steps": self.step_counter.item(),
             "D_mean": float(np.mean(self.D_history)) if self.D_history else self.D_0,
             "health_mean": float(np.mean(self.health_history)) if self.health_history else 1.0,
         }
@@ -720,7 +749,7 @@ class WienerHomeostat(nn.Module):
 
 if __name__ == "__main__":
     print("Testing VelocityBrain...")
-    vb = VelocityBrain(hidden_dim=2048)
+    vb = VelocityBrain(hidden_dim= 1024)
     z = torch.randn(4, 2048)
     salience = torch.randn(4, 2048) * 0.1
     result = vb(z, salience, apply_noise=False)
@@ -729,7 +758,7 @@ if __name__ == "__main__":
     print("  metrics:", {k: f"{v.mean().item():.4f}" for k, v in result['metrics'].items()})
 
     print("\nTesting MultiTimeScaleKDA...")
-    kda = MultiTimeScaleKDA(hidden_dim=2048)
+    kda = MultiTimeScaleKDA(hidden_dim= 1024)
     out = kda(result['delta_z'])
     print(f"  KDA output shape: {out.shape}")
     print("All tests passed!")

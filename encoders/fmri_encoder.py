@@ -15,11 +15,11 @@ Fallback: BrainLM (ICLR 2024) if NeuroSTORM weights unavailable.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict, Any
 import math
 
 import sys
-sys.path.insert(0, "/home/yanlu/Documents/a")
 
 try:
     from brain_moe_pinn.utils.mamba2_ssm import Mamba2EncoderBlock, FLA_MAMBA2_AVAILABLE
@@ -40,7 +40,7 @@ class NeuroSTORMPromptTuning(nn.Module):
     def __init__(
         self,
         num_prompts: int = 32,
-        prompt_dim: int = 768,
+        prompt_dim: int = 96,
         num_layers: int = 4,
         dropout: float = 0.1,
     ):
@@ -142,15 +142,21 @@ class ShiftedWindowMambaBlock(nn.Module):
         return x
 
     def _mamba_block(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply simplified Mamba-style transformation."""
+        """
+        Gated linear transformation with learned timestep modulation.
+
+        NOTE: This is a simplified gating layer, NOT a full selective SSM.
+        A_log, B_param, and C_param are reserved for future S6 discretization.
+        The actual NeuroSTORM SSM backbone is provided by the pretrained model.
+        """
         B_tokens, D = x.shape
         x_gate = self.in_proj(x)
         x_inner, gate = x_gate.chunk(2, dim=-1)
         x_inner = x_inner * torch.sigmoid(gate)
         ssm_params = self.x_proj(x_inner)
-        B_param, C_param, dt_bias = ssm_params.split([self.state_dim, self.state_dim, 1], dim=-1)
-        dt = torch.softplus(self.dt_bias.unsqueeze(0) + dt_bias)
-        output = self.out_proj(x_inner * dt.squeeze(-1).float()) + self.D.float() * x_inner
+        _, _, dt_bias = ssm_params.split([self.state_dim, self.state_dim, 1], dim=-1)
+        dt = F.softplus(self.dt_bias.unsqueeze(0) + dt_bias)
+        output = self.out_proj(x_inner * dt.squeeze(-1).float() + self.D.float() * x_inner)
         return output
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -323,7 +329,7 @@ class NeuroSTORMEncoder(nn.Module):
         depths: List[int] = [2, 2, 6, 2],
         window_size: int = 4,
         num_prompts: int = 32,
-        prompt_dim: int = 768,
+        prompt_dim: int = 96,
         dropout: float = 0.1,
         use_tpt: bool = True,
         use_mamba2: bool = False,
@@ -355,7 +361,7 @@ class NeuroSTORMEncoder(nn.Module):
         if self.use_tpt:
             self.prompt_tuning = NeuroSTORMPromptTuning(
                 num_prompts=num_prompts,
-                prompt_dim=hidden_dims[-1],
+                prompt_dim=hidden_dims[0],
                 num_layers=4,
                 dropout=dropout,
             )
@@ -448,7 +454,7 @@ class NeuroSTORMEncoder(nn.Module):
 
         if self.use_tpt:
             prompt_list = self.prompt_tuning(B)
-            prompt_tokens = prompt_list[-1]
+            prompt_tokens = prompt_list[0] if isinstance(prompt_list, list) else prompt_list
             tokens = torch.cat([prompt_tokens, tokens], dim=1)
 
         features = self.backbone(tokens)
@@ -457,7 +463,9 @@ class NeuroSTORMEncoder(nn.Module):
 
         if self.use_tpt:
             num_prompts = self.prompt_tuning.num_prompts
-            last_hidden = last_hidden[:, num_prompts:, :]
+            seq_len = last_hidden.shape[1]
+            if seq_len > num_prompts:
+                last_hidden = last_hidden[:, num_prompts:, :]
 
         pooler_out = self.pooler_activation(self.pooler(last_hidden.mean(dim=1)))
 
@@ -494,7 +502,9 @@ class NeuroSTORMEncoder(nn.Module):
 
         if self.use_tpt:
             num_prompts = self.prompt_tuning.num_prompts
-            last_hidden = last_hidden[:, num_prompts:, :]
+            seq_len = last_hidden.shape[1]
+            if seq_len > num_prompts:
+                last_hidden = last_hidden[:, num_prompts:, :]
 
         pooler_out = self.pooler_activation(self.pooler(last_hidden.mean(dim=1)))
 

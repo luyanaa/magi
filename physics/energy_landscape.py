@@ -13,7 +13,7 @@ def compute_waddington_landscape(
     energy_fn,
     grid_range: Tuple[float, float] = (-3.0, 3.0),
     resolution: int = 50,
-    latent_dim: int = 2048,
+    latent_dim: int = 1024,
     device: str = "cuda",
 ) -> Dict:
     """

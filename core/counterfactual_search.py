@@ -33,7 +33,7 @@ class LatentPerturbation(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         perturbation_dim: int = 64,
         num_actions: int = 4,
     ):
@@ -96,8 +96,7 @@ class LatentPerturbation(nn.Module):
 
         random_coef = torch.randn(B, num_samples, self.perturbation_dim, device=z_current.device) * 0.1
 
-        perturbations = random_coef @ casimir.transpose(-2, -1)
-        perturbations = perturbations.squeeze(-1)
+        perturbations = casimir + random_coef
         perturbations = self.action_proj(perturbations)
 
         return perturbations
@@ -132,7 +131,7 @@ class TrajectoryRollout(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         num_steps: int = 10,
         dt: float = 0.001,
     ):
@@ -199,7 +198,7 @@ class TrajectoryDiscriminator(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         hidden_dim: int = 512,
     ):
         super().__init__()
@@ -254,7 +253,7 @@ class CounterfactualTreeSearch(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         num_goals: int = 2,
         num_exploration: int = 1,
         rollout_steps: int = 3,
@@ -356,6 +355,10 @@ class CounterfactualTreeSearch(nn.Module):
         num_a0 = actions_0.shape[1]  # branch_factor
 
         # Rollout step 0 with all level-0 actions
+        # NOTE: Tree search uses geometric action perturbations only (no velocity net).
+        # This is intentional — running the full VelocityBrain for each leaf would be
+        # O(branch_factor^3) forward passes. The TrajectoryRollout class implements
+        # the full dynamics for single-trajectory rollouts when accuracy is needed.
         z_expanded_0 = z_root.unsqueeze(1).expand(-1, num_a0, -1)  # (B, num_a0, d)
         z_next_0 = z_expanded_0 + actions_0 * math.sqrt(self.rollout.dt)  # (B, num_a0, d)
 
@@ -405,9 +408,11 @@ class CounterfactualTreeSearch(nn.Module):
         # Score all leaf states
         z_leaf_flat = z_leaf.reshape(B, num_a0 * num_a1 * num_a2, self.latent_dim)
 
-        # Create pseudo-trajectories for discriminator
-        traj_for_disc = z_leaf_flat.unsqueeze(2)  # (B, num_leaves, 1, d)
-        scores_flat = self.discriminator(traj_for_disc)  # (B, num_leaves)
+        # Create pseudo-trajectories for discriminator (shape: B*num_leaves, 1, d)
+        num_leaves = num_a0 * num_a1 * num_a2
+        traj_for_disc = z_leaf_flat.reshape(B * num_leaves, 1, self.latent_dim)
+        scores = self.discriminator(traj_for_disc)  # (B*num_leaves,)
+        scores_flat = scores.reshape(B, num_leaves)  # (B, num_leaves)
 
         best_leaf_indices = scores_flat.argmin(dim=1)  # (B,)
 
@@ -449,7 +454,7 @@ class ImaginationSampler(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         hidden_dim: int = 512,
         num_timesteps: int = 20,
     ):
@@ -502,8 +507,6 @@ class ImaginationSampler(nn.Module):
         std = torch.exp(0.5 * log_std)
         eps = torch.randn_like(mean)
         imagined_states = mean + std * eps
-
-        imagined_states = imagined_states.transpose(1, 2)
 
         return {
             "imagined_states": imagined_states,

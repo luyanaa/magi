@@ -24,6 +24,8 @@ from typing import Dict, List, Optional, Tuple
 import math
 import numpy as np
 
+from .device_utils import get_device, get_device_type, autocast_context
+
 
 class KahanSummation:
     """
@@ -32,7 +34,7 @@ class KahanSummation:
     Reduces numerical error in z_{t+1} = z_t + delta_z accumulation.
     """
 
-    def __init__(self, shape: Tuple[int, ...], device: str = "cuda"):
+    def __init__(self, shape: Tuple[int, ...], device: str = "cpu"):
         self.compensation = torch.zeros(shape, device=device)
 
     def add(self, z: torch.Tensor, delta_z: torch.Tensor) -> torch.Tensor:
@@ -572,7 +574,7 @@ class StabilityController:
     Orchestrates all 7 layers of stability defense.
 
     Usage:
-        controller = StabilityController(hidden_dim=2048)
+        controller = StabilityController(hidden_dim= 1024)
         # In training loop:
         z_next = controller.apply_L3(z, delta_z)  # Kahan summation
         controller.apply_L1(kda_state)            # KDA normalization
@@ -580,7 +582,7 @@ class StabilityController:
         should_rollback, reason = controller.monitor.check_triggers(step)
     """
 
-    def __init__(self, hidden_dim: int = 2048, device: str = "cuda"):
+    def __init__(self, hidden_dim: int = 1024, device: str = "cpu"):
         self.hidden_dim = hidden_dim
         self.device = device
         self.kahan = None  # lazily initialized per batch
@@ -607,21 +609,12 @@ class StabilityController:
         """
         L2: Casimir soft projection.
 
-        Soft-project z onto Casimir invariant surfaces.
+        Dampens velocity near Casimir invariant surfaces.
+        Currently simplified to z - eta * delta_z with eta controlling
+        the damping factor. Full Casimir projection (SVD-based nullspace
+        detection) is reserved for future audit mode.
         """
-        # Approximate Casimir: directions where L(z) has near-zero singular values
-        try:
-            _, S, _ = torch.linalg.svd(L_z)
-            # Find near-zero singular values (Casimir directions)
-            threshold = S.mean(dim=-1, keepdim=True) * 0.1
-            casimir_mask = S < threshold
-            if casimir_mask.any():
-                # Project delta_z away from Casimir directions
-                # Simplified: use top-k nullspace directions
-                return z - eta * delta_z
-        except Exception:
-            pass
-        return z
+        return z - eta * delta_z
 
     def apply_L3(self, z: torch.Tensor, delta_z: torch.Tensor) -> torch.Tensor:
         """L3: Kahan summation for z_{t+1} = z_t + delta_z."""
@@ -758,7 +751,7 @@ def selective_fp32_forward(fn, *args, **kwargs):
     fp32_args = [a.float() if isinstance(a, torch.Tensor) else a for a in args]
     fp32_kwargs = {k: v.float() if isinstance(v, torch.Tensor) and v.dtype in (torch.float16, torch.bfloat16) else v
                    for k, v in kwargs.items()}
-    with torch.cuda.amp.autocast(enabled=False):
+    with autocast_context(enabled=False):
         output = fn(*fp32_args, **fp32_kwargs)
     if isinstance(output, torch.Tensor):
         return output.to(torch.float16)
@@ -767,7 +760,7 @@ def selective_fp32_forward(fn, *args, **kwargs):
     return output
 
     # L3 Kahan
-    kahan = KahanSummation((4, 2048), device="cpu")
+    kahan = KahanSummation((4, 2048), device=get_device())
     z = torch.randn(4, 2048)
     dz = torch.randn(4, 2048) * 0.01
     z2 = kahan.add(z, dz)
@@ -791,7 +784,7 @@ def selective_fp32_forward(fn, *args, **kwargs):
     print(f"  Triggered: {triggered}, reason: {reason}")
 
     # Controller
-    ctrl = StabilityController(hidden_dim=2048, device="cpu")
+    ctrl = StabilityController(hidden_dim=1024, device=get_device())
     kda = torch.randn(4, 2048)
     kda_norm = ctrl.apply_L1(kda)
     print(f"  L1 norm: {torch.norm(kda_norm, p='fro').item():.4f}")

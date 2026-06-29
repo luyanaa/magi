@@ -13,14 +13,13 @@ import torch
 import torch.nn as nn
 from typing import Optional, Dict, Tuple, List
 import math
+import warnings
 
 import sys
-sys.path.insert(0, "/home/yanlu/Documents/flash-linear-attention")
-
 try:
-    from fla.layers import KimiDeltaAttention
+    import fla
     FLA_AVAILABLE = True
-except ImportError as e:
+except ImportError:
     FLA_AVAILABLE = False
     KimiDeltaAttention = None
     print(f"[KDA Decoder] Warning: fla not available ({e}). Using PyTorch fallback.")
@@ -36,7 +35,7 @@ class KDAEncoderBlock(nn.Module):
 
     def __init__(
         self,
-        hidden_size: int = 2048,
+        hidden_size: int = 1024,
         head_dim: int = 128,
         num_heads: Optional[int] = None,
         expand_v: float = 1.0,
@@ -123,10 +122,13 @@ class KDAEncoderBlock(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
             )
+            if attn_out.dtype != residual.dtype:
+                attn_out = attn_out.to(residual.dtype)
             x = residual + attn_out
         else:
             attn_out, _ = self.attention(x_normed, x_normed, x_normed, attn_mask=attention_mask)
             x = residual + attn_out
+            present = None
 
         residual = x
         x = residual + self.mlp(self.norm2(x))
@@ -221,7 +223,7 @@ class KDADecoderBlock(nn.Module):
 
     def __init__(
         self,
-        hidden_size: int = 2048,
+        hidden_size: int = 1024,
         target_dim: int = 768,
         head_dim: int = 128,
         num_heads: Optional[int] = None,
@@ -314,6 +316,7 @@ class KDADecoderBlock(nn.Module):
         else:
             attn_out, _ = self.self_attn(x_normed, x_normed, x_normed, attn_mask=attention_mask)
             x = residual + attn_out
+            present = None
 
         if context is not None:
             residual = x
@@ -349,7 +352,7 @@ class KDATemporalDecoder(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         output_dim: int = 768,
         num_layers: int = 4,
         kda_ratio: float = 0.25,
@@ -447,9 +450,16 @@ class KDATemporalDecoder(nn.Module):
         presents = [] if use_cache else None
         causal_mask = None
         if use_cache:
+            max_mask_len = 16384
+            mask_len = min(seq_length, max_mask_len)
             causal_mask = torch.triu(
-                torch.ones(seq_length, seq_length, device=device) * float("-inf"), diagonal=1
+                torch.ones(mask_len, mask_len, dtype=torch.bool, device=device), diagonal=1
             )
+            if seq_length > max_mask_len:
+                warnings.warn(
+                    f"seq_length={seq_length} exceeds causal mask limit {max_mask_len}. "
+                    "Mask truncated; past_key_values beyond this limit use no mask."
+                )
 
         for i, block in enumerate(self.decoder_blocks):
             block_pkv = past_key_values[i] if past_key_values is not None else None
@@ -483,7 +493,7 @@ class EEGKDADecoder(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         hidden_dim: int = 768,
         output_channels: int = 19,
         num_layers: int = 4,
@@ -527,7 +537,7 @@ class fMRIKDADecoder(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         hidden_dim: int = 768,
         num_regions: int = 400,
         num_layers: int = 4,
@@ -572,17 +582,22 @@ class KIMIKDAMoDeCoderRouter(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 2048,
+        latent_dim: int = 1024,
         eeg_hidden: int = 768,
         fmri_hidden: int = 768,
+        meg_hidden: int = 768,
         output_channels: int = 19,
         num_regions: int = 400,
+        meg_channels: int = 306,
         patch_size: int = 256,
         num_layers: int = 4,
         head_dim: int = 128,
         dropout: float = 0.1,
+        use_meg: bool = False,
     ):
         super().__init__()
+        self.use_meg = use_meg
+        self.num_modalities = 3 if use_meg else 2
 
         self.eeg_decoder = EEGKDADecoder(
             latent_dim=latent_dim,
@@ -602,10 +617,22 @@ class KIMIKDAMoDeCoderRouter(nn.Module):
             dropout=dropout,
         )
 
+        if use_meg:
+            self.meg_decoder = EEGKDADecoder(
+                latent_dim=latent_dim,
+                hidden_dim=meg_hidden,
+                output_channels=meg_channels,
+                num_layers=num_layers,
+                head_dim=head_dim,
+                dropout=dropout,
+            )
+
+        gate_in = latent_dim * self.num_modalities
+        gate_out = self.num_modalities
         self.gate = nn.Sequential(
-            nn.Linear(latent_dim * 2, latent_dim),
+            nn.Linear(gate_in, latent_dim),
             nn.SiLU(),
-            nn.Linear(latent_dim, 2),
+            nn.Linear(latent_dim, gate_out),
             nn.Softmax(dim=-1),
         )
 
@@ -626,8 +653,10 @@ class KIMIKDAMoDeCoderRouter(nn.Module):
         z: torch.Tensor,
         hub_eeg: torch.Tensor,
         hub_fmri: torch.Tensor,
+        hub_meg: Optional[torch.Tensor] = None,
         eeg_seq_length: int = 256,
         fmri_seq_length: int = 100,
+        meg_seq_length: int = 256,
     ) -> Dict[str, torch.Tensor]:
         """
         Generate modality-specific decodings using KDA decoders.
@@ -636,22 +665,33 @@ class KIMIKDAMoDeCoderRouter(nn.Module):
             z: (B, latent_dim) latent state at t+1
             hub_eeg: (B, latent_dim) EEG hub token
             hub_fmri: (B, latent_dim) fMRI hub token
+            hub_meg: (B, latent_dim) optional MEG hub token
             eeg_seq_length: EEG output sequence length
             fmri_seq_length: fMRI output sequence length
+            meg_seq_length: MEG output sequence length
         Returns:
-            dict with 'eeg_recon', 'fmri_recon', 'gate_weights'
+            dict with 'eeg_recon', 'fmri_recon', 'gate_weights', optional 'meg_recon'
         """
         eeg_out = self.eeg_decoder(z, seq_length=eeg_seq_length)
         fmri_out = self.fmri_decoder(z, seq_length=fmri_seq_length)
 
-        gate_input = torch.cat([hub_eeg, hub_fmri], dim=-1)
+        if self.use_meg and hub_meg is not None:
+            gate_input = torch.cat([hub_eeg, hub_fmri, hub_meg], dim=-1)
+        else:
+            gate_input = torch.cat([hub_eeg, hub_fmri], dim=-1)
         gate_weights = self.gate(gate_input)
 
-        return {
+        result = {
             "eeg_recon": eeg_out,
             "fmri_recon": fmri_out,
             "gate_weights": gate_weights,
         }
+
+        if self.use_meg and hub_meg is not None:
+            meg_out = self.meg_decoder(z, seq_length=meg_seq_length)
+            result["meg_recon"] = meg_out
+
+        return result
 
 
 if __name__ == "__main__":
@@ -663,13 +703,13 @@ if __name__ == "__main__":
         print("fla not available, using PyTorch fallback")
 
     print("\nTesting KDATemporalDecoder...")
-    decoder = KDATemporalDecoder(latent_dim=2048, output_dim=768, num_layers=4)
+    decoder = KDATemporalDecoder(latent_dim= 1024, output_dim=768, num_layers=4)
     z = torch.randn(2, 2048)
     out = decoder(z, seq_length=100)
     print(f"  output shape: {out.shape}")
 
     print("\nTesting EEGKDADecoder...")
-    eeg_dec = EEGKDADecoder(latent_dim=2048, output_channels=19)
+    eeg_dec = EEGKDADecoder(latent_dim= 1024, output_channels=19)
     z = torch.randn(2, 2048)
     eeg_out = eeg_dec(z, seq_length=19)
     print(f"  EEG output shape: {eeg_out.shape}")
@@ -677,12 +717,12 @@ if __name__ == "__main__":
     print(f"  EEG output shape: {eeg_out.shape}")
 
     print("\nTesting fMRIKDADecoder...")
-    fmri_dec = fMRIKDADecoder(latent_dim=2048, num_regions=400)
+    fmri_dec = fMRIKDADecoder(latent_dim= 1024, num_regions=400)
     fmri_out = fmri_dec(z, seq_length=100)
     print(f"  fMRI output shape: {fmri_out.shape}")
 
     print("\nTesting KIMIKDAMoDeCoderRouter...")
-    router = KIMIKDAMoDeCoderRouter(latent_dim=2048, output_channels=19, num_regions=400)
+    router = KIMIKDAMoDeCoderRouter(latent_dim= 1024, output_channels=19, num_regions=400)
     hub_eeg = torch.randn(2, 2048)
     hub_fmri = torch.randn(2, 2048)
     out = router(z, hub_eeg, hub_fmri, eeg_seq_length=19)

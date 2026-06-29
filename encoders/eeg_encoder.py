@@ -23,7 +23,6 @@ except ImportError as e:
     MAGI_AVAILABLE = False
     EEGFoundationModel = None
 
-sys.path.insert(0, "/home/yanlu/Documents/a")
 try:
     from brain_moe_pinn.utils.mamba2_ssm import Mamba2Backbone, FLA_MAMBA2_AVAILABLE
 except ImportError:
@@ -46,8 +45,10 @@ class EEGEncoderWrapper(nn.Module):
 
     def __init__(
         self,
-        hidden_dim: int = 768,
-        output_dim: int = 2048,
+        hidden_dim: int = 512,
+        output_dim: int = 1024,
+        num_layers: int = 8,
+        num_heads: int = 8,
         freeze_encoder: bool = True,
         use_biot_embedding: bool = True,
         use_factorized: bool = False,
@@ -60,10 +61,13 @@ class EEGEncoderWrapper(nn.Module):
         mamba2_layers: int = 4,
         mamba2_chunk_size: int = 256,
         mamba2_backend: str = "triton",
+        use_momentum_encoder: bool = True,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
         self.freeze_encoder = freeze_encoder
         self.freeze_epochs = freeze_epochs
         self.current_epoch = 0
@@ -78,8 +82,11 @@ class EEGEncoderWrapper(nn.Module):
                 use_biot_embedding=use_biot_embedding,
                 use_factorized=use_factorized,
                 channels=channels,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                use_momentum_encoder=use_momentum_encoder,
             )
-            print(f"[EEGEncoderWrapper] Loaded Magi EEGFoundationModel (BIOT={use_biot_embedding}, factorized={use_factorized})")
+            print(f"[EEGEncoderWrapper] Loaded Magi EEGFoundationModel ({num_layers}L×{hidden_dim}d, heads={num_heads}, BIOT={use_biot_embedding}, factorized={use_factorized})")
         else:
             raise RuntimeError(
                 f"Magi EEGFoundationModel not available. MAGI_AVAILABLE={MAGI_AVAILABLE}. "
@@ -241,7 +248,7 @@ class EEGProjection(nn.Module):
     def __init__(
         self,
         input_dim: int = 768,
-        output_dim: int = 2048,
+        output_dim: int = 1024,
         dropout: float = 0.1,
     ):
         super().__init__()
