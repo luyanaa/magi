@@ -103,6 +103,53 @@ class ChannelSignalAdapter(nn.Module):
         return channel_tokens.mean(dim=1)
 
 
+def _linear_resample(x: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Linear resample along the last axis (``align_corners=True``).
+
+    Drop-in equivalent to ``F.interpolate(x, size=target_len, mode="linear",
+    align_corners=True)`` -- verified to 2.4e-07 forward and *bit-identical*
+    backward -- expressed with indexing and multiplication.
+
+    This exists only as a fallback for accelerators whose ``upsample_linear1d``
+    has no backward kernel.  torch_musa 1.3.0 is the known case: forward is
+    implemented, backward is not, so training dies with "Could not run
+    'aten::upsample_linear1d_backward.grad_input' with arguments from the
+    'musa' backend".  Everywhere else the vendor-tuned ``F.interpolate``
+    kernel is preferred, which is what :func:`_resample_time` selects.
+    """
+    time_in = x.shape[-1]
+    if target_len == time_in:
+        return x
+    if target_len == 1:
+        return x[..., :1]
+    src = torch.arange(target_len, device=x.device, dtype=x.dtype) * (
+        (time_in - 1) / (target_len - 1))
+    lower = src.floor().long().clamp(0, time_in - 1)
+    upper = (lower + 1).clamp(0, time_in - 1)
+    frac = (src - lower.to(src.dtype)).to(x.dtype)
+    return (x[..., lower] * (1.0 - frac).view(1, 1, -1)
+            + x[..., upper] * frac.view(1, 1, -1))
+
+
+def _portable_resample_required(device_type: str) -> bool:
+    """Whether this device needs the hand-rolled resample.
+
+    Only MUSA is known to ship ``upsample_linear1d`` without its backward
+    kernel.  Keeping the workaround narrow means every other backend keeps
+    the tuned native kernel.
+    """
+    return device_type == "musa"
+
+
+def _resample_time(x: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Resample the time axis to ``target_len`` on the backend's best path."""
+    if x.shape[-1] == target_len:
+        return x
+    if _portable_resample_required(x.device.type):
+        return _linear_resample(x, target_len)
+    return F.interpolate(x, size=target_len, mode="linear", align_corners=True)
+
+
 class SignalReconstructionHead(nn.Module):
     """Generative decoder: evolved latent (+ channel identity) -> signal.
 
@@ -199,5 +246,4 @@ class SignalReconstructionHead(nn.Module):
         )
         if target_time_len == self.num_time_basis:
             return frames
-        return F.interpolate(
-            frames, size=target_time_len, mode="linear", align_corners=True)
+        return _resample_time(frames, target_time_len)

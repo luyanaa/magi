@@ -13,6 +13,11 @@ torch = pytest.importorskip("torch")
 from brain_moe_pinn import BrainMoEPINN
 from brain_moe_pinn.training.losses import ReconstructionLoss, TotalLoss
 from brain_moe_pinn.training.training_phases import LossWeights
+from brain_moe_pinn.core.observation_adapters import (
+    _linear_resample,
+    _portable_resample_required,
+    _resample_time,
+)
 
 
 def _make_generic_model():
@@ -228,3 +233,73 @@ def test_species_batch_helpers():
     assert augmented2.recon_loss_types == {"calcium": "huber"}
     # Nothing to add -> same object back (no accidental copies).
     assert augment_phase_loss_weights(LossWeights(), (), {}) is not None
+
+
+class TestPortableResample:
+    """`_linear_resample` replaces F.interpolate in the reconstruction head.
+
+    F.interpolate lowers to upsample_linear1d, whose backward kernel is
+    missing on some accelerators (torch_musa 1.3.0 has forward only), which
+    killed training on MUSA. The replacement must stay numerically identical.
+    """
+
+    @pytest.mark.parametrize("time_in,time_out", [
+        (64, 256), (256, 64), (64, 128), (7, 129), (129, 7),
+        (64, 1), (1, 64), (64, 2), (2, 64), (64, 64),
+    ])
+    def test_matches_interpolate_forward(self, time_in, time_out):
+        import torch.nn.functional as F
+        torch.manual_seed(0)
+        x = torch.randn(3, 8, time_in)
+        ref = F.interpolate(x, size=time_out, mode="linear", align_corners=True)
+        assert torch.allclose(_linear_resample(x, time_out), ref, atol=1e-6)
+
+    def test_matches_interpolate_backward(self):
+        """Gradients must match exactly - this is the path MUSA lacked."""
+        import torch.nn.functional as F
+        torch.manual_seed(0)
+        a = torch.randn(2, 4, 64, requires_grad=True)
+        b = a.detach().clone().requires_grad_(True)
+        F.interpolate(a, size=200, mode="linear", align_corners=True).sum().backward()
+        _linear_resample(b, 200).sum().backward()
+        assert torch.equal(a.grad, b.grad)
+
+    def test_identity_and_singleton(self):
+        x = torch.randn(2, 3, 16)
+        assert _linear_resample(x, 16) is x
+        assert _linear_resample(x, 1).shape == (2, 3, 1)
+        assert torch.allclose(_linear_resample(x, 1), x[..., :1])
+
+class TestResampleDispatch:
+    """The portable path must stay a narrow MUSA-only workaround.
+
+    Every other backend keeps the vendor-tuned F.interpolate kernel; only the
+    device whose backward kernel is missing gets the hand-rolled version.
+    """
+
+    def test_only_musa_takes_portable_path(self):
+        assert _portable_resample_required("musa")
+        for other in ("cpu", "cuda", "xpu", "xla", "npu", "mlu", "mps"):
+            assert not _portable_resample_required(other), other
+
+    def test_non_musa_uses_native_interpolate(self, monkeypatch):
+        """A CUDA/CPU tensor must go through F.interpolate, not the fallback."""
+        import torch.nn.functional as F
+        import brain_moe_pinn.core.observation_adapters as oa
+
+        calls = []
+        real = F.interpolate
+
+        def spy(*args, **kwargs):
+            calls.append(kwargs.get("mode"))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(oa.F, "interpolate", spy)
+        x = torch.randn(2, 3, 64)
+        out = _resample_time(x, 128)
+        assert calls == ["linear"], "native interpolate was not used on CPU"
+        assert out.shape == (2, 3, 128)
+
+    def test_identity_short_circuits(self):
+        x = torch.randn(2, 3, 16)
+        assert _resample_time(x, 16) is x

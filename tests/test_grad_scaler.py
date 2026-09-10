@@ -11,6 +11,7 @@ functioning scaler look like a NaN-gradient bug when grads are read after
 import pytest
 import torch
 
+import brain_moe_pinn.runtime.device_utils as du
 from brain_moe_pinn.runtime.device_utils import (
     DEFAULT_INIT_SCALE,
     grad_scaler,
@@ -69,3 +70,81 @@ def test_cuda_scaler_starts_at_default_and_override():
 def test_device_type_resolution_used_for_scaler():
     """grad_scaler keys off the resolved device type, not the raw argument."""
     assert get_device_type("cpu") == "cpu"
+
+
+# --- vendor backends and old-torch robustness -----------------------------
+
+class _RecordingScaler:
+    """Stand-in for a vendor GradScaler that records its init_scale."""
+
+    def __init__(self, init_scale=None, **kwargs):
+        self.init_scale = init_scale
+
+    def get_scale(self):
+        return self.init_scale
+
+    def is_enabled(self):
+        return True
+
+
+def _install_vendor_stub(monkeypatch, module_name, attr_path, scaler):
+    """Install a fake vendor module exposing ``attr_path`` -> scaler class."""
+    import sys
+    import types
+
+    obj = types.ModuleType(module_name)
+    cur = obj
+    parts = attr_path.split(".")
+    for part in parts[:-1]:
+        nxt = types.ModuleType(f"{module_name}.{part}")
+        setattr(cur, part, nxt)
+        cur = nxt
+    setattr(cur, parts[-1], scaler)
+    monkeypatch.setitem(sys.modules, module_name, obj)
+
+
+@pytest.mark.parametrize("vendor", ["musa", "npu", "mlu"])
+def test_vendor_backends_use_vendor_scaler(monkeypatch, vendor):
+    """Each vendor backend must get its *own* scaler, not an inert one.
+
+    An enabled-but-inert scaler silently removes the fp16 safety net, so a
+    vendor that ships a real GradScaler must be routed to it.
+    """
+    module_name, _autocast, scaler_attr, _label = du._VENDOR_BACKENDS[vendor]
+    _install_vendor_stub(monkeypatch, module_name, scaler_attr, _RecordingScaler)
+    monkeypatch.setattr(du, "get_device_type", lambda device=None: vendor)
+
+    scaler = du.grad_scaler(None, enabled=True, init_scale=256.0)
+    assert isinstance(scaler, _RecordingScaler)
+    assert scaler.get_scale() == 256.0
+
+
+def test_vendor_backends_declare_both_attrs():
+    """Every vendor entry needs an autocast path and a scaler path."""
+    for name, entry in du._VENDOR_BACKENDS.items():
+        assert len(entry) == 4, f"{name} entry is not a 4-tuple"
+        module, autocast_attr, scaler_attr, label = entry
+        assert module and autocast_attr and scaler_attr and label
+        assert autocast_attr.endswith("autocast")
+        assert scaler_attr.endswith("GradScaler")
+
+
+def test_disabled_scaler_without_torch_amp_gradscaler(monkeypatch):
+    """torch < 2.3 has no torch.amp.GradScaler; this must not raise.
+
+    Every non-CUDA/XPU device routes through _disabled_scaler, so depending
+    on the newer attribute took out CPU, MUSA and XLA at once.
+    """
+    monkeypatch.delattr(torch.amp, "GradScaler", raising=False)
+    scaler = du._disabled_scaler("cpu")
+    assert not scaler.is_enabled()
+    loss = torch.tensor(1.5)
+    assert torch.equal(scaler.scale(loss), loss)
+
+
+def test_disabled_scaler_raises_when_no_implementation(monkeypatch):
+    """With neither attribute present, fail loudly rather than silently."""
+    monkeypatch.delattr(torch.amp, "GradScaler", raising=False)
+    monkeypatch.delattr(torch.cuda.amp, "GradScaler", raising=False)
+    with pytest.raises(RuntimeError, match="no GradScaler implementation"):
+        du._disabled_scaler("cpu")

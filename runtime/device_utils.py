@@ -151,11 +151,14 @@ def safe_epsilon(reference, default: float = 1e-8) -> float:
 # on its own once a clean window is seen, so dynamic range is unaffected.
 DEFAULT_INIT_SCALE = 4096.0
 
-_VENDOR_AMP = {
-    # device type -> (module, attribute path to the vendor autocast factory)
-    "npu": ("torch_npu", "npu.amp.autocast", "Ascend NPU"),
-    "musa": ("torch_musa", "core.amp.autocast", "Moore Threads MUSA"),
-    "mlu": ("torch_mlu", "core.amp.autocast", "Cambricon MLU"),
+_VENDOR_BACKENDS = {
+    # device type -> (module, autocast attr, scaler attr, label)
+    "npu": ("torch_npu", "npu.amp.autocast",
+            "npu.amp.GradScaler", "Ascend NPU"),
+    "musa": ("torch_musa", "core.amp.autocast",
+             "core.amp.GradScaler", "Moore Threads MUSA"),
+    "mlu": ("torch_mlu", "core.amp.autocast",
+            "core.amp.GradScaler", "Cambricon MLU"),
 }
 
 
@@ -221,6 +224,52 @@ def _xla_autocast_dtype(dtype: Optional[torch.dtype]) -> torch.dtype:
     return dtype
 
 
+def device_aware_gru():
+    """An ``nn.GRU`` that routes each call to the implementation that can run it.
+
+    ``torch_xla/_patched_functions.py`` runs::
+
+        nn.GRU = _pathch_module(nn.GRU, ScanGRU)
+
+    which rebinds the class **globally**, not only on XLA devices.  Its
+    scan-based implementation requires XLA tensors, so ordinary CPU (and CUDA)
+    input raises "Expected all tensors in the given list to be XLA tensors" --
+    any CPU use of ``nn.GRU`` breaks merely because torch_xla is importable,
+    which is what failed three ``test_audit_invariants`` cases on a TPU host.
+
+    Routing is decided per call from the input tensor, which is the only
+    correct scope:
+
+    * XLA input keeps torch_xla's scan implementation (the TPU fast path).
+    * Any other input uses the native class that ``_pathch_module`` stored as
+      ``_orig`` -- the library's own way back.
+    * Hosts without torch_xla get plain ``nn.GRU`` untouched, so CUDA/CPU
+      code paths are bit-for-bit what they were; this function is a no-op
+      there.
+
+    Scoping by *host* instead would be wrong: on a TPU the CPU-tensor code
+    paths must still work, and a CUDA user who happens to have torch_xla
+    installed would otherwise be stuck with a class that rejects CUDA tensors.
+
+    The returned class subclasses the installed one, so parameter names -- and
+    therefore existing checkpoints -- are unchanged.
+    """
+    installed = torch.nn.GRU
+    native = getattr(installed, "_orig", None)
+    if native is None:
+        return installed
+
+    class _DeviceAwareGRU(installed):
+        def forward(self, input, hx=None):
+            if getattr(input, "is_xla", False):
+                return super().forward(input, hx)
+            return native.forward(self, input, hx)
+
+    _DeviceAwareGRU.__name__ = "GRU"
+    _DeviceAwareGRU.__qualname__ = "GRU"
+    return _DeviceAwareGRU
+
+
 def autocast_context(device: Optional[Union[str, torch.device]] = None, enabled: bool = True, dtype: Optional[torch.dtype] = None):
     """
     Return an autocast context manager for the resolved device type.
@@ -254,10 +303,10 @@ def autocast_context(device: Optional[Union[str, torch.device]] = None, enabled:
     if _torch_amp_accepts(dt):
         return torch.amp.autocast(device_type=dt, dtype=dtype, enabled=True)
 
-    vendor = _VENDOR_AMP.get(dt)
+    vendor = _VENDOR_BACKENDS.get(dt)
     if vendor is not None:
-        module_name, attr_path, label = vendor
-        factory = _resolve_attr(_require_vendor(module_name, label), attr_path)
+        module_name, autocast_attr, _scaler_attr, label = vendor
+        factory = _resolve_attr(_require_vendor(module_name, label), autocast_attr)
         return factory(dtype=dtype) if dtype is not None else factory()
 
     raise RuntimeError(
@@ -303,10 +352,14 @@ def grad_scaler(device: Optional[Union[str, torch.device]] = None,
 
     scale = DEFAULT_INIT_SCALE if init_scale is None else float(init_scale)
 
-    if dt == "npu":
-        # Ascend ships its own scaler; stock torch would be inert here.
-        scaler_cls = _resolve_attr(
-            _require_vendor("torch_npu", "Ascend NPU"), "npu.amp.GradScaler")
+    # Vendor accelerators ship their own scaler; stock torch would be inert
+    # (or, for MUSA/MLU, invalid) here.  Using the vendor one matters: an
+    # enabled-but-inert scaler silently removes the fp16 safety net, so
+    # overflowing gradients get applied instead of skipped.
+    vendor = _VENDOR_BACKENDS.get(dt)
+    if vendor is not None:
+        module_name, _autocast_attr, scaler_attr, label = vendor
+        scaler_cls = _resolve_attr(_require_vendor(module_name, label), scaler_attr)
         return scaler_cls(init_scale=scale)
 
     if dt in ("cuda", "xpu") and _device_available(dt):
@@ -321,10 +374,40 @@ def _device_available(device_type: str) -> bool:
 
 
 def _disabled_scaler(device_type: str):
-    try:
-        return torch.amp.GradScaler(device=device_type, enabled=False)
-    except Exception:
-        return torch.amp.GradScaler(enabled=False)
+    """Return an inert scaler, on any supported torch.
+
+    ``torch.amp.GradScaler`` only exists from torch 2.3; before that the
+    scaler lives at ``torch.cuda.amp.GradScaler``.  Depending on the newer
+    path alone made this raise AttributeError on older builds -- and since
+    every non-CUDA/XPU device routes here, that took out CPU, MUSA and XLA
+    alike.  The fallback is a real disabled scaler, not a stand-in: it must
+    pass losses through untouched so a disabled path cannot distort them.
+    """
+    newer = getattr(getattr(torch, "amp", None), "GradScaler", None)
+    if newer is not None:
+        try:
+            return newer(device=device_type, enabled=False)
+        except Exception:
+            try:
+                return newer(enabled=False)
+            except Exception:
+                pass
+
+    legacy = getattr(getattr(getattr(torch, "cuda", None), "amp", None),
+                     "GradScaler", None)
+    if legacy is not None:
+        # Only reached when the preferred torch.amp.GradScaler is missing, so
+        # the "prefer torch.amp" deprecation notice is moot by construction.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            try:
+                return legacy(device=device_type, enabled=False)
+            except Exception:
+                return legacy(enabled=False)
+
+    raise RuntimeError(
+        "no GradScaler implementation found; expected torch.amp.GradScaler "
+        "(torch>=2.3) or torch.cuda.amp.GradScaler")
 
 
 def set_device(local_rank: int):

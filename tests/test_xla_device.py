@@ -116,3 +116,70 @@ def test_xla_autocast_context_is_constructible():
 def test_xla_scaler_is_disabled():
     """XLA gets a disabled scaler: bf16 has fp32's range and needs no scaling."""
     assert not du.grad_scaler("xla", enabled=True).is_enabled()
+
+
+class TestDeviceAwareGRU:
+    """torch_xla rebinds nn.GRU globally; calls must still route correctly.
+
+    torch_xla/_patched_functions.py does
+    `nn.GRU = _pathch_module(nn.GRU, ScanGRU)`, and that scan variant requires
+    XLA tensors - so CPU/CUDA nn.GRU raises as soon as torch_xla is importable.
+    """
+
+    def test_untouched_without_torch_xla(self, monkeypatch):
+        """No shim -> plain nn.GRU, so CUDA/CPU code paths are unchanged."""
+        real = torch.nn.modules.rnn.GRU
+        monkeypatch.setattr(torch.nn, "GRU", real)
+        assert du.device_aware_gru() is real
+
+    def test_non_xla_input_routes_to_native(self, monkeypatch):
+        real = torch.nn.modules.rnn.GRU
+        seen = {}
+
+        class ScanShim(real):
+            _orig = real
+
+            def forward(self, input, hx=None):
+                seen["shim"] = True
+                return super().forward(input, hx)
+
+        monkeypatch.setattr(torch.nn, "GRU", ScanShim)
+        gru = du.device_aware_gru()(4, 3, batch_first=True)
+        out, _ = gru(torch.randn(2, 5, 4))          # CPU tensor
+        assert tuple(out.shape) == (2, 5, 3)
+        assert "shim" not in seen, "XLA scan path was taken for CPU input"
+
+    def test_xla_input_keeps_scan_path(self, monkeypatch):
+        """XLA input must still reach torch_xla's implementation.
+
+        A tensor's `is_xla` attribute is not writable, so routing is exercised
+        with a sentinel whose `is_xla` is True; the shim stands in for the scan
+        implementation and simply records that it was reached.
+        """
+        import types
+
+        real = torch.nn.modules.rnn.GRU
+        seen = {}
+
+        class ScanShim(real):
+            _orig = real
+
+            def forward(self, input, hx=None):
+                seen["shim"] = True
+                return "scan-result", None
+
+        monkeypatch.setattr(torch.nn, "GRU", ScanShim)
+        gru = du.device_aware_gru()(4, 3, batch_first=True)
+        gru(types.SimpleNamespace(is_xla=True))
+        assert seen.get("shim") is True, "scan implementation was bypassed"
+
+    def test_parameter_names_unchanged(self, monkeypatch):
+        """Subclassing must not alter state_dict keys (checkpoint compat)."""
+        real = torch.nn.modules.rnn.GRU
+
+        class ScanShim(real):
+            _orig = real
+
+        monkeypatch.setattr(torch.nn, "GRU", ScanShim)
+        names = set(du.device_aware_gru()(4, 3, batch_first=True).state_dict())
+        assert names == set(real(4, 3, batch_first=True).state_dict())

@@ -152,7 +152,7 @@ def test_build_data_loaders_species_profile(tmp_path):
     profile = tmp_path / "species.json"
     profile.write_text('{"kind": "species", "root": "species_root", '
                        '"modalities": ["calcium", "voltage"], '
-                       '"batch_size": 2, "seq_len": 256}')
+                       '"batch_size": 2, "seq_len": 256, "num_workers": 0}')
     train_loader, val_loader = train_mod.build_data_loaders(profile)
     batch = next(iter(train_loader))
     assert batch["calcium"].shape == (2, 146, 256)

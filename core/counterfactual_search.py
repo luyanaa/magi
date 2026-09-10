@@ -19,6 +19,8 @@ Reference: Brain MoE-PINN Training Plan §2.5
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ..runtime.device_utils import device_aware_gru
 from typing import Tuple, Optional, List, Dict
 import math
 
@@ -482,7 +484,9 @@ class ImaginationSampler(nn.Module):
         self.latent_dim = latent_dim
         self.num_timesteps = num_timesteps
 
-        self.temporal_encoder = nn.GRU(
+        # device_aware_gru(): see runtime.device_utils -- torch_xla rebinds nn.GRU
+        # globally and its scan variant rejects CPU tensors.
+        self.temporal_encoder = device_aware_gru()(
             input_size=latent_dim,
             hidden_size=hidden_dim,
             num_layers=2,

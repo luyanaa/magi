@@ -857,11 +857,13 @@ removed design documents live in git history.*
   dataset loaders (DANDI/BIDS/EDF).
 
 **Verification in this checkout (2026-09)**
-- `133 passed, 2 skipped` (134 collected). Covers `test_unified_model`,
+- `154 passed, 2 skipped` (156 collected). Covers `test_unified_model`,
   `test_new_capabilities`, `test_free_run_metrics`,
   `test_signal_reconstruction`, `test_data_and_rollout`,
   `test_manifest_dataset`, `test_control_sde`, `test_audit_invariants`,
   `test_grad_scaler`, `test_xla_device`, `test_deepspeed_config`.
+  The same suite passes unchanged on a Kaggle T4, a Colab TPU (v5e1),
+  a MooreThreads MTT S4000 and a Hygon K500SM_AI DCU.
   `tests/conftest.py` bootstraps imports; modules `py_compile` clean;
   `train.py --help` verified.
 - On a Kaggle T4 the same suite is `134 passed, 1 skipped` (the extra pass
@@ -894,6 +896,32 @@ removed design documents live in git history.*
   compute path, and an explicit fp16 request is promoted with a warning.
   Verified on a Colab TPU v5e1 (torch_xla 2.9.0): auto-detect resolves to
   `xla`, and model forward/backward/step runs clean.
+- MUSA (MooreThreads MTT S4000, torch 2.2.0 + torch_musa 1.3.0), verified
+  on hardware: auto-detect resolves to `musa`; `torch.amp.autocast` rejects
+  the backend ("has not registered a module"), so autocast routes to
+  `torch_musa.core.amp.autocast`; `grad_scaler` returns the vendor
+  `GradScaler`; forward/backward/step runs clean. Vendor scalers are
+  dispatched from `_VENDOR_BACKENDS`, which covers NPU/MUSA/MLU.
+- MUSA ships `upsample_linear1d` **forward only** - no backward kernel - so
+  `F.interpolate` killed training there. `_resample_time` therefore uses a
+  hand-rolled `_linear_resample` **only when `x.device.type == "musa"`**;
+  every other backend keeps the tuned native kernel. The fallback is
+  equivalent to 2.4e-07 forward and **bit-identical** backward.
+- Hygon DCU (K500SM_AI, ROCm/HIP 6.3 via DTK 26.04, torch 2.9.0), verified on
+  hardware: HIP presents through torch's **cuda** namespace, so the existing
+  `cuda` entry in `_BACKEND_PRIORITY` handles it with no new backend - no
+  `hip` branch is needed. Device auto-detect resolves to `cuda`,
+  `grad_scaler` returns an enabled scaler at `DEFAULT_INIT_SCALE`, and model
+  forward/backward/step runs clean in **fp32, bf16 and fp16**. DeepSpeed
+  `torch_autocast` was verified end-to-end on this native-bf16 part with both
+  `--precision bf16` and `--precision fp16` (ZeRO-2, 6 steps, finite and
+  decreasing) - the combination that cannot be exercised on Turing (no native
+  bf16) or on an unavailable Colab TPU. The DTK environment must be sourced
+  first (`source /opt/dtk/env.sh`), or torch fails to load `libgalaxyhip.so`.
+- `_disabled_scaler` falls back to `torch.cuda.amp.GradScaler` because
+  `torch.amp.GradScaler` only exists from torch 2.3; depending on the
+  newer attribute alone raised AttributeError on the MUSA host's torch
+  2.2.0, which took out every non-CUDA/XPU device at once.
 
 ### Open items and next actions
 
@@ -914,7 +942,9 @@ removed design documents live in git history.*
 | LOW | Perception correction | Now a free-energy gradient step (`active_inference_step`, default 0.1) instead of a detached pull toward the rollout endpoint. Needs a step-size sweep on real runs |
 | LOW | Perturbation validation | Control input is now wired from stimulus-role data (roles → perturbation reduction → conditioned gates, `--noise_mode` policy). Remaining: C. elegans optogenetic-style validation protocol on ingested corpora |
 | MED | Conditioned diffusion (P2.2) | Diffusion gain `σ(u)` conditioned on control (zero-init bounded gain, default identity) — deferred until control metrics are reviewed on salt/HF ingests |
-| LOW | TPU single-owner re-verification | The 3 `test_audit_invariants` failures on a Colab TPU host were traced to device contention in the test harness: a subprocess competed with the kernel process already holding `xla:0`, and TPUs are single-tenant (`open(/dev/vfio/0): Device or resource busy`). A clean single-owner session should confirm no GRU-specific issue remains. Blocked on Colab TPU capacity (free tier) |
+| RESOLVED | torch_xla rebinds `nn.GRU` globally | **Cause confirmed**: importing torch_xla rebinds the class itself (`nn.GRU -> torch_xla.experimental.gru.GRU`) via `torch_xla/_patched_functions.py:69`, `nn.GRU = _pathch_module(nn.GRU, ScanGRU)` - a *global* rebind with no env guard, so CPU/CUDA input raises `RuntimeError: Expected all tensors in the given list to be XLA tensors`. Minimal repro: the same call works with torch_xla unimportable and fails the moment it is imported. `runtime.device_utils.device_aware_gru()` subclasses the installed class and routes **per call from the input tensor**: XLA input keeps the scan path, anything else uses the native class that `_pathch_module` stores as `_orig`. Hosts without torch_xla get plain `nn.GRU` untouched, so CUDA/CPU code paths are unchanged, and parameter names stay identical (checkpoint-compatible) |
+| MED | Multi-worker DataLoaders | `build_data_loaders` defaults to `num_workers: 4`, so any profile omitting the key forks workers. Two independent hazards: (1) fork-after-threads deadlocks on runtimes that start threads (torch_musa does) - observed hanging the suite on the MTT S4000, waiting forever in `_try_get_data`; (2) on that same MUSA stack multi-worker loading cannot work at all, because torch_musa's patched `torch/multiprocessing/reductions.py` tests `storage.is_musa`, which the installed torch build does not define, so **any** tensor crossing a worker boundary raises `AttributeError` and the parent hangs. Reproduced with a trivial dataset, so it is not this repo's code. `spawn` was tried as a fix and reverted: it imposes an `__main__` guard on every caller and does not help where (2) applies. Test profiles pin `num_workers: 0`; use in-process loading on MUSA until the torch/torch_musa versions match |
+| MED | TODO: re-verify GRU fix on TPU | The **cause** was verified on a Colab TPU v5e1, and an earlier always-native variant took the suite from `3 failed, 138 passed` to `144 passed, 2 skipped`. The implementation has since changed to per-call device dispatch, which that run does **not** cover - it is verified locally only (12 tests). Re-run the TPU suite and additionally confirm a forward on a real XLA tensor keeps using the scan implementation. Blocked on Colab TPU capacity being unavailable |
 | LOW | Deferred features | See table below |
 
 ### Deferred design choices (act only if evidence demands)

@@ -17,6 +17,7 @@ from typing import Optional, Dict, Tuple
 import math
 
 from ..runtime.device_utils import get_device as _get_device
+from ..runtime.device_utils import device_aware_gru
 
 
 def _resolve_device():
@@ -249,7 +250,9 @@ class SmithPredictor(nn.Module):
         self.prediction_horizon = prediction_horizon
         self.oscillation_tolerant = oscillation_tolerant
 
-        self.history_encoder = nn.GRU(
+        # device_aware_gru(): torch_xla rebinds nn.GRU globally and its scan
+        # variant then rejects CPU tensors.
+        self.history_encoder = device_aware_gru()(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
             num_layers=2,
