@@ -22,15 +22,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, Dict, List
+import logging
 import math
+
+from ..runtime.device_utils import safe_epsilon
+from .velocity_brain import oettinger_mobility_action
+
+logger = logging.getLogger(__name__)
 
 
 class PoissonRouter(nn.Module):
     """
-    Poisson Router for MoE expert selection. (Legacy stateless router — kept for ablation.)
+    Antisymmetric router for MoE expert selection. (Legacy stateless router —
+    kept for ablation.)
 
-    Uses explicit antisymmetric parameterization W = A - A^T
-    combined with symmetric baseline scores.
+    Uses an explicit antisymmetric parameterization W = A - A^T combined with
+    symmetric baseline scores.
+
+    Naming note: the antisymmetric matrix is a bilinear form on gate logits
+    motivated by attractor-orthogonalization work, **not** a Poisson bracket or
+    a Poisson process.  Nothing here satisfies the Jacobi identity or generates
+    a Hamiltonian flow; the name is historical.
     """
 
     def __init__(
@@ -110,8 +122,24 @@ class PoissonRouter(nn.Module):
             A_new = Q @ R @ Q.T
             A_new = (A_new - A_new.T) / 2
             self.A_antisym.data = A_new
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - QR can fail on ill-conditioned A
+            # fall back to the SVD (polar) orthogonalisation; never fail silently
+            try:
+                U, _, Vh = torch.linalg.svd(A_copy)
+                A_new = U @ Vh
+                A_new = (A_new - A_new.T) / 2
+                self.A_antisym.data = A_new
+                self.orthog_failures = getattr(self, "orthog_failures", 0)
+                self.orthog_svd_fallbacks = getattr(self, "orthog_svd_fallbacks", 0) + 1
+                logger.warning("PoissonRouter.orthogonalize: QR failed (%s); "
+                               "used SVD fallback (fallback #%d).",
+                               exc, self.orthog_svd_fallbacks)
+            except Exception as exc2:  # noqa: BLE001
+                self.orthog_failures = getattr(self, "orthog_failures", 0) + 1
+                logger.error("PoissonRouter.orthogonalize FAILED (QR and SVD): "
+                             "%s / %s (failure #%d) - antisymmetry constraint "
+                             "not enforced this step.",
+                             exc, exc2, self.orthog_failures)
 
     def try_orthogonalize(self, step: int):
         """Call orthogonalize if orthog_interval steps have passed."""
@@ -131,11 +159,13 @@ class PoissonSSMRouter(nn.Module):
 
     Architecture:
         h_t = A_bar(z_t) ⊙ h_{t-1} + B_bar(z_t) ⊙ x(z_t)   (selective SSM)
-        logits_t = C(z_t) · h_t   +   W(z_t)   +   Poisson(z_t)
+        logits_t = C(z_t) · h_t   +   W(z_t)   +   skew(z_t)
                   ↑ SSM readout    ↑ direct    ↑ antisymmetric
 
-    where the Poisson term uses A_skew - A_skew^T for GENERIC-inspired
-    routing geometry (Grassmannian attractor orthogonalization).
+    where the skew term is ``A_skew - A_skew^T``: an antisymmetric bilinear
+    form on the gate pre-activations (Grassmannian attractor-orthogonalization
+    motivation).  It is a routing geometry, not a Poisson bracket — no Jacobi
+    identity is claimed.
 
     Design choices:
     - State size s=64: enough for routing context, negligible overhead
@@ -207,21 +237,23 @@ class PoissonSSMRouter(nn.Module):
         self.orthog_interval = 1000
 
         self.register_buffer("_state", torch.zeros(1, self.state_dim))
+        # Remaining calls for which AutoRollback level 3 forces Top-1 routing.
+        self._top1_override_remaining = 0
 
     def reset_state(self, batch_size: Optional[int] = None):
         """
         Reset the recurrent SSM state.
 
-        Called at phase boundaries or when starting a new sequence.
-
-        Args:
-            batch_size: if provided, reinitialize state to zeros (B, state_dim)
-                        if None, keep current state size (for epoch resets
-                        where batch dimension is unchanged).
+        ``None`` clears the currently allocated batch shape. It never means
+        "keep the previous sequence", which would leak one batch into the
+        next generic observation forward.
         """
-        if batch_size is not None:
-            device = self._state.device
-            self._state.data = torch.zeros(batch_size, self.state_dim, device=device)
+        device = self._state.device
+        size = self._state.shape[0] if batch_size is None else int(batch_size)
+        if size <= 0:
+            raise ValueError("batch_size must be positive")
+        self._state.data = torch.zeros(
+            size, self.state_dim, device=device)
 
     def forward(
         self,
@@ -281,10 +313,23 @@ class PoissonSSMRouter(nn.Module):
         # Temperature-scaled routing
         scores = logits / self.tau
 
-        # Top-k selection
-        _, selected_indices = torch.topk(scores, self.num_selected, dim=-1)
+        # AutoRollback level 3: temporarily force Top-1 routing.
+        num_selected = self.num_selected
+        if self._top1_override_remaining > 0:
+            self._top1_override_remaining -= 1
+            num_selected = 1
+
+        # Preserve the exact top-k forward weights while retaining a tiny
+        # straight-through gradient from the full softmax. Without this,
+        # top_k=1 produces a constant weight of one and router dispatch has
+        # no learning signal.
+        _, selected_indices = torch.topk(scores, num_selected, dim=-1)
         gate_scores = torch.gather(scores, -1, selected_indices)
-        gate_weights = torch.softmax(gate_scores, dim=-1)
+        topk_weights = torch.softmax(gate_scores, dim=-1)
+        full_probs = torch.softmax(scores, dim=-1)
+        selected_probs = torch.gather(full_probs, -1, selected_indices)
+        gate_weights = topk_weights + 1e-3 * (
+            selected_probs - selected_probs.detach())
 
         if return_scores:
             return gate_weights, selected_indices, scores
@@ -297,6 +342,20 @@ class PoissonSSMRouter(nn.Module):
     def reset_orthog_counter(self):
         """Reset the orthogonalization step counter."""
         self.steps_since_orthog.zero_()
+
+    def apply_top1_override(self, steps: int) -> None:
+        """Force Top-1 routing for the next ``steps`` forward calls.
+
+        Used by AutoRollback level 3.  A countdown rather than a flag because
+        the rollback is explicitly temporary; reaching zero restores the
+        configured ``num_selected``.
+        """
+        self._top1_override_remaining = max(0, int(steps))
+
+    @property
+    def effective_num_selected(self) -> int:
+        """Number of experts the next forward will route to."""
+        return 1 if self._top1_override_remaining > 0 else self.num_selected
 
 
 class ExpertNetwork(nn.Module):
@@ -532,6 +591,10 @@ class MoEVelocityField(nn.Module):
         max_capacity = int(B * self.capacity_factor)
         expert_outputs = [torch.zeros_like(z) for _ in self.all_experts]
         expert_counts = [0] * self.num_experts
+        gate_weights = torch.zeros(
+            B, self.top_k, device=device, dtype=z.dtype)
+        selected_indices = torch.zeros(
+            B, self.top_k, dtype=torch.long, device=device)
 
         # --- Shared experts: always active, uniform weights ---
         for i in range(self.num_shared):
@@ -540,19 +603,24 @@ class MoEVelocityField(nn.Module):
 
         if not force_shared_only:
             # --- Routed experts: Top-K with temperature ---
-            gate_weights, selected_indices = self.router(z)  # Relative indices [0, num_routed)
+            gate_weights, selected_indices = self.router(
+                z)  # Relative indices [0, num_routed)
 
             # Map selected indices to absolute expert positions
             selected_indices = selected_indices + self.num_shared
-            selected_indices = torch.clamp(selected_indices, min=self.num_shared, max=self.num_experts - 1)
+            selected_indices = torch.clamp(
+                selected_indices, min=self.num_shared,
+                max=self.num_experts - 1)
 
             for b in range(B):
                 for k in range(self.top_k):
                     exp_idx = selected_indices[b, k].item()
-                    weight = gate_weights[b, k].item()
+                    weight = gate_weights[b, k]
 
                     if expert_counts[exp_idx] < max_capacity:
-                        expert_outputs[exp_idx][b] += weight * self.all_experts[exp_idx](z[b:b+1]).squeeze(0)
+                        expert_outputs[exp_idx][b] += (
+                            weight * self.all_experts[exp_idx](
+                                z[b:b + 1]).squeeze(0))
                         expert_counts[exp_idx] += 1
 
         velocity = torch.stack(expert_outputs).sum(dim=0)
@@ -566,28 +634,44 @@ class MoEVelocityField(nn.Module):
             ]
             velocity = torch.stack(lesioned_outputs).sum(dim=0)
 
-        # Compute all expert outputs for Grassmannian regularization (training only)
+        # Compute all expert outputs for Grassmannian regularization (training
+        # only). Returns the RAW orthogonality: TotalLoss applies the phase
+        # weight (loss_weights.grassmannian_reg) exactly once. The internal
+        # ``grassmannian_weight`` attribute is kept for API compatibility.
         grassmannian_loss = torch.tensor(0.0, device=z.device)
-        if self.training and self.grassmannian_weight > 0 and B > 0:
-            all_expert_outputs = []
-            for expert in self.all_experts:
+        orthogonality = torch.tensor(0.0, device=z.device)
+        if self.training and B > 0:
+            # Reuse the shared-expert outputs already computed above instead of
+            # running every expert a second time on every training step.
+            all_expert_outputs = [
+                expert_outputs[i] * self.num_shared
+                for i in range(self.num_shared)
+            ]
+            for expert in self.routed_experts:
                 all_expert_outputs.append(expert(z))
             expert_out_stack = torch.stack(all_expert_outputs, dim=1)
-            outputs_norm = expert_out_stack / (expert_out_stack.norm(dim=-1, keepdim=True) + 1e-8)
+            outputs_norm = expert_out_stack / (expert_out_stack.norm(dim=-1, keepdim=True)
+                                              + safe_epsilon(expert_out_stack))
             gram = torch.matmul(outputs_norm, outputs_norm.transpose(-2, -1))
             mask = torch.eye(self.num_experts, device=gram.device).unsqueeze(0)
             gram_off_diag = (1 - mask) * gram
             orthogonality = (gram_off_diag ** 2).sum() / (self.num_experts * (self.num_experts - 1))
-            grassmannian_loss = self.grassmannian_weight * orthogonality
+            grassmannian_loss = orthogonality
 
         total_active = sum(1 for c in expert_counts if c > 0)
         routing_metrics = {
-            "expert_utilization": [c / max(max_capacity, 1) for c in expert_counts],
-            "max_load": max(expert_counts) / (max(max_capacity, 1) / self.num_experts) if max_capacity > 0 else 0,
+            "expert_utilization": [
+                c / max(max_capacity, 1) for c in expert_counts],
+            "max_load": max(expert_counts) / (
+                max(max_capacity, 1) / self.num_experts
+            ) if max_capacity > 0 else 0,
             "selected_experts": selected_indices,
             "gate_weights": gate_weights,
-            "router_entropy": -(gate_weights * torch.log(gate_weights + 1e-8)).sum(dim=-1).mean(),
+            "router_entropy": -(
+                gate_weights * torch.log(gate_weights + safe_epsilon(gate_weights))
+            ).sum(dim=-1).mean(),
             "num_active_experts": total_active,
+            "num_experts": self.num_experts,
             "expert_orthogonality": orthogonality,
         }
 
@@ -669,18 +753,23 @@ class ExpertGenericPerturbation(nn.Module):
         use_deep_bias: bool = False,
         bias_depth: int = 14,
         width_multiplier: float = 1.0,
+        projection_bottleneck: int = 128,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.rank = rank
 
         # ---- delta_L: U_i(z) @ J @ U_i(z)^T ----
+        # The ``d x d*rank`` readout dominates the parameter count of a
+        # structured expert (16.8M at d=1024, rank=16, versus ~2.1M for the
+        # whole plain expert), so the factor map runs through a bottleneck:
+        # the low-rank factor only needs to span the rank directions, not a
+        # full-width hidden state at the output layer.
+        bottleneck = max(int(rank), int(projection_bottleneck))
         self.U_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, bottleneck),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim * rank),
+            nn.Linear(bottleneck, hidden_dim * rank),
         )
 
         half = rank // 2
@@ -694,21 +783,22 @@ class ExpertGenericPerturbation(nn.Module):
         # ---- delta_M: diag(softplus(g_diag)) + V @ V^T ----
         # PSD by construction, unbounded positive via softplus, with low-rank coupling.
         # Diagonal-only (sigmoid) is too restrictive: bounded and no cross-coordinate coupling.
+        # The operator-producing heads (U_proj, M_diag_gate, M_coupling) carry
+        # no dropout for the same reason as the base operators: delta_L and
+        # delta_M must be functions of z.  ``bias_net`` below is the lone
+        # unstructured residual and may regularize freely.
         self.M_diag_gate = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
         )
         # Low-rank coupling: V(z) in R^{d x r_mob} for cross-coordinate dissipation
         self.M_coupling_rank = max(4, rank // 4)
         self.M_coupling = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, bottleneck),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim * self.M_coupling_rank),
+            nn.Linear(bottleneck, hidden_dim * self.M_coupling_rank),
         )
 
         # ---- velocity_bias: standard MLP ----
@@ -719,6 +809,7 @@ class ExpertGenericPerturbation(nn.Module):
                 num_layers=bias_depth,
                 dropout=dropout,
             )
+            output_layer = self.bias_net.output_proj[-1]
         else:
             bias_dim = int(hidden_dim * width_multiplier)
             self.bias_net = nn.Sequential(
@@ -728,6 +819,17 @@ class ExpertGenericPerturbation(nn.Module):
                 nn.Dropout(dropout),
                 nn.Linear(bias_dim, hidden_dim, bias=False),
             )
+            output_layer = self.bias_net[-1]
+
+        # ``velocity_bias`` is the one term an expert adds that is *not*
+        # GENERIC-structured: it is an arbitrary additive velocity, not a
+        # perturbation of L or M.  Zero-initialising its readout makes the
+        # composite field exactly ``L grad_E + M grad_S`` at initialisation, so
+        # the structured configuration genuinely holds the structure at step 0
+        # and the model learns how much unstructured residual it needs.  A
+        # random-init bias would break the structure before training starts.
+        if isinstance(output_layer, nn.Linear):
+            nn.init.zeros_(output_layer.weight)
 
     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -890,37 +992,36 @@ class MoEGenericVelocityField(nn.Module):
             if gE is None:
                 return V
             # V: (B, d, r), gE: (B, d)
-            norm_sq = (gE ** 2).sum(dim=-1, keepdim=True) + 1e-8  # (B, 1)
+            norm_sq = (gE ** 2).sum(dim=-1, keepdim=True) + safe_epsilon(gE)
             coeffs = torch.bmm(V.transpose(-2, -1), gE.unsqueeze(-1)).squeeze(-1) / norm_sq  # (B, r)
             # P_E V = V - gE[:, None] * coeffs[:, None, :]
             return V - gE.unsqueeze(-1) * coeffs.unsqueeze(1)
 
-        def apply_diag_projected_to_gradS(m: torch.Tensor, gE: torch.Tensor, gS: torch.Tensor) -> torch.Tensor:
-            """
-            Exact action of P_E @ diag(m) @ P_E on grad_S, computed in O(d).
-
-            For D = diag(m), P_E = I - (e e^T)/(e^T e):
-                P_E D P_E = D - [(m⊙e)e^T + e(m⊙e)^T]/(e^T e)
-                            + [(∑ m_i e_i^2) e e^T] / (e^T e)^2
-            This is D plus two rank-1 corrections — never dense.
-            """
-            if gE is None or gS is None:
+        def apply_diag_projected_to_gradS(
+            m: torch.Tensor, gE: torch.Tensor, gS: torch.Tensor
+        ) -> torch.Tensor:
+            """Exact action of ``P_E diag(m) P_E`` on ``grad_S``, in O(d)."""
+            if gS is None:
+                return torch.zeros_like(m)
+            if gE is None:
                 return m * gS
-            e = gE
-            v = gS
-            e_dot_e = (e ** 2).sum(dim=-1, keepdim=True) + 1e-8      # (B, 1)
-            e_dot_v = (e * v).sum(dim=-1, keepdim=True)              # (B, 1)
-            m_dot_e = m * e                                          # (B, d)
-            m_dot_e_dot_v = (m_dot_e * v).sum(dim=-1, keepdim=True)  # (B, 1)
-            sum_m_e2 = (m * e ** 2).sum(dim=-1, keepdim=True)        # (B, 1)
+            return oettinger_mobility_action(m, gE, gS)
 
-            # (P_E D P_E) v = m⊙v - (m⊙e)(e·v)/(e·e) - e((m⊙e)·v)/(e·e)
-            #                 + e(e·v)(∑m_i e_i^2)/(e·e)^2
-            result = m * v
-            result -= m_dot_e * e_dot_v / e_dot_e
-            result -= e * m_dot_e_dot_v / e_dot_e
-            result += e * e_dot_v * sum_m_e2 / (e_dot_e ** 2)
-            return result
+        def project_L_orthogonal(
+            L: torch.Tensor, gS: Optional[torch.Tensor]
+        ) -> torch.Tensor:
+            """Project a Poisson perturbation so the entropy gradient is null."""
+            if gS is None:
+                return L
+            norm_sq = (gS ** 2).sum(dim=-1, keepdim=True) + safe_epsilon(gS)
+            e_col = gS.unsqueeze(-1)
+            e_row = gS.unsqueeze(-2)
+            left = torch.bmm(e_col, torch.bmm(e_row, L)) / norm_sq.unsqueeze(-1)
+            right = torch.bmm(torch.bmm(L, e_col), e_row) / norm_sq.unsqueeze(-1)
+            center = torch.bmm(
+                e_col, torch.bmm(e_row, torch.bmm(L, e_col))
+            ) * e_row / (norm_sq.unsqueeze(-1) ** 2)
+            return L - left - right + center
 
         # Accumulators for combined perturbations
         delta_L_sum = torch.zeros(B, d, d, device=device, dtype=z.dtype)
@@ -950,7 +1051,7 @@ class MoEGenericVelocityField(nn.Module):
             for b in range(B):
                 for k in range(self.top_k):
                     exp_idx = selected_indices[b, k].item()
-                    weight = gate_weights[b, k].item()
+                    weight = gate_weights[b, k]
 
                     if expert_counts[exp_idx] < max_capacity:
                         dL, dM_diag, V, bias = self.all_experts[exp_idx](z[b : b + 1])
@@ -980,11 +1081,19 @@ class MoEGenericVelocityField(nn.Module):
                         V_list.append((w, V, grad_E))
                         bias_sum += w * bias
                     else:
+                        # Intentional: a lesioned ROUTED expert contributes
+                        # nothing (lesion = remove, not substitute). Only the
+                        # surviving shared experts re-normalize by 1/num_shared.
                         pass
 
+        # Project the learned Poisson perturbation with P_S on both sides so
+        # the entropy gradient remains in the null space of the combined L.
+        delta_L_sum = project_L_orthogonal(delta_L_sum, grad_S)
+
         # --- Öttinger projection on mobility ---
-        # Low-rank: P_E (Σ w_i V_i V_i^T) P_E = Σ w_i (P_E V_i)(P_E V_i)^T
-        delta_M_lowrank_sum = torch.zeros(B, d, d, device=device, dtype=z.dtype)
+        # Low-rank: P_E (Σ w_i V_i V_i^T) P_E = Σ w_i (P_E V_i) (P_E V_i)^T
+        delta_M_lowrank_sum = torch.zeros(
+            B, d, d, device=device, dtype=z.dtype)
         for item in V_list:
             if len(item) == 3:
                 w, V, gE_slice = item
@@ -992,65 +1101,100 @@ class MoEGenericVelocityField(nn.Module):
             else:
                 w, V = item
                 V_proj = project_V_orthogonal(V, grad_E)
-            delta_M_lowrank_sum += w * torch.bmm(V_proj, V_proj.transpose(-2, -1))
+            delta_M_lowrank_sum += w * torch.bmm(
+                V_proj, V_proj.transpose(-2, -1))
 
-        # Diagonal: exact rank-1 formulation, action computed on-the-fly in __init__.py
-        # We keep delta_M_diag_sum as the raw diagonal weights; the projected action
-        # is (P_E diag(M_diag) P_E) @ grad_S, computed directly without materialization.
+        # Diagonal mobility is evaluated through the exact projected action;
+        # this keeps the operator implicit and gives diagnostics a gradient.
+        delta_M_diag_action = torch.zeros(
+            B, d, device=device, dtype=z.dtype)
+        if grad_S is not None:
+            delta_M_diag_action = apply_diag_projected_to_gradS(
+                delta_M_diag_sum, grad_E, grad_S)
+        delta_M_diag_grad_E = torch.zeros(
+            B, d, device=device, dtype=z.dtype)
+        if grad_E is not None:
+            delta_M_diag_grad_E = apply_diag_projected_to_gradS(
+                delta_M_diag_sum, grad_E, grad_E)
 
-        # Grassmannian regularization on expert velocity biases
+        # Grassmannian regularization on expert velocity biases. Returns the
+        # RAW orthogonality; TotalLoss applies the phase weight once.
         grassmannian_loss = torch.tensor(0.0, device=device)
         orthogonality = torch.tensor(0.0, device=device)
-        if self.training and self.grassmannian_weight > 0 and B > 0:
+        if self.training and B > 0:
             all_biases = []
             for expert in self.all_experts:
                 _, _, _, bias = expert(z)
                 all_biases.append(bias)
-            bias_stack = torch.stack(all_biases, dim=1)  # (B, num_experts, d)
-            bias_norm = bias_stack / (bias_stack.norm(dim=-1, keepdim=True) + 1e-8)
-            gram = torch.bmm(bias_norm, bias_norm.transpose(-2, -1))
-            mask = torch.eye(self.num_experts, device=gram.device).unsqueeze(0)
+            bias_stack = torch.stack(all_biases, dim=1)
+            bias_norm = bias_stack / (
+                bias_stack.norm(dim=-1, keepdim=True) + safe_epsilon(bias_stack))
+            gram = torch.bmm(
+                bias_norm, bias_norm.transpose(-2, -1))
+            mask = torch.eye(
+                self.num_experts, device=gram.device).unsqueeze(0)
             gram_off_diag = (1 - mask) * gram
-            orthogonality = (gram_off_diag ** 2).sum() / (self.num_experts * (self.num_experts - 1))
-            grassmannian_loss = self.grassmannian_weight * orthogonality
+            orthogonality = (gram_off_diag ** 2).sum() / (
+                self.num_experts * (self.num_experts - 1))
+            grassmannian_loss = orthogonality
 
         total_active = sum(1 for c in expert_counts if c > 0)
-        expert_ortho = orthogonality if self.training else torch.tensor(0.0, device=device)
+        expert_ortho = (
+            orthogonality if self.training
+            else torch.tensor(0.0, device=device))
 
         routing_metrics = {
-            "expert_utilization": [c / max(max_capacity, 1) for c in expert_counts],
-            "max_load": max(expert_counts) / (max(max_capacity, 1) / self.num_experts) if max_capacity > 0 else 0,
+            "expert_utilization": [
+                c / max(max_capacity, 1) for c in expert_counts],
+            "max_load": max(expert_counts) / (
+                max(max_capacity, 1) / self.num_experts
+            ) if max_capacity > 0 else 0,
             "selected_experts": selected_indices,
             "gate_weights": gate_weights,
-            "router_entropy": -(gate_weights * torch.log(gate_weights + 1e-8)).sum(dim=-1).mean(),
+            "router_entropy": -(
+                gate_weights * torch.log(gate_weights + safe_epsilon(gate_weights))
+            ).sum(dim=-1).mean(),
             "num_active_experts": total_active,
+            "num_experts": self.num_experts,
             "expert_orthogonality": expert_ortho,
         }
 
-        # Pre-compute projected diagonal action on grad_S (exact, O(d))
-        delta_M_diag_action = torch.zeros(B, d, device=device, dtype=z.dtype)
-        if grad_S is not None:
-            delta_M_diag_action = apply_diag_projected_to_gradS(
-                delta_M_diag_sum, grad_E, grad_S
-            )
-
-        # Optional: diagnostics on combined degeneracy
-        if grad_E is not None and grad_S is not None and L_base is not None and M_base is not None:
+        # Optional differentiable combined degeneracy diagnostics.
+        L_eff = delta_L_sum
+        if L_base is not None:
             L_eff = L_base + delta_L_sum
-            L_grad_S = torch.bmm(L_eff, grad_S.unsqueeze(-1)).squeeze(-1)
-            # Full M @ grad_E = (P_E diag(M_diag) P_E) @ grad_E + M_lowrank @ grad_E
-            # For degeneracy check: M_lowrank was already projected, so M_lowrank @ grad_E = 0
-            M_grad_E_diag = apply_diag_projected_to_gradS(delta_M_diag_sum, grad_E, grad_E)
-            routing_metrics["combined_L_grad_S_norm"] = torch.norm(L_grad_S, dim=-1).mean().item()
-            routing_metrics["combined_M_grad_E_norm"] = torch.norm(M_grad_E_diag, dim=-1).mean().item()
+        L_grad_S = torch.zeros_like(z)
+        if grad_S is not None:
+            L_grad_S = torch.bmm(
+                L_eff, grad_S.unsqueeze(-1)).squeeze(-1)
+
+        M_diag_eff = delta_M_diag_sum
+        if M_base is not None:
+            M_diag_eff = M_base + delta_M_diag_sum
+        M_grad_E = torch.zeros_like(z)
+        if grad_E is not None:
+            M_grad_E = apply_diag_projected_to_gradS(
+                M_diag_eff, grad_E, grad_E)
+            M_grad_E = M_grad_E + torch.bmm(
+                delta_M_lowrank_sum, grad_E.unsqueeze(-1)
+            ).squeeze(-1)
+        generic_constraint_residual = (
+            L_grad_S.square().sum(dim=-1).mean()
+            + M_grad_E.square().sum(dim=-1).mean())
+        routing_metrics["combined_L_grad_S_norm"] = (
+            torch.norm(L_grad_S, dim=-1).mean().item())
+        routing_metrics["combined_M_grad_E_norm"] = (
+            torch.norm(M_grad_E, dim=-1).mean().item())
 
         return {
             "delta_L": delta_L_sum,
             "delta_M_diag": delta_M_diag_sum,
             "delta_M_diag_action": delta_M_diag_action,
+            "delta_M_diag_grad_E": delta_M_diag_grad_E,
             "delta_M_lowrank": delta_M_lowrank_sum,
             "velocity_bias": bias_sum,
             "routing_metrics": routing_metrics,
+            "generic_constraint_residual": generic_constraint_residual,
             "grassmannian_loss": grassmannian_loss,
         }
 

@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 from transformers import BertConfig, BertModel
 from typing import Optional, Tuple, Dict, Any, List
-import copy
+
+from .momentum import MomentumEncoder
 
 from brain_moe_pinn.magi.patch_embedding import EEGMasking
 from brain_moe_pinn.magi.transformer import BERTEncoder
@@ -156,41 +157,6 @@ class BERTBaseEncoder(nn.Module):
             # If outputs is a single tensor, wrap it
             return (outputs,)
 
-
-class MomentumEncoder(nn.Module):
-    """
-    Momentum encoder with exponential moving average (EMA) updates.
-    Architecturally identical to the base encoder, but its weights are updated via
-    m * momentum_encoder + (1 - m) * base_encoder.
-    """
-
-    def __init__(self, base_encoder: nn.Module, momentum: float = 0.999):
-        super().__init__()
-        # Create a deep copy of the base encoder's architecture
-        self.encoder = copy.deepcopy(base_encoder)
-        # Make sure momentum encoder parameters are not updated by gradient descent
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-        self.momentum = momentum
-        self.base_encoder = base_encoder
-
-    @torch.no_grad()
-    def update(self):
-        """
-        Update momentum encoder weights via EMA.
-        Should be called after each training step.
-        """
-        for param_q, param_k in zip(
-            self.base_encoder.parameters(), self.encoder.parameters()
-        ):
-            param_k.data = param_k.data * self.momentum + param_q.data * (1.0 - self.momentum)
-
-    def forward(self, *args, **kwargs):
-        """
-        Forward pass through the momentum encoder (no gradients).
-        """
-        with torch.no_grad():
-            return self.encoder(*args, **kwargs)
 
 
 class EEGFoundationModel(nn.Module):

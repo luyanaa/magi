@@ -21,47 +21,8 @@ from .magi_v2 import (
     MagiV2EEGEncoder,
     create_magi_v2_from_v1,
 )
-from .spatio_temporal import (
-    EEG2DPatchEmbedding,
-    STANDARD_10_20_COORDS,
-    BIOTStyleEmbedding,
-    ChannelTypeEmbedding,
-)
+from .momentum import MomentumEncoder
 
-
-class MomentumEncoder(nn.Module):
-    """Momentum encoder for contrastive learning (EMA of base encoder)."""
-    
-    def __init__(self, base_encoder: nn.Module, momentum: float = 0.999):
-        super().__init__()
-        self.momentum = momentum
-        self.base_encoder = base_encoder
-        
-        # Create momentum encoder as a copy
-        self.momentum_encoder = self._clone_model(base_encoder)
-        
-        # Freeze momentum encoder parameters
-        for param in self.momentum_encoder.parameters():
-            param.requires_grad = False
-    
-    def _clone_model(self, model: nn.Module) -> nn.Module:
-        """Create a deep copy of the model with the same weights."""
-        import copy
-        clone = copy.deepcopy(model)
-        return clone
-    
-    @torch.no_grad()
-    def update(self):
-        """Update momentum encoder with EMA."""
-        for param_q, param_k in zip(
-            self.base_encoder.parameters(),
-            self.momentum_encoder.parameters()
-        ):
-            param_k.data = param_k.data * self.momentum + param_q.data * (1.0 - self.momentum)
-    
-    def forward(self, *args, **kwargs):
-        """Forward through momentum encoder."""
-        return self.momentum_encoder(*args, **kwargs)
 
 
 class EEGFoundationModelV2(nn.Module):
@@ -92,6 +53,7 @@ class EEGFoundationModelV2(nn.Module):
         alternating_pattern: bool = True,
         max_channels: int = 256,
         patch_size_time: int = 256,
+        stride_time: Optional[int] = None,
         mask_ratio: float = 0.75,
         momentum: float = 0.999,
         projection_dim: int = 256,
@@ -127,6 +89,7 @@ class EEGFoundationModelV2(nn.Module):
             'alternating_pattern': alternating_pattern,
             'max_channels': max_channels,
             'patch_size_time': patch_size_time,
+            'stride_time': stride_time,
             'use_biot_embedding': use_biot_embedding,
             'use_channel_type_embed': use_channel_type_embed,
             'ecog_amplitude_scale': ecog_amplitude_scale,
@@ -150,6 +113,7 @@ class EEGFoundationModelV2(nn.Module):
             alternating_pattern=alternating_pattern,
             max_channels=max_channels,
             patch_size_time=patch_size_time,
+            stride_time=stride_time,
             use_biot_embedding=use_biot_embedding,
             use_channel_type_embed=use_channel_type_embed,
             ecog_amplitude_scale=ecog_amplitude_scale,

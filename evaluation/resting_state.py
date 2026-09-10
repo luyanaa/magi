@@ -8,18 +8,24 @@ when run in imagination mode without task cues.
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Dict, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 
 def compute_psd_slope(z_sequence: torch.Tensor, sample_rate: float = 1.0) -> float:
     """
-    Compute 1/f PSD slope of latent trajectory.
+    Signed log-log PSD slope of a latent trajectory.
 
     Args:
         z_sequence: (T, d) latent state sequence
         sample_rate: sampling rate in Hz
     Returns:
-        slope: estimated power-law exponent (target 0.8-1.2)
+        slope: estimated power-law exponent (negative for 1/f-like decay)
+
+    This is a diagnostic of the latent trajectory's own spectrum.  It is *not*
+    a 1/f health check: the 1/f property is an observable signature of neural
+    signals, not a guaranteed property of latent dynamical trajectories, and
+    the aperiodic exponent in real recordings varies with subject, region, and
+    state rather than sitting in a fixed window.
     """
     T, d = z_sequence.shape
     slopes = []
@@ -38,51 +44,101 @@ def compute_psd_slope(z_sequence: torch.Tensor, sample_rate: float = 1.0) -> flo
     return float(np.mean(slopes)) if slopes else 0.0
 
 
-def compute_avalanche_stats(z_sequence: torch.Tensor, threshold_factor: float = 2.0) -> Dict[str, float]:
+def compute_avalanche_stats(
+    z_sequence: torch.Tensor,
+    threshold_factor: float = 2.0,
+    min_avalanches: int = 20,
+) -> Dict[str, float]:
+    """Avalanche statistics for a latent population trajectory.
+
+    Neuronal avalanches are defined over a *population*: at each time bin the
+    units whose activity exceeds their own threshold are counted, consecutive
+    active bins form one avalanche, and the avalanche size is the total
+    activation count across those bins.  Criticality is summarised by the
+    exponent of the size distribution ``P(s) ~ s^-tau``, estimated by maximum
+    likelihood (Clauset et al., 2009).
+
+    The previous implementation regressed ``log(size)`` on ``log(duration)``
+    and reported that slope as ``tau``.  Size-versus-duration scaling is a
+    *different* exponent (close to 2 under mean-field criticality) and is not
+    the avalanche size exponent, so the reported number was mislabelled.
+
+    Args:
+        z_sequence: (T, d) latent trajectory; the d components act as the
+            population and first differences define activity.
+        threshold_factor: per-unit threshold in standard deviations above the
+            unit's own mean activity.
+        min_avalanches: minimum number of avalanches before an exponent is
+            reported; below this the estimate is returned as NaN rather than
+            fitted on noise.
     """
-    Detect neuronal avalanches in latent velocity norm.
+    if z_sequence.dim() != 2:
+        raise ValueError("z_sequence must be (T, d)")
+    time_len, width = z_sequence.shape
+    if time_len < 3 or width < 1:
+        return {"tau": float("nan"), "num_avalanches": 0,
+                "size_exponent_definition": "P(size) ~ size^-tau (MLE)",
+                "insufficient_data": True}
 
-    Returns:
-        dict with tau (size-duration exponent), size_distribution
-    """
-    T = z_sequence.shape[0]
-    v_norm = torch.norm(z_sequence[1:] - z_sequence[:-1], p=2, dim=-1).cpu().numpy()
-    threshold = np.median(v_norm) * threshold_factor
+    activity = (z_sequence[1:] - z_sequence[:-1]).abs().cpu().numpy()
+    mean = activity.mean(axis=0, keepdims=True)
+    std = activity.std(axis=0, keepdims=True)
+    std[std < 1e-12] = 1e-12
+    active = activity > (mean + threshold_factor * std)
+    counts = active.sum(axis=1)
 
-    in_avalanche = False
-    avalanches = []
-    current = {"start": 0, "size": 0, "duration": 0, "sum": 0.0}
+    sizes: List[float] = []
+    durations: List[int] = []
+    run_size = 0
+    run_len = 0
+    for count in counts.tolist():
+        if count > 0:
+            run_size += count
+            run_len += 1
+        elif run_len:
+            sizes.append(float(run_size))
+            durations.append(run_len)
+            run_size, run_len = 0, 0
+    if run_len:
+        sizes.append(float(run_size))
+        durations.append(run_len)
 
-    for t in range(len(v_norm)):
-        if v_norm[t] > threshold:
-            if not in_avalanche:
-                current = {"start": t, "size": 0, "duration": 0, "sum": 0.0}
-                in_avalanche = True
-            current["duration"] += 1
-            current["sum"] += v_norm[t]
-        else:
-            if in_avalanche:
-                current["size"] = current["sum"]
-                avalanches.append(current)
-                in_avalanche = False
+    num_avalanches = len(sizes)
+    base = {
+        "num_avalanches": num_avalanches,
+        "size_exponent_definition": "P(size) ~ size^-tau (MLE)",
+        "threshold_factor": float(threshold_factor),
+        "mean_size": float(np.mean(sizes)) if sizes else 0.0,
+        "mean_duration": float(np.mean(durations)) if durations else 0.0,
+        "max_size": float(np.max(sizes)) if sizes else 0.0,
+    }
+    if num_avalanches < int(min_avalanches):
+        return {"tau": float("nan"), "insufficient_data": True, **base}
 
-    if len(avalanches) < 3:
-        return {"tau": 0.0, "num_avalanches": 0}
+    sizes_arr = np.asarray(sizes, dtype=float)
+    size_min = max(1.0, float(sizes_arr.min()))
+    log_terms = np.log(sizes_arr / size_min)
+    denominator = float(log_terms.sum())
+    if denominator <= 1e-12:
+        # Every avalanche has the same size: no power law is identifiable.
+        return {"tau": float("nan"), "insufficient_data": True, **base}
+    tau = 1.0 + num_avalanches / denominator
 
-    sizes = [a["size"] for a in avalanches]
-    durations = [a["duration"] for a in avalanches]
-
-    # Fit power law: log(size) ~ -tau * log(duration)
-    if len(set(durations)) > 1:
-        tau = -np.polyfit(np.log(durations + 1e-8), np.log(sizes + 1e-8), 1)[0]
-    else:
-        tau = 0.0
+    # First-order branching estimate: mean ratio of successive active counts
+    # inside an avalanche.  Reported as a crude criticality summary only.
+    ratios = [
+        counts[k + 1] / counts[k]
+        for k in range(len(counts) - 1)
+        if counts[k] > 0
+    ]
+    branching = float(np.mean(ratios)) if ratios else float("nan")
 
     return {
         "tau": float(tau),
-        "num_avalanches": len(avalanches),
-        "mean_size": float(np.mean(sizes)),
-        "mean_duration": float(np.mean(durations)),
+        "insufficient_data": False,
+        "size_min": size_min,
+        "branching_estimate": branching,
+        **base,
     }
 
 

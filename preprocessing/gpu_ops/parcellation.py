@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict
 
-from ...utils.device_utils import get_device
+from ...runtime.device_utils import get_device
 
 ATLAS_REGISTRY = {
     "schaefer_100": {"n_rois": 100, "description": "Schaefer 100 ROI"},

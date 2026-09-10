@@ -1,93 +1,124 @@
 """
-Thermodynamics analysis: EPR, Jarzynski, Landauer, Crooks.
+Thermodynamics-related diagnostics and monitoring utilities.
+
+Trajectory diagnostics are intentionally labelled as proxies unless a
+complete stochastic-process definition makes a thermodynamic quantity
+identifiable.
 """
 
 import torch
 import numpy as np
-import math
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 
 
-def compute_epr_trajectory(
+def compute_trajectory_diagnostics(
     z_trajectory: torch.Tensor,
     delta_z_trajectory: torch.Tensor,
     D: float = 1.0,
+    div_drift_fn=None,
 ) -> Dict[str, float]:
-    """
-    Compute entropy production rate along a trajectory.
+    """Compute trajectory diagnostics without claiming thermodynamic EPR.
 
-    sigma = ||v||^2 / D (proxy)
-    sigma_exact = <v, div(J_v)> / D (exact, requires Jacobian)
+    The observed trajectory alone does not identify stochastic entropy
+    production.  This function therefore reports only explicit diagnostics:
+
+      velocity_proxy = ||delta_z||^2 / D
+      signed_work_proxy = <delta_z, d(delta_z)/dt> / D
+      drift_divergence = div f(z), when a divergence function is supplied
+
+    ``signed_work_proxy`` is useful for detecting local acceleration or
+    deceleration, but it is not entropy production.  ``div_drift_fn`` is
+    reported directly and is not combined with velocity into an EPR estimate.
+    A pathwise entropy-production calculation requires an explicitly defined
+    stochastic process, diffusion tensor, time-step convention, and
+    forward/reverse path-probability ratio.
     """
-    T = z_trajectory.shape[0]
+    if z_trajectory.shape[0] != delta_z_trajectory.shape[0]:
+        raise ValueError("z_trajectory and delta_z_trajectory must share time length")
     v = delta_z_trajectory
+    T = v.shape[0]
+    if T < 3:
+        raise ValueError("compute_trajectory_diagnostics needs >= 3 time steps")
 
-    # Proxy
-    sigma_proxy = (v ** 2).sum(dim=-1) / (D + 1e-8)
+    denom = float(D) + 1e-8
+    velocity_proxy = (v ** 2).sum(dim=-1) / denom
 
-    # Exact via finite-difference Jacobian trace
-    sigma_exact = []
-    for t in range(T):
-        # Approximate div(v) = trace(J_v)
-        # Using velocity differences as proxy
-        if t < T - 1:
-            dv = v[t + 1] - v[t]
-            dt = 1.0
-            trace_approx = (dv / dt).sum().item()
-        else:
-            trace_approx = 0.0
-        sigma_exact.append((v[t] * trace_approx).sum().item() / (D + 1e-8))
+    # Central differences estimate local change in the observed increment.
+    dv = torch.zeros_like(v)
+    dv[1:-1] = (v[2:] - v[:-2]) / 2.0
+    dv[0] = v[1] - v[0]
+    dv[-1] = v[-1] - v[-2]
+    signed_work_proxy = (v * dv).sum(dim=-1) / denom
 
-    sigma_exact = np.array(sigma_exact)
-    sigma_proxy = sigma_proxy.cpu().numpy()
+    def _red(x):
+        x = x.detach().float().cpu()
+        return float(x.mean()), float(x.std())
 
-    # Correlation
-    if sigma_proxy.std() > 1e-6 and sigma_exact.std() > 1e-6:
-        corr = np.corrcoef(sigma_proxy, sigma_exact)[0, 1]
-    else:
-        corr = 1.0
+    velocity_mean, velocity_std = _red(velocity_proxy)
+    work_mean, work_std = _red(signed_work_proxy)
+    corr = 1.0
+    if velocity_std > 1e-6 and work_std > 1e-6:
+        vp = velocity_proxy.detach().float().cpu().numpy()
+        wp = signed_work_proxy.detach().float().cpu().numpy()
+        corr = float(np.corrcoef(vp, wp)[0, 1])
 
-    return {
-        "epr_proxy_mean": float(sigma_proxy.mean()),
-        "epr_exact_mean": float(sigma_exact.mean()),
-        "epr_proxy_std": float(sigma_proxy.std()),
-        "epr_exact_std": float(sigma_exact.std()),
-        "epr_correlation": float(corr),
-        "epr_negative_ratio": float((sigma_proxy < 0).mean()),
+    out = {
+        "velocity_proxy_mean": velocity_mean,
+        "velocity_proxy_std": velocity_std,
+        "signed_work_proxy_mean": work_mean,
+        "signed_work_proxy_std": work_std,
+        "negative_work_ratio": float((signed_work_proxy < 0).float().mean()),
+        "velocity_work_correlation": corr,
     }
+    if div_drift_fn is not None:
+        with torch.no_grad():
+            div = div_drift_fn(z_trajectory)
+        div = torch.as_tensor(
+            div, dtype=v.dtype, device=v.device).reshape(-1)
+        if div.shape[0] != T:
+            raise ValueError("div_drift_fn must return one value per time step")
+        div_mean, div_std = _red(div)
+        out["drift_divergence_mean"] = div_mean
+        out["drift_divergence_std"] = div_std
+        out["negative_divergence_ratio"] = float((div < 0).float().mean())
+    return out
 
 
-def compute_jarzynski_work(
+def compute_energy_change_diagnostic(
     z_trajectory: torch.Tensor,
     energy_fn,
+    beta: float = 1.0,
 ) -> Dict[str, float]:
-    """
-    Jarzynski equality: <exp(-beta W)> = exp(-beta dF).
+    """Summarize energy changes without claiming work or Jarzynski validity.
 
-    Only requires forward trajectories (compatible with irreversible architecture).
+    A Jarzynski estimate requires a specified driven protocol, an initial
+    equilibrium ensemble, inverse temperature, and work measurements.  A
+    latent trajectory plus an arbitrary scalar field supplies none of those
+    guarantees.  This helper therefore reports only energy-change statistics
+    and a cumulant-like numerical dispersion proxy.
     """
-    T = z_trajectory.shape[0]
+    if beta <= 0:
+        raise ValueError("beta must be positive")
     with torch.no_grad():
-        energies = []
-        for t in range(T):
-            E = energy_fn(z_trajectory[t:t+1])
-            energies.append(E.item() if hasattr(E, "item") else E)
-
-    energies = np.array(energies)
-    # Work = cumulative energy change
-    W = np.cumsum(np.diff(energies, prepend=energies[0]))
-
-    # Jarzynski estimate
-    beta = 1.0
-    jarzynski_left = np.exp(-beta * W).mean()
-    jarzynski_right = np.exp(-beta * (energies[-1] - energies[0]))
-
+        energies = torch.stack([
+            torch.as_tensor(energy_fn(z_trajectory[t:t + 1]))
+            .detach().float().mean()
+            for t in range(z_trajectory.shape[0])
+        ]).cpu().numpy()
+    delta_e = np.diff(energies)
+    exp_neg_beta_delta = np.exp(-beta * delta_e.astype(np.float64))
+    mean_exp = float(exp_neg_beta_delta.mean()) if delta_e.size else float("nan")
+    proxy = (
+        beta * float(delta_e.mean()) - np.log(mean_exp)
+        if delta_e.size and np.isfinite(mean_exp) and mean_exp > 0
+        else float("nan")
+    )
     return {
-        "work_mean": float(W.mean()),
-        "work_max": float(W.max()),
-        "jarzynski_left": float(jarzynski_left),
-        "jarzynski_right": float(jarzynski_right),
-        "jarzynski_error": abs(jarzynski_left - jarzynski_right),
+        "energy_change_mean": float(delta_e.mean()) if delta_e.size else 0.0,
+        "energy_change_std": float(delta_e.std()) if delta_e.size else 0.0,
+        "energy_change_max": float(delta_e.max()) if delta_e.size else 0.0,
+        "exp_neg_beta_change_mean": mean_exp,
+        "energy_change_dispersion_proxy": float(proxy),
     }
 
 
@@ -105,25 +136,13 @@ def compute_landauer_bound(
     return float(Q_min)
 
 
-class BergsonMonitor:
-    """
-    Wiener Proposal #1: Bergson 监控器.
+class EnergyChangeMonitor:
+    """Heuristic monitor for latent energy-change and routing proxies.
 
-    Measures the irreversibility gap via Bergson information:
-        I_Bergson = <βΔW> − log<e^{−βΔW}>
-
-    This reuses the existing Jarzynski infrastructure (compute_jarzynski_work).
-    I_Bergson quantifies the "duration" (Bergsonian duree) — the internal
-    time experienced by the system beyond reversible (thermodynamic) time.
-
-    Interpretation:
-      I_Bergson ≈ 0 : near-reversible dynamics (system is in equilibrium)
-      I_Bergson >> 0 : far-from-equilibrium (high irreversibility, active learning)
-      I_Bergson < 0  : FP16 instability in exp(−βΔW) — flag as numerical warning
-
-    FP16 safety: exp(−βΔW) is computed in selective FP32 to avoid overflow.
-    Schedule: every step, logged every 100 (same as EPR).
-    Read-only: no loss terms, no backward path modifications.
+    The monitor is deliberately not named or interpreted as a Bergson
+    information, Jarzynski, work, irreversibility, or entropy-production
+    estimator.  Its collapse flag is a model-health heuristic that requires
+    both low proxy activity and low router entropy.
     """
 
     def __init__(
@@ -132,14 +151,16 @@ class BergsonMonitor:
         window_size: int = 100,
         fp32_for_exp: bool = True,
     ):
+        if beta <= 0:
+            raise ValueError("beta must be positive")
+        if window_size < 2:
+            raise ValueError("window_size must be at least 2")
         self.beta = beta
         self.window_size = window_size
         self.fp32_for_exp = fp32_for_exp
-
-        self.work_history: List[float] = []
-        self.bergson_history: List[float] = []
-        self.energy_trajectory: List[float] = []
-        self.nan_warning_count: int = 0
+        self.change_history: List[float] = []
+        self.proxy_history: List[float] = []
+        self.nan_warning_count = 0
 
     def update(
         self,
@@ -147,171 +168,60 @@ class BergsonMonitor:
         z_next: torch.Tensor,
         energy_fn=None,
     ) -> Dict[str, float]:
-        """
-        Compute Bergson information for one step transition.
-
-        Requires the current and next latent states, plus an energy function
-        to compute work W = ΔE along the trajectory.
-
-        If energy_fn is not provided, falls back to ||z_next − z_current||^2 / D
-        as a proxy work estimate.
-
-        Args:
-            z_current: (B, d) latent state at time t
-            z_next: (B, d) latent state at time t+1
-            energy_fn: callable z -> E(z) for work computation
-
-        Returns:
-            dict with i_bergson, mean_work, exp_work, nan_warning
-        """
+        """Record one scalar energy-change or latent-step proxy."""
         with torch.no_grad():
             if energy_fn is not None:
-                E_current = energy_fn(z_current)
-                E_next = energy_fn(z_next)
-                if hasattr(E_current, "item"):
-                    E_current = E_current.item()
-                if hasattr(E_next, "item"):
-                    E_next = E_next.item()
-                delta_W = E_next - E_current
+                current = torch.as_tensor(energy_fn(z_current)).float().mean().item()
+                next_value = torch.as_tensor(energy_fn(z_next)).float().mean().item()
+                change = next_value - current
             else:
-                delta_z = z_next - z_current
-                delta_W = (delta_z ** 2).sum(dim=-1).mean().item()
+                change = (z_next - z_current).pow(2).sum(dim=-1).mean().item()
+        self.change_history.append(float(change))
+        self.change_history = self.change_history[-self.window_size:]
 
-        self.work_history.append(delta_W)
-        self.energy_trajectory.append(
-            (E_next if energy_fn is not None else delta_W)
-        )
-
-        if len(self.work_history) > self.window_size:
-            self.work_history = self.work_history[-self.window_size:]
-            self.energy_trajectory = self.energy_trajectory[-self.window_size:]
-
-        if len(self.work_history) < 2:
-            result = {
-                "i_bergson": float("nan"),
-                "bergson_mean_work": float("nan"),
-                "bergson_exp_work": float("nan"),
-                "bergson_nan_warning": 0.0,
+        if len(self.change_history) < 2:
+            return {
+                "energy_change_proxy": float("nan"),
+                "mean_energy_change": float("nan"),
+                "exp_neg_beta_change": float("nan"),
+                "proxy_nan_warning": 0.0,
             }
-            self.bergson_history.append(result["i_bergson"])
-            return result
 
-        W_arr = np.array(self.work_history)
-        beta = self.beta
-
-        if self.fp32_for_exp:
-            exp_neg_beta_W = np.exp(-beta * W_arr.astype(np.float64))
-        else:
-            exp_neg_beta_W = np.exp(-beta * W_arr)
-
-        mean_work = float(W_arr.mean())
-        mean_exp_work = float(exp_neg_beta_W.mean())
-
-        if mean_exp_work <= 0 or np.isnan(mean_exp_work) or np.isinf(mean_exp_work):
+        values = np.asarray(self.change_history)
+        dtype = np.float64 if self.fp32_for_exp else values.dtype
+        exp_neg_beta = np.exp(-self.beta * values.astype(dtype))
+        mean_exp = float(exp_neg_beta.mean())
+        if not np.isfinite(mean_exp) or mean_exp <= 0:
             self.nan_warning_count += 1
-            i_bergson = float("nan")
-            nan_warning = 1.0
+            proxy = float("nan")
+            warning = 1.0
         else:
-            i_bergson = beta * mean_work - np.log(mean_exp_work)
-            nan_warning = 0.0
-
-        if np.isnan(i_bergson) or np.isinf(i_bergson):
-            self.nan_warning_count += 1
-            nan_warning = 1.0
-
-        result = {
-            "i_bergson": float(i_bergson) if not np.isnan(i_bergson) else float("nan"),
-            "bergson_mean_work": mean_work,
-            "bergson_exp_work": mean_exp_work,
-            "bergson_nan_warning": nan_warning,
-            "bergson_collapse_alarm": 0.0,
+            proxy = self.beta * float(values.mean()) - np.log(mean_exp)
+            warning = 0.0
+        self.proxy_history.append(proxy)
+        self.proxy_history = self.proxy_history[-10000:]
+        return {
+            "energy_change_proxy": proxy,
+            "mean_energy_change": float(values.mean()),
+            "exp_neg_beta_change": mean_exp,
+            "proxy_nan_warning": warning,
         }
-
-        self.bergson_history.append(result["i_bergson"])
-        if len(self.bergson_history) > 10000:
-            self.bergson_history = self.bergson_history[-5000:]
-
-        return result
 
     def check_collapse(self, router_entropy: float, threshold: float = 0.5) -> bool:
-        """
-        Check for Bergson collapse with router-entropy conjunction.
-
-        I_Bergson → 0 alone can indicate either:
-          (a) genuine collapse (system lost time direction)
-          (b) low-activity resting state (system is quiescent but healthy)
-
-        To distinguish: collapse is only flagged when I_Bergson → 0 AND
-        router entropy is also below threshold (indicating the system has
-        lost diversity, not just reduced activity).
-
-        Args:
-            router_entropy: current router entropy from PoissonRouter
-            threshold: router entropy below which collapse is flagged
-        Returns:
-            True if Bergson collapse is detected (both metrics low)
-        """
-        valid_values = [b for b in self.bergson_history[-20:]
-                        if not (math.isnan(b) if isinstance(b, float) else np.isnan(b))]
-        if not valid_values:
+        """Return a heuristic low-activity/low-routing-diversity flag."""
+        valid = [x for x in self.proxy_history if np.isfinite(x)]
+        if not valid:
             return False
-
-        recent_bergson = float(np.mean(valid_values))
-        return recent_bergson < 0.01 and router_entropy < threshold
-
-    def update_from_jarzynski(
-        self,
-        jarzynski_result: Dict[str, float],
-    ) -> Dict[str, float]:
-        """
-        Alternative: compute Bergson info from pre-computed Jarzynski results.
-
-        Uses the work_mean and jarzynski_left from compute_jarzynski_work().
-
-        Args:
-            jarzynski_result: output dict from compute_jarzynski_work()
-
-        Returns:
-            dict with i_bergson, bergson_mean_work, bergson_exp_work, bergson_nan_warning
-        """
-        mean_work = jarzynski_result.get("work_mean", 0.0)
-        jarzynski_left = jarzynski_result.get("jarzynski_left", 1.0)
-
-        if jarzynski_left <= 0 or np.isnan(jarzynski_left) or np.isinf(jarzynski_left):
-            self.nan_warning_count += 1
-            i_bergson = float("nan")
-            nan_warning = 1.0
-        else:
-            i_bergson = self.beta * mean_work - np.log(jarzynski_left)
-            nan_warning = 0.0
-
-        if np.isnan(i_bergson) or np.isinf(i_bergson):
-            self.nan_warning_count += 1
-            nan_warning = 1.0
-
-        result = {
-            "i_bergson": float(i_bergson) if not np.isnan(i_bergson) else float("nan"),
-            "bergson_mean_work": mean_work,
-            "bergson_exp_work": jarzynski_left,
-            "bergson_nan_warning": nan_warning,
-        }
-
-        self.work_history.append(mean_work)
-        if len(self.work_history) > self.window_size:
-            self.work_history = self.work_history[-self.window_size:]
-
-        self.bergson_history.append(result["i_bergson"])
-        if len(self.bergson_history) > 10000:
-            self.bergson_history = self.bergson_history[-5000:]
-
-        return result
+        return float(np.mean(valid[-20:])) < 0.01 and router_entropy < threshold
 
     def get_report(self) -> Dict:
-        valid = [b for b in self.bergson_history if not (math.isnan(b) if isinstance(b, float) else np.isnan(b))]
+        valid = [x for x in self.proxy_history if np.isfinite(x)]
         return {
-            "i_bergson_current": self.bergson_history[-1] if self.bergson_history else float("nan"),
-            "i_bergson_mean": float(np.mean(valid)) if valid else float("nan"),
+            "energy_change_proxy_current": (
+                self.proxy_history[-1] if self.proxy_history else float("nan")),
+            "energy_change_proxy_mean": (
+                float(np.mean(valid)) if valid else float("nan")),
             "nan_warning_count": self.nan_warning_count,
-            "work_history_len": len(self.work_history),
-            "bergson_history_len": len(self.bergson_history),
+            "change_history_len": len(self.change_history),
+            "proxy_history_len": len(self.proxy_history),
         }

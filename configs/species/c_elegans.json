@@ -1,0 +1,37 @@
+{
+  "species": "c_elegans",
+  "latent_dim": 256,
+  "features": {
+    "eeg_backend": "v1",
+    "use_kda_decoder": false,
+    "use_active_inference": false,
+    "use_species_conditioning": true,
+    "use_generic_observation_adapter": true,
+    "use_mamba2": false,
+    "use_deep_experts": false,
+    "use_generic_moe": false,
+    "use_species_conditioning": true,
+    "use_stochastic_noise": false,
+    "use_meg": false,
+    "perturbation_dim": 2
+  },
+  "data": {
+    "modalities": ["calcium", "voltage", "behavior"],
+    "sample_rate_hz": 10.0,
+    "time_unit": "seconds",
+    "sequence_seconds": 60.0,
+    "channel_count": 302,
+    "max_channels": 302,
+    "region_count": 302,
+    "atlas": "wormbase_neuron_order",
+    "paired_next_step_targets": true
+  },
+  "training": {
+    "ladder_stage": "c_elegans",
+    "freeze_shared_dynamics": false,
+    "freeze_observation_adapters": false,
+    "replay_species": [],
+    "leave_subject_out": true,
+    "batch_size": 8
+  }
+}

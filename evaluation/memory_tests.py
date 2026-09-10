@@ -16,50 +16,75 @@ from typing import Dict, List, Tuple, Optional
 def evaluate_pattern_completion(
     model: nn.Module,
     num_patterns: int = 10,
-    noise_level: float = 0.3,
+    noise_level: float = 0.8,
+    store_steps: int = 200,
 ) -> Dict[str, float]:
-    """
-    Test memory pattern completion under noise.
+    """Pattern completion through the model's Hebbian memory.
 
-    Store patterns in Hebbian memory, then retrieve with noisy cues.
+    Patterns are *stored* by running Oja's rule on the model's own weight
+    matrix — the same plasticity rule the trainer uses — and then retrieved
+    from an independent noisy cue.  The reported quantity is the retrieval
+    gain: how much closer the recalled state is to the stored pattern than the
+    cue it was recalled from.
+
+    The previous version wrote nothing into memory (it called the MoE on unit
+    vectors) and then ran ``model(zeros, zeros, mode="imagination")``, so its
+    similarity score was at chance by construction and said nothing about the
+    memory system.
     """
     model.eval()
+    memory = getattr(model, "hebbian_memory", None)
+    if memory is None:
+        return {"runnable": False, "reason": "model has no hebbian_memory"}
     device = next(model.parameters()).device
-    latent_dim = model.latent_dim
+    dim = int(model.latent_dim)
 
-    # Generate random patterns
-    patterns = torch.randn(num_patterns, latent_dim, device=device)
-    patterns = patterns / (patterns.norm(dim=-1, keepdim=True) + 1e-8)
+    patterns = torch.nn.functional.normalize(
+        torch.randn(num_patterns, dim, device=device), dim=-1)
 
-    # Store patterns (simulate encoding)
-    if hasattr(model, "moe_velocity"):
-        moe = model.moe_velocity
-        for p in patterns:
-            z = p.unsqueeze(0)
-            _ = moe(z)
-
-    # Test retrieval with noisy cues
-    similarities = []
-    for p in patterns:
-        noise = torch.randn_like(p) * noise_level
-        cue = p + noise
-        cue = cue / (cue.norm() + 1e-8)
-
-        # Forward through model to see if it converges back to pattern
+    # Storage: Oja's rule only updates while the module is in training mode.
+    was_training = memory.training
+    memory.train()
+    try:
         with torch.no_grad():
-            dummy_eeg = torch.zeros(1, 19, 2560, device=device)
-            dummy_fmri = torch.zeros(1, 400, 100, device=device)
-            out = model(dummy_eeg, dummy_fmri, mode="imagination")
-            z_next = out["z_next"].squeeze(0)
+            for _ in range(max(1, int(store_steps))):
+                for pattern in patterns:
+                    sample = pattern.unsqueeze(0)
+                    memory.hebbian_weight(sample, sample, update=True)
+    finally:
+        memory.train(was_training)
 
-        sim = torch.cosine_similarity(z_next, p, dim=-1).item()
-        similarities.append(sim)
+    # Recall from an independent noisy cue.
+    cue_similarities = []
+    recall_similarities = []
+    with torch.no_grad():
+        for pattern in patterns:
+            cue = torch.nn.functional.normalize(
+                pattern + noise_level * torch.randn_like(pattern), dim=-1)
+            recalled = memory.hebbian_weight(
+                cue.unsqueeze(0), cue.unsqueeze(0), update=False).squeeze(0)
+            cue_similarities.append(
+                torch.cosine_similarity(cue, pattern, dim=-1).item())
+            recall_similarities.append(
+                torch.cosine_similarity(recalled, pattern, dim=-1).item())
 
-    avg_sim = sum(similarities) / len(similarities)
+    cue_mean = float(np.mean(cue_similarities))
+    recall_mean = float(np.mean(recall_similarities))
+    chance = float(np.mean([
+        torch.cosine_similarity(
+            torch.nn.functional.normalize(torch.randn(dim, device=device), dim=-1),
+            pattern, dim=-1).item()
+        for pattern in patterns
+    ]))
     return {
-        "pattern_completion_similarity": avg_sim,
+        "runnable": True,
+        "pattern_completion_similarity": recall_mean,
+        "cue_similarity": cue_mean,
+        "chance_similarity": chance,
+        "completion_gain": recall_mean - cue_mean,
         "num_patterns": num_patterns,
         "noise_level": noise_level,
+        "store_steps": int(store_steps),
     }
 
 

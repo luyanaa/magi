@@ -1,0 +1,33 @@
+{
+  "name": "cross_species_data_ladder",
+  "order": ["c_elegans", "zebrafish", "mouse", "human"],
+  "stages": [
+    {
+      "species": "c_elegans",
+      "profile": "configs/species/c_elegans.json",
+      "replay_species": []
+    },
+    {
+      "species": "zebrafish",
+      "profile": "configs/species/zebrafish.json",
+      "replay_species": ["c_elegans"]
+    },
+    {
+      "species": "mouse",
+      "profile": "configs/species/mouse.json",
+      "replay_species": ["c_elegans", "zebrafish"]
+    },
+    {
+      "species": "human",
+      "profile": "configs/species/human.json",
+      "replay_species": ["c_elegans", "zebrafish", "mouse"]
+    }
+  ],
+  "contract": {
+    "shared_latent_dynamics": true,
+    "species_conditioning": "metadata_only",
+    "subject_split": "leave_one_subject_out",
+    "normalization": "fit_on_training_subjects_only",
+    "observation_entrypoint": "BrainMoEPINN.forward_modalities"
+  }
+}

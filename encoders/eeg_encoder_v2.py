@@ -16,38 +16,11 @@ Features:
 
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple, Dict, List, Any
-import sys
-import os
+from typing import Optional, Dict, List
 import warnings
 
-try:
-    from brain_moe_pinn.magi.encoder_v2 import EEGFoundationModelV2
-    from brain_moe_pinn.magi.magi_v2 import MagiV2EEGEncoder, create_magi_v2_from_v1
-    MAGI_V2_AVAILABLE = True
-except ImportError as e:
-    MAGI_V2_AVAILABLE = False
-    EEGFoundationModelV2 = None
-    MagiV2EEGEncoder = None
-    warnings.warn(f"Magi v2 not available: {e}")
-
-# Try v1 as fallback
-try:
-    from src.model.encoder import EEGFoundationModel
-    MAGI_V1_AVAILABLE = True
-except ImportError:
-    MAGI_V1_AVAILABLE = False
-    EEGFoundationModel = None
-
-sys.path.insert(0, "/home/yanlu/Documents/a")
-try:
-    from brain_moe_pinn.utils.mamba2_ssm import Mamba2Backbone, FLA_MAMBA2_AVAILABLE
-except ImportError:
-    try:
-        from utils.mamba2_ssm import Mamba2Backbone, FLA_MAMBA2_AVAILABLE
-    except ImportError:
-        FLA_MAMBA2_AVAILABLE = False
-        Mamba2Backbone = None
+from brain_moe_pinn.magi.magi_v2 import MagiV2EEGEncoder
+from brain_moe_pinn.sequence.mamba2_ssm import Mamba2Backbone, FLA_MAMBA2_AVAILABLE
 
 
 class EEGEncoderWrapperV2(nn.Module):
@@ -103,42 +76,26 @@ class EEGEncoderWrapperV2(nn.Module):
         self.current_context_length = patch_size_time
         self.target_context_length = patch_size_time * 4  # Can expand to 4×
         
-        # Initialize Magi v2 encoder
-        if MAGI_V2_AVAILABLE and EEGFoundationModelV2 is not None:
-            self.encoder = EEGFoundationModelV2(
-                hidden_dim=hidden_dim,
-                num_layers=num_layers,
-                num_heads=num_heads,
-                patch_size_time=patch_size_time,
-                stride_time=stride_time,
-                max_channels=max_channels,
-                use_biot_embedding=use_biot_embedding,
-                use_channel_type_embed=use_channel_type_embed,
-                ecog_amplitude_scale=ecog_amplitude_scale,
-                use_rope=use_rope,
-                alternating_pattern=alternating_pattern,
-                window_size=window_size,
-                **kwargs,
-            )
-            print(f"[EEGEncoderWrapperV2] Loaded Magi v2 EEGFoundationModelV2 "
-                  f"(24L×{hidden_dim}d, BIOT={use_biot_embedding}, ECoG-scale={ecog_amplitude_scale})")
-        
-        elif MAGI_V1_AVAILABLE and EEGFoundationModel is not None:
-            # Fallback to v1, then upgrade to v2
-            print("[EEGEncoderWrapperV2] Magi v2 not available, using v1 with upgrade")
-            self.encoder = self._create_v2_from_v1(
-                hidden_dim=hidden_dim,
-                num_layers=num_layers,
-                patch_size_time=patch_size_time,
-                use_biot_embedding=use_biot_embedding,
-                **kwargs,
-            )
-        else:
-            raise RuntimeError(
-                "Magi EEG foundation model not available. "
-                f"MAGI_V2_AVAILABLE={MAGI_V2_AVAILABLE}, MAGI_V1_AVAILABLE={MAGI_V1_AVAILABLE}. "
-                "Check brain_moe_pinn.magi package."
-            )
+        # Brain MoE-PINN only needs the Magi representation encoder. The
+        # standalone EEGFoundationModelV2 adds pretraining heads that are not
+        # used in this production adapter.
+        self.encoder = MagiV2EEGEncoder(
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            patch_size_time=patch_size_time,
+            stride_time=stride_time,
+            max_channels=max_channels,
+            use_biot_embedding=use_biot_embedding,
+            use_channel_type_embed=use_channel_type_embed,
+            ecog_amplitude_scale=ecog_amplitude_scale,
+            use_rope=use_rope,
+            alternating_pattern=alternating_pattern,
+            window_size=window_size,
+        )
+        print(f"[EEGEncoderWrapperV2] Loaded MagiV2EEGEncoder "
+              f"({num_layers}L×{hidden_dim}d, BIOT={use_biot_embedding}, "
+              f"ECoG-scale={ecog_amplitude_scale})")
         
         # Load from v1 checkpoint if specified
         if from_v1_checkpoint:
@@ -172,34 +129,7 @@ class EEGEncoderWrapperV2(nn.Module):
         print(f"[EEGEncoderWrapperV2] Initialized: hidden_dim={hidden_dim}, "
               f"output_dim={output_dim}, freeze={freeze_encoder}, mamba2={use_mamba2}")
     
-    def _create_v2_from_v1(
-        self,
-        hidden_dim: int = 1024,
-        num_layers: int = 24,
-        patch_size_time: int = 256,
-        use_biot_embedding: bool = True,
-        **kwargs,
-    ) -> EEGFoundationModelV2:
-        """Create v2 model from v1 architecture."""
-        # Create a dummy v1 model
-        v1_model = EEGFoundationModel(
-            hidden_dim=768,  # v1 default
-            patch_size_time=patch_size_time,
-            use_biot_embedding=use_biot_embedding,
-            **{k: v for k, v in kwargs.items() if k in ['in_channels', 'channels']},
-        )
-        
-        # Convert to v2
-        v2_model = EEGFoundationModelV2.from_v1_model(
-            v1_model,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            patch_size_time=patch_size_time,
-            use_biot_embedding=use_biot_embedding,
-            **kwargs,
-        )
-        
-        return v2_model
+
     
     def load_from_v1_checkpoint(self, checkpoint_path: str):
         """Load weights from v1 checkpoint."""
@@ -220,17 +150,17 @@ class EEGEncoderWrapperV2(nn.Module):
             else:
                 state_dict = checkpoint
             
-            # Filter for encoder weights
             encoder_state_dict = {}
-            for k, v in state_dict.items():
-                if k.startswith('encoder.'):
-                    encoder_state_dict[k[8:]] = v  # Remove 'encoder.' prefix
-                elif k.startswith('base_encoder.'):
-                    encoder_state_dict[k[13:]] = v  # Remove 'base_encoder.' prefix
-            
+            prefixes = ("encoder.base_encoder.", "base_encoder.", "encoder.")
+            for key, value in state_dict.items():
+                for prefix in prefixes:
+                    if key.startswith(prefix):
+                        encoder_state_dict[key[len(prefix):]] = value
+                        break
+
             if encoder_state_dict:
-                # Load with strict=False for architecture changes
-                missing, unexpected = self.encoder.base_encoder.load_state_dict(
+                # v1 and v2 differ in dimensions; compatible keys are loaded.
+                missing, unexpected = self.encoder.load_state_dict(
                     encoder_state_dict, strict=False
                 )
                 print(f"[EEGEncoderWrapperV2] Loaded v1 checkpoint: {checkpoint_path}")
@@ -278,8 +208,8 @@ class EEGEncoderWrapperV2(nn.Module):
         Args:
             context_length: New context length in samples
         """
-        if hasattr(self.encoder.base_encoder, 'set_context_length'):
-            self.encoder.base_encoder.set_context_length(context_length)
+        if hasattr(self.encoder, 'set_context_length'):
+            self.encoder.set_context_length(context_length)
             self.current_context_length = context_length
             print(f"[EEGEncoderWrapperV2] Context length set to {context_length}")
         
@@ -293,9 +223,8 @@ class EEGEncoderWrapperV2(nn.Module):
         channel_types: Optional[torch.Tensor] = None,
         return_pooler: bool = False,
         mamba2_only: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass through EEG encoder.
+    ) -> Dict[str, torch.Tensor]:
+        """Forward pass through EEG encoder.
         
         Args:
             eeg: (B, C, T) EEG/ECoG/sEEG signals
@@ -305,8 +234,8 @@ class EEGEncoderWrapperV2(nn.Module):
             mamba2_only: Skip Magi encoder, only use Mamba-2 (for ablation)
         
         Returns:
-            embeddings: (B, L, output_dim) token embeddings
-            pooler_output: (B, output_dim) if return_pooler else None
+            dict with ``last_hidden`` and ``embeddings``. ``pooler_output``
+            is included when ``return_pooler`` is true.
         """
         B, C, T = eeg.shape
         
@@ -316,12 +245,11 @@ class EEGEncoderWrapperV2(nn.Module):
         
         # Magi v2 encoder
         if not mamba2_only:
-            last_hidden, pooler_output = self.encoder.forward_embeddings(
+            last_hidden, pooler_output = self.encoder(
                 eeg=eeg,
                 channel_names=channel_names,
                 channel_types=channel_types,
             )
-            
             # Mamba-2 context processing
             if self.mamba2 is not None:
                 # Reshape for Mamba-2: (B, L, D) -> process
@@ -339,7 +267,7 @@ class EEGEncoderWrapperV2(nn.Module):
                     in_channels=C,
                     out_channels=self.hidden_dim,
                     kernel_size=self.encoder.patch_size_time,
-                    stride=self.encoder.patch_size_time,
+                    stride=self.encoder.stride_time,
                 ).to(eeg.device)
             
             # Project to token space: (B, C, T) -> (B, D, T/P) -> (B, T/P, D)
@@ -347,9 +275,9 @@ class EEGEncoderWrapperV2(nn.Module):
             tokens = tokens.permute(0, 2, 1)  # (B, T/P, D)
             
             # Add BIOT embeddings if available
-            if channel_names is not None and hasattr(self.encoder.base_encoder, 'biot_embed'):
+            if channel_names is not None and hasattr(self.encoder, 'biot_embed'):
                 # Simplified: just use first channel name per position
-                biot_embeds = self.encoder.base_encoder.biot_embed(channel_names[0])  # (1, C, D)
+                biot_embeds = self.encoder.biot_embed(channel_names[0])  # (1, C, D)
                 # Average across channels for each token
                 biot_embeds = biot_embeds.mean(dim=1, keepdim=True)  # (1, 1, D)
                 biot_embeds = biot_embeds.expand(B, tokens.shape[1], -1)  # (B, T/P, D)
@@ -362,11 +290,15 @@ class EEGEncoderWrapperV2(nn.Module):
         # Project to output dimension
         embeddings = self.projection(last_hidden)
         
+        out = {
+            "last_hidden": last_hidden,
+            "embeddings": embeddings,
+        }
         if return_pooler:
-            pooler_projected = self.projection(pooler_output.unsqueeze(1)).squeeze(1)
-            return embeddings, pooler_projected
-        else:
-            return embeddings, None
+            out["pooler_output"] = self.projection(
+                pooler_output.unsqueeze(1)
+            ).squeeze(1)
+        return out
     
     def load_pretrained(self, checkpoint_path: str, strict: bool = True):
         """

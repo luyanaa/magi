@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import math
 from typing import Optional, Tuple
 
-from ...utils.device_utils import get_device
+from ...runtime.device_utils import get_device
 
 
 def gaussian_kernel_3d(

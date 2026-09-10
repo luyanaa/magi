@@ -9,7 +9,7 @@ import torch
 from typing import Optional, Dict, List, Tuple, Any
 from pathlib import Path
 
-from ...utils.device_utils import get_device
+from ...runtime.device_utils import get_device
 from dataclasses import dataclass
 import warnings
 import json

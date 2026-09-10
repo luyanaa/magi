@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from typing import Optional
 
-from ...utils.device_utils import get_device
+from ...runtime.device_utils import get_device
 from typing import Optional, Tuple, Dict
 import warnings
 

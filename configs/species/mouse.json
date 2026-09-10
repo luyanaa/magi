@@ -1,0 +1,37 @@
+{
+  "species": "mouse",
+  "latent_dim": 512,
+  "features": {
+    "eeg_backend": "v1",
+    "use_kda_decoder": false,
+    "use_active_inference": false,
+    "use_species_conditioning": true,
+    "use_generic_observation_adapter": true,
+    "use_mamba2": false,
+    "use_deep_experts": false,
+    "use_generic_moe": true,
+    "use_species_conditioning": true,
+    "use_stochastic_noise": false,
+    "use_meg": false,
+    "perturbation_dim": 2
+  },
+  "data": {
+    "modalities": ["calcium", "voltage", "widefield", "fmri", "behavior"],
+    "sample_rate_hz": 30.0,
+    "time_unit": "seconds",
+    "sequence_seconds": 30.0,
+    "channel_count": 64,
+    "max_channels": 1024,
+    "region_count": 400,
+    "atlas": "schaefer_400",
+    "paired_next_step_targets": true
+  },
+  "training": {
+    "ladder_stage": "mouse",
+    "freeze_shared_dynamics": false,
+    "freeze_observation_adapters": false,
+    "replay_species": ["c_elegans", "zebrafish"],
+    "leave_subject_out": true,
+    "batch_size": 4
+  }
+}

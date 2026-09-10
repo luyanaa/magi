@@ -11,15 +11,15 @@ import torch
 import torch.nn as nn
 import pytest
 
-try:
-    import fla
-except ImportError:
-    raise ImportError(
-        "flash-linear-attention (fla) is required. "
-        "Install it with: pip install git+https://github.com/sustcsonglin/flash-linear-attention.git"
-    )
+# The KDA/FLA stack needs CUDA builds; skip the whole suite (not error) in
+# venvs without it so CPU-only development keeps collecting the other tests.
+pytest.importorskip(
+    "fla",
+    reason="flash-linear-attention (fla) required; run on the cluster/CUDA env "
+    "or: pip install git+https://github.com/sustcsonglin/flash-linear-attention.git",
+)
 
-from brain_moe_pinn.utils.device_utils import get_device
+from brain_moe_pinn.runtime.device_utils import get_device
 
 from brain_moe_pinn import BrainMoEPINN
 from brain_moe_pinn.core.velocity_brain import VelocityBrain
@@ -79,8 +79,8 @@ class TestSmokeSuite:
         max_asym = torch.abs(sym_part).max().item()
         assert max_asym < 1e-5, f"Router not antisymmetric: max|W+W^T|={max_asym}"
 
-    def test_03_generic_degeneracy(self, small_velocity):
-        """Test #3: GENERIC degeneracy ||L∇S||/(||L||_F ||∇S||) < 1e-3."""
+    def test_03_pointwise_degeneracy(self, small_velocity):
+        """Test #3: pointwise ``L @ grad_S`` residual is small."""
         z = torch.randn(4, 256, requires_grad=True)
         result = small_velocity(z, apply_noise=False)
         delta_z = result["delta_z"]
@@ -97,23 +97,21 @@ class TestSmokeSuite:
         norm_L_grad_S = torch.norm(L_grad_S, p=2, dim=-1)
 
         ratio = (norm_L_grad_S / (norm_L * norm_grad_S + 1e-8)).mean().item()
-        # Soft projection (eta=0.1) doesn't enforce exact orthogonality;
-        # check that violation is below ~10% rather than 0.1%
-        assert ratio < 0.15, f"GENERIC degeneracy violation: {ratio:.6f}"
+        # The symmetric P L P projection is pointwise, not a global theorem.
+        assert ratio < 0.15, f"Pointwise degeneracy residual: {ratio:.6f}"
 
-    def test_04_epr_correlation(self, small_velocity):
-        """Test #4: EPR proxy vs exact estimator correlation r > 0.85."""
+    def test_04_dissipative_proxy_nonnegative(self, small_velocity):
+        """Test #4: the algebraic dissipative proxy is non-negative."""
         z = torch.randn(4, 256, requires_grad=True)
         result = small_velocity(z, apply_noise=False)
         grad_S = result["grad_S"]
         M_diag = result.get("M_diag", torch.ones_like(grad_S) * 0.1)
 
-        # Proxy: sigma = grad_S · M · grad_S (correct GENERIC EPR)
-        sigma = (grad_S * M_diag * grad_S).sum(dim=-1)
+        proxy = (grad_S * M_diag * grad_S).sum(dim=-1)
 
-        # Verify non-negative (Second Law)
-        assert (sigma >= -1e-6).all(), f"EPR has negative values: {sigma.min().item():.6f}"
-        assert sigma.mean().item() > 0, f"Mean EPR should be positive: {sigma.mean().item():.6f}"
+        assert (proxy >= -1e-6).all(), (
+            f"Dissipative proxy is negative: {proxy.min().item():.6f}")
+        assert proxy.mean().item() > 0, "Dissipative proxy should be positive"
 
     def test_05_oja_convergence(self):
         """Test #5: Oja update converges ||ΔW|| < 1e-4."""

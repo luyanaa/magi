@@ -19,10 +19,10 @@ import sys
 try:
     import fla
     FLA_AVAILABLE = True
-except ImportError:
+except ImportError as _e:
     FLA_AVAILABLE = False
     KimiDeltaAttention = None
-    print(f"[KDA Decoder] Warning: fla not available ({e}). Using PyTorch fallback.")
+    print(f"[KDA Decoder] Warning: fla not available ({_e}). Using PyTorch fallback.")
 
 
 class KDAEncoderBlock(nn.Module):

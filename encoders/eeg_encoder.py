@@ -24,10 +24,10 @@ except ImportError as e:
     EEGFoundationModel = None
 
 try:
-    from brain_moe_pinn.utils.mamba2_ssm import Mamba2Backbone, FLA_MAMBA2_AVAILABLE
+    from brain_moe_pinn.sequence.mamba2_ssm import Mamba2Backbone, FLA_MAMBA2_AVAILABLE
 except ImportError:
     try:
-        from utils.mamba2_ssm import Mamba2Backbone, FLA_MAMBA2_AVAILABLE
+        from sequence.mamba2_ssm import Mamba2Backbone, FLA_MAMBA2_AVAILABLE
     except ImportError:
         FLA_MAMBA2_AVAILABLE = False
         Mamba2Backbone = None

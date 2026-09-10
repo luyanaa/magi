@@ -6,28 +6,20 @@
   "zero_optimization": {
     "stage": 3,
     "allgather_partitions": true,
-    "allgather_bucket_size": 5e7,
+    "allgather_bucket_size": 50000000.0,
     "overlap_comm": true,
     "reduce_scatter": true,
-    "reduce_bucket_size": 5e7,
+    "reduce_bucket_size": 50000000.0,
     "contiguous_gradients": true,
     "load_from_fp32_weights": true,
     "round_robin_gradients": true,
     "zero3_init_flag": true,
     "zero3_save_16bit_model": true,
-    "stage3_prefetch_bucket_size": 5e7,
-    "stage3_param_persistence_threshold": 1e6,
-    "stage3_max_live_parameters": 1e9,
-    "stage3_max_reuse_distance": 1e9,
+    "stage3_prefetch_bucket_size": 50000000.0,
+    "stage3_param_persistence_threshold": 1000000.0,
+    "stage3_max_live_parameters": 1000000000.0,
+    "stage3_max_reuse_distance": 1000000000.0,
     "stage3_gather_16bit_weights_on_model_save": true
-  },
-  "fp16": {
-    "enabled": true,
-    "loss_scale": 0,
-    "loss_scale_window": 1000,
-    "initial_scale_power": 16,
-    "hysteresis": 2,
-    "min_loss_scale": 1
   },
   "bf16": {
     "enabled": false
@@ -42,13 +34,6 @@
     "broker_type": "primary",
     "timeout": 1800
   },
-  "checkpoint": {
-    "save_interval": 5000,
-    "tag_checkpoint_major_only": false
-  },
-  "sparse_checkpoint": {
-    "enabled": false
-  },
   "activation_checkpointing": {
     "partition_activations": true,
     "cpu_checkpointing": false,
@@ -57,5 +42,9 @@
     "synchronize_checkpoint_boundary": false,
     "profile": false
   },
-  "zero_allow_untested_optimizer": true
+  "zero_allow_untested_optimizer": true,
+  "torch_autocast": {
+    "enabled": true,
+    "dtype": "float16"
+  }
 }

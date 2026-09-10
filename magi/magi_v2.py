@@ -546,6 +546,7 @@ class MagiV2EEGEncoder(nn.Module):
         alternating_pattern: bool = True,
         max_channels: int = 256,  # Cap for ECoG/sEEG
         patch_size_time: int = 256,
+        stride_time: Optional[int] = None,
         use_biot_embedding: bool = True,
         use_channel_type_embed: bool = True,
         ecog_amplitude_scale: float = 20.0,  # ECoG ~20× scalp EEG amplitude
@@ -554,7 +555,7 @@ class MagiV2EEGEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.max_channels = max_channels
         self.patch_size_time = patch_size_time
-        self.use_biot_embedding = use_biot_embedding
+        self.stride_time = patch_size_time if stride_time is None else stride_time
         self.use_channel_type_embed = use_channel_type_embed
         self.ecog_amplitude_scale = ecog_amplitude_scale
         
@@ -581,7 +582,7 @@ class MagiV2EEGEncoder(nn.Module):
             in_channels=1,  # Per electrode
             out_channels=hidden_dim,
             kernel_size=patch_size_time,
-            stride=patch_size_time,
+            stride=self.stride_time,
             padding=0,
         )
         
@@ -665,6 +666,10 @@ class MagiV2EEGEncoder(nn.Module):
             pooler_output: (B, D)
         """
         B, C, T = eeg.shape
+        if channel_names is not None and channel_names and isinstance(channel_names[0], str):
+            channel_names = [channel_names for _ in range(B)]
+        if channel_types is not None and channel_types.dim() == 1:
+            channel_types = channel_types.unsqueeze(0).expand(B, -1)
         
         # Validate channel count
         if C > self.max_channels:
@@ -683,8 +688,8 @@ class MagiV2EEGEncoder(nn.Module):
                 channel_signal = eeg[b, c:c+1, :]  # (1, T)
                 
                 # Temporal projection
-                channel_tokens = self.temporal_proj(channel_signal.unsqueeze(1))  # (1, D, T/P)
-                channel_tokens = channel_tokens.squeeze(1).transpose(1, 0)  # (T/P, D)
+                channel_tokens = self.temporal_proj(channel_signal.unsqueeze(1))
+                channel_tokens = channel_tokens.squeeze(0).transpose(0, 1)
                 
                 # Add BIOT embedding if available
                 if self.biot_embed is not None and channel_names is not None:

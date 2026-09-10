@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from typing import Optional, Dict, Tuple
 import math
 
-from ..utils.device_utils import get_device as _get_device
+from ..runtime.device_utils import get_device as _get_device
 
 
 def _resolve_device():
@@ -60,13 +60,6 @@ class ValueFunction(nn.Module):
             nn.Linear(hidden_dim // 4, 1),
         )
 
-        self.value_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-
     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Compute value function V(z) = -(E - TS).
@@ -106,19 +99,31 @@ class ValueFunction(nn.Module):
         self,
         z: torch.Tensor,
         goal_attractors: Optional[torch.Tensor] = None,
+        action: Optional[torch.Tensor] = None,
         action_cost: float = 0.01,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Compute Expected Free Energy for trajectory scoring.
+        """Score a trajectory endpoint with a free-energy-like objective.
 
-        EFE = V(z_future) + action_cost * ||action||^2
+        This is **not** the variational Expected Free Energy of active
+        inference.  There is no observation model, no posterior over hidden
+        causes, and no epistemic (information-gain) term.  What it computes is
+
+            F(z) = E(z) - T*S(z) - 0.1*td(z)
+                   + 0.1*mean_b ||z - goal_b||
+                   + action_cost * ||action||^2
+
+        the negative of :meth:`ValueFunction.forward` plus explicit goal
+        attraction and control cost.  Lower is better.  Treat it as a learned
+        preference scalar, not as a variational bound.
 
         Args:
-            z: (B, d) current or trajectory state
-            goal_attractors: optional goal states for goal-directed EFE
-            action_cost: cost scaling for actions
+            z: (B, d) trajectory endpoint (or current state)
+            goal_attractors: optional (B, num_goals, d) preferred states
+            action: optional (B, a) control applied to reach ``z``; its squared
+                norm is charged at ``action_cost``
+            action_cost: cost scaling for the control term
         Returns:
-            efe: (B,) expected free energy
+            efe: (B,) free-energy-like score per trajectory
         """
         V, metrics = self.forward(z)
 
@@ -129,6 +134,12 @@ class ValueFunction(nn.Module):
             goal_cost = 0.1 * goal_dist
             efe = efe + goal_cost
             metrics["goal_cost"] = goal_cost.mean().item()
+
+        if action is not None and action_cost > 0:
+            control_cost = action_cost * action.reshape(
+                action.shape[0], -1).pow(2).sum(dim=-1)
+            efe = efe + control_cost
+            metrics["control_cost"] = control_cost.mean().item()
 
         metrics["efe"] = efe.mean().item()
         return efe, metrics
@@ -270,6 +281,7 @@ class SmithPredictor(nn.Module):
         self,
         z_current: torch.Tensor,
         kda_state_history: torch.Tensor,
+        oscillation_tolerant: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Predict future state accounting for delay.
@@ -277,6 +289,9 @@ class SmithPredictor(nn.Module):
         Args:
             z_current: (B, d) current latent state
             kda_state_history: (B, T_history, d) history of KDA states
+            oscillation_tolerant: gain mode for this call; falls back to the
+                constructor default.  Passed in rather than stored so the
+                module cannot change behaviour between two identical forwards.
         Returns:
             dict with prediction, delay estimate, stability check
         """
@@ -292,7 +307,9 @@ class SmithPredictor(nn.Module):
 
         gamma = torch.abs(self.feedback_gain)
 
-        gamma_max = self.gamma_max_oscillation if self.oscillation_tolerant else self.gamma_max_hard
+        tolerant = (self.oscillation_tolerant
+                    if oscillation_tolerant is None else bool(oscillation_tolerant))
+        gamma_max = self.gamma_max_oscillation if tolerant else self.gamma_max_hard
         stability_margin = gamma_max - gamma * tau_est
         is_stable = stability_margin > 0
 
@@ -308,7 +325,7 @@ class SmithPredictor(nn.Module):
             "feedback_gain": adjusted_gain,
             "stability_margin": stability_margin,
             "is_stable": is_stable,
-            "oscillation_tolerant": self.oscillation_tolerant,
+            "oscillation_tolerant": tolerant,
         }
 
         return result
@@ -346,7 +363,6 @@ class SmithPredictor(nn.Module):
         tau = self.tau_delay
 
         if not math.isnan(ataxia_score) and ataxia_score > 0.5:
-            self.oscillation_tolerant = False
             gamma_max_hard = 1.0 / (tau + 1e-6)
             return {
                 "gamma_max": gamma_max_hard,
@@ -356,7 +372,6 @@ class SmithPredictor(nn.Module):
             }
 
         if not math.isnan(catalepsy_score) and catalepsy_score > 3.0:
-            self.oscillation_tolerant = True
             gamma_max_cat = (math.pi / 2) / (tau + 1e-6)
             return {
                 "gamma_max": gamma_max_cat,
@@ -366,8 +381,11 @@ class SmithPredictor(nn.Module):
                 "requires_noise_injection": True,
             }
 
-        self.oscillation_tolerant = True
-
+        # No mutation of module state: the mode is an output of this call, and
+        # the caller decides whether to pass it back in.  Previously this method
+        # flipped ``self.oscillation_tolerant`` as a side effect, which made two
+        # identical forwards return different results and made validation
+        # order-dependent whenever the monitors ran.
         if math.isnan(q_factor):
             gamma_max = (math.pi / 2) / (tau + 1e-6)
             mode = "oscillation_tolerant_default"
@@ -388,18 +406,26 @@ class SmithPredictor(nn.Module):
             "stability_target": gamma_max * tau,
         }
 
-    def compute_stability_loss(self) -> torch.Tensor:
+    def compute_stability_loss(
+        self, oscillation_tolerant: Optional[bool] = None
+    ) -> torch.Tensor:
         """
         Compute stability regularization loss.
 
         Encourages gamma * tau_delay < stability_target.
         oscillation_tolerant=True: target = pi/2 - 0.2 (margin within oscillation range)
         oscillation_tolerant=False: target = 0.9 (original hard overdamping)
+
+        The bound is a scalar loop-gain heuristic (first-order loop with pure
+        delay); this network has no plant delay, so treat the target as a
+        tunable knob rather than a stability criterion.
         """
         gamma = torch.abs(self.feedback_gain)
         tau = self.tau_delay
 
-        target = self.oscillation_stability_target if self.oscillation_tolerant else 0.9
+        tolerant = (self.oscillation_tolerant
+                    if oscillation_tolerant is None else bool(oscillation_tolerant))
+        target = self.oscillation_stability_target if tolerant else 0.9
 
         stability_violation = F.relu(gamma * tau - target)
 
@@ -410,19 +436,21 @@ class PrecisionGate(nn.Module):
     """
     Precision Gate for dynamic weighting of prediction errors.
 
-    Dynamically adjusts the weight (precision) of prediction errors
-    based on:
+    Adjusts the weight (precision) of prediction errors from two scalar
+    summaries:
     - Delay magnitude: longer delays -> lower precision (more uncertainty)
     - Action magnitude: larger actions -> higher precision requirement
 
-    Implements: precision = sigma^-2 = exp(-alpha * delay) * exp(beta * |action|)
+    The mapping is learned (a small MLP over the two encoded scalars plus a
+    learnable base), not the closed-form
+    ``exp(-alpha*delay) * exp(beta*|action|)``; that expression motivates the
+    inputs but is not what the module evaluates.
     """
 
     def __init__(
         self,
         hidden_dim: int = 1024,
         delay_dim: int = 64,
-        action_dim: int = 64,
     ):
         super().__init__()
 
@@ -432,8 +460,11 @@ class PrecisionGate(nn.Module):
             nn.Linear(delay_dim, 1),
         )
 
+        # Precision depends on the action magnitude |a| (a scalar), matching
+        # precision = sigma^-2 = exp(-alpha*delay) * exp(beta*|a|).  The
+        # encoder therefore consumes one input, not ``action_dim`` inputs.
         self.action_encoder = nn.Sequential(
-            nn.Linear(action_dim, delay_dim),
+            nn.Linear(1, delay_dim),
             nn.GELU(),
             nn.Linear(delay_dim, 1),
         )
@@ -455,19 +486,22 @@ class PrecisionGate(nn.Module):
         """
         Compute dynamic precision weight.
 
+        Two scalar summaries drive a learned precision:
+        the feedback delay and the executed action magnitude.  Both are
+        scalars per batch item, so ``action`` may be any shape whose trailing
+        dimensions describe the action vector.
+
         Args:
             delay: (B,) or (B, 1) delay time
-            action: (B, d) or (B, action_dim) action magnitude
+            action: (B,) or (B, k) executed action; only its norm is used
         Returns:
             precision: (B,) precision weights
             metrics: dict with components
         """
         if delay.dim() == 1:
             delay = delay.unsqueeze(-1)
-        if action.dim() == 2:
-            action_mag = torch.norm(action, dim=-1, keepdim=True)
-        else:
-            action_mag = action.unsqueeze(-1) if action.dim() == 1 else action
+        action_mag = action.reshape(action.shape[0], -1).norm(
+            dim=-1, keepdim=True)
 
         delay_encoded = self.delay_encoder(torch.log(delay + 1e-3))
         action_encoded = self.action_encoder(action_mag)
@@ -517,7 +551,8 @@ class ClosedLoopFeedback(nn.Module):
         self.tau_delay = tau_delay
         self.feedback_strength = feedback_strength
 
-        self.efference_copy = EfferenceCopy(latent_dim=latent_dim)
+        self.efference_copy = EfferenceCopy(
+            latent_dim=latent_dim, hidden_dim=latent_dim)
 
         self.smith_predictor = SmithPredictor(
             hidden_dim=latent_dim,
@@ -574,7 +609,9 @@ class ClosedLoopFeedback(nn.Module):
                 catalepsy_score=catalepsy_score if catalepsy_score is not None else 0.0,
             )
 
-            smith_result = self.smith_predictor(z_current, kda_state_history)
+            smith_result = self.smith_predictor(
+                z_current, kda_state_history,
+                oscillation_tolerant=wiener_adjustment["oscillation_tolerant"])
             predicted_z = smith_result["predicted_z"]
             stability_margin = smith_result["stability_margin"]
         else:
@@ -593,31 +630,41 @@ class ClosedLoopFeedback(nn.Module):
             precision_metrics = {}
 
         catalepsy_noise_boost = 0.0
-        if wiener_adjustment is not None and wiener_adjustment.get("requires_noise_injection", False):
+        if (wiener_adjustment is not None
+                and wiener_adjustment.get("requires_noise_injection", False)):
             catalepsy_noise_boost = 0.1
-
         prediction_error = efference_result["prediction_error"]
+        corrected_z = z_current
+        weighted_error = None
+        error_signal = None
         if prediction_error is not None:
             weighted_error = prediction_error * precision * stability_margin
 
-            error_signal = efference_result["efference"] * weighted_error.unsqueeze(-1)
+            error_signal = efference_result["efference"] * (
+                weighted_error.unsqueeze(-1))
 
             if catalepsy_noise_boost > 0:
-                noise_signal = torch.randn_like(error_signal) * catalepsy_noise_boost
+                noise_signal = torch.randn_like(error_signal) * (
+                    catalepsy_noise_boost)
                 error_signal = error_signal + noise_signal
 
+            # Bounded time-axis history of per-step feedback error signals,
+            # shape (B, T, d) with T <= max_history.  Concatenating on the
+            # feature axis instead would grow the latent width without bound
+            # and destroy the per-step correspondence.
+            error_step = error_signal.detach().unsqueeze(1)
             if self.error_history is None:
-                self.error_history = error_signal.detach()
+                self.error_history = error_step
             else:
                 self.error_history = torch.cat([
-                    self.error_history, error_signal.detach()
+                    self.error_history, error_step
                 ], dim=1)[:, -self.max_history:]
 
-            corrected_z = z_current + self.feedback_strength * error_signal
-        else:
-            corrected_z = z_current
-            weighted_error = None
-            error_signal = None
+            # Smith prediction and precision-weighted reafference are fused
+            # in latent space; the fusion output is the actual correction.
+            feedback_input = torch.cat([predicted_z, error_signal], dim=-1)
+            correction = self.feedback_fusion(feedback_input)
+            corrected_z = z_current + self.feedback_strength * correction
 
         result = {
             "corrected_z": corrected_z,
@@ -630,7 +677,10 @@ class ClosedLoopFeedback(nn.Module):
                 "stability_margin": stability_margin.mean().item() if stability_margin is not None else 1.0,
                 "feedback_strength": self.feedback_strength,
                 "wiener_mode": wiener_adjustment.get("mode", "disabled") if wiener_adjustment else "disabled",
-                "oscillation_tolerant": self.smith_predictor.oscillation_tolerant,
+                "oscillation_tolerant": (
+                    bool(wiener_adjustment["oscillation_tolerant"])
+                    if wiener_adjustment
+                    else self.smith_predictor.oscillation_tolerant),
                 "catalepsy_noise_boost": catalepsy_noise_boost,
                 **precision_metrics,
             }
@@ -662,21 +712,30 @@ class ActiveInferenceController(nn.Module):
         use_counterfactual: bool = True,
         use_feedback: bool = True,
         tau_delay: float = 0.5,
+        energy_entropy_net: Optional[nn.Module] = None,
+        counterfactual_search: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.use_counterfactual = use_counterfactual
         self.use_feedback = use_feedback
 
-        self.value_function = ValueFunction(hidden_dim=latent_dim)
+        # Share the caller's energy/entropy fields when supplied: the value
+        # function and the velocity field must score the *same* potentials,
+        # otherwise EFE ranks states on a landscape the dynamics never follow.
+        self.value_function = ValueFunction(
+            hidden_dim=latent_dim,
+            energy_entropy_net=energy_entropy_net,
+        )
 
-        if use_counterfactual:
+        self.cfts = counterfactual_search
+        if use_counterfactual and self.cfts is None:
             from .counterfactual_search import CounterfactualTreeSearch
             self.cfts = CounterfactualTreeSearch(
                 latent_dim=latent_dim,
                 num_goals=2,
                 num_exploration=1,
-                rollout_steps=10,
+                rollout_steps=3,
             )
 
         if use_feedback:

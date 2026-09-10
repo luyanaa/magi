@@ -77,17 +77,20 @@ class LatentPerturbation(nn.Module):
         num_samples: int = 4,
     ) -> torch.Tensor:
         """
-        Generate random exploration actions along Casimir invariant directions.
+        Generate exploratory action candidates.
 
-        Casimir invariants are quantities that commute with all generators
-        of the Poisson algebra, meaning perturbations along these directions
-        don't affect the energy/conservation properties.
+        The candidates are learned latent directions plus per-sample noise,
+        projected by ``action_proj``.  They are not Casimir invariants: a
+        Casimir invariant of a Poisson structure lies in the kernel of the
+        structure matrix, and nothing here constrains
+        ``L(z) @ casimir_directions`` to vanish.  Treat them as learned
+        exploration directions.
 
         Args:
             z_current: (B, d) current latent state
             num_samples: number of random actions to generate
         Returns:
-            (B, num_samples, d) random action perturbations
+            (B, num_samples, d) exploratory action perturbations
         """
         B = z_current.shape[0]
 
@@ -123,10 +126,15 @@ class LatentPerturbation(nn.Module):
 
 class TrajectoryRollout(nn.Module):
     """
-    Roll out future trajectories from current state using the dynamics model.
+    Roll out candidate futures from a latent state under the model dynamics.
 
-    Given current state z_t and action perturbations, simulates future
-    trajectories using the VelocityBrain/MoE dynamics model.
+    The injected ``velocity_net`` is the generic velocity backbone
+    (``VelocityBrain``).  MoE expert modulation, stimulus control, species
+    conditioning, and the multi-time-scale filter are **not** part of the
+    rollout: the search therefore explores the base GENERIC-inspired field at
+    the state it is given.  Keep that in mind when interpreting the selected
+    trajectory as "what the model would do" — it is the backbone's
+    continuation, not a full forward pass.
     """
 
     def __init__(
@@ -134,17 +142,37 @@ class TrajectoryRollout(nn.Module):
         latent_dim: int = 1024,
         num_steps: int = 10,
         dt: float = 0.001,
+        action_mode: str = "impulse",
     ):
         super().__init__()
+        if action_mode not in ("impulse", "sustained"):
+            raise ValueError("action_mode must be 'impulse' or 'sustained'")
         self.latent_dim = latent_dim
         self.num_steps = num_steps
         self.dt = dt
+        self.action_mode = action_mode
 
         self.velocity_net = None
 
     def set_velocity_net(self, velocity_net: nn.Module):
         """Set the velocity/dynamics network for rollouts."""
         self.velocity_net = velocity_net
+        integration_dt = getattr(velocity_net, "integration_dt", None)
+        if integration_dt is not None:
+            self.dt = float(integration_dt)
+
+    def _velocity(self, z: torch.Tensor) -> torch.Tensor:
+        if self.velocity_net is None:
+            return torch.zeros_like(z)
+        output = self.velocity_net(z)
+        if isinstance(output, dict):
+            velocity = output.get("velocity", output.get("delta_z"))
+        else:
+            velocity = output
+        if velocity is None:
+            raise ValueError(
+                "velocity_net must return a tensor or a velocity/delta_z key")
+        return velocity
 
     def forward(
         self,
@@ -154,34 +182,35 @@ class TrajectoryRollout(nn.Module):
         """
         Roll out trajectories for each action.
 
-        Args:
-            z_init: (B, d) initial latent state
-            actions: (B, num_actions, d) action perturbations per sample
         Returns:
-            trajectories: (B, num_actions, num_steps+1, d) trajectory states
-            rewards: (B, num_actions) reward scores for each trajectory
+            trajectories: (B, num_actions, num_steps+1, d)
+            rewards: action-norm scores retained for compatibility
         """
         B, num_actions, d = actions.shape
         device = z_init.device
 
-        trajectories = torch.zeros(B, num_actions, self.num_steps + 1, d, device=device)
-        trajectories[:, :, 0] = z_init.unsqueeze(1).expand(-1, num_actions, -1)
-
-        z_current = z_init.unsqueeze(1).expand(-1, num_actions, -1).clone()
+        trajectories = torch.zeros(
+            B, num_actions, self.num_steps + 1, d, device=device,
+            dtype=z_init.dtype)
+        trajectories[:, :, 0] = z_init.unsqueeze(1).expand(
+            -1, num_actions, -1)
+        z_current = z_init.unsqueeze(1).expand(
+            -1, num_actions, -1).clone()
 
         for step in range(self.num_steps):
             z_flat = z_current.reshape(B * num_actions, d)
-
-            if self.velocity_net is not None:
-                with torch.set_grad_enabled(self.training):
-                    delta_z = self.velocity_net(z_flat)["velocity"]
+            delta_z = self._velocity(z_flat).view(B, num_actions, d)
+            # Counterfactual semantics: the intervention is applied once, at
+            # the branch point, and the dynamics then evolve on their own.
+            # "sustained" keeps the action on every step instead.
+            if step > 0 and self.action_mode == "impulse":
+                step_action = torch.zeros_like(actions)
             else:
-                delta_z = torch.randn_like(z_flat) * 0.01
-
-            delta_z = delta_z.view(B, num_actions, d)
-
-            z_current = z_current + self.dt * delta_z + actions * math.sqrt(self.dt)
-
+                step_action = actions
+            # Actions are deterministic control inputs, so they enter the
+            # Euler step with a dt weight like the drift.  A sqrt(dt) weight
+            # belongs to stochastic increments.
+            z_current = z_current + self.dt * (delta_z + step_action)
             trajectories[:, :, step + 1] = z_current
 
         return trajectories, actions.norm(dim=-1)
@@ -241,14 +270,9 @@ class CounterfactualTreeSearch(nn.Module):
     """
     Counterfactual Tree Search for action selection.
 
-    From current state z_t, generates multiple counterfactual trajectories
-    by applying different latent perturbations (actions), evaluates them
-    via discriminator, and selects the best action.
-
-    Branching factor: 4 (per plan §2.5)
-    - 2 goal attractor-based actions
-    - 1 random exploration action
-    - 1 task cue action
+    Candidate actions are expanded for ``rollout_steps`` levels.  Each
+    branch is advanced by the configured latent dynamics and scored on its
+    exact path by the trajectory discriminator.
     """
 
     def __init__(
@@ -259,13 +283,17 @@ class CounterfactualTreeSearch(nn.Module):
         rollout_steps: int = 3,
         branch_factor: int = 4,
         dt: float = 0.001,
+        selection_temperature: float = 0.1,
     ):
         super().__init__()
+        if selection_temperature <= 0:
+            raise ValueError("selection_temperature must be positive")
         self.latent_dim = latent_dim
         self.num_goals = num_goals
         self.num_exploration = num_exploration
         self.num_actions = num_goals + num_exploration + 1
         self.branch_factor = branch_factor
+        self.selection_temperature = selection_temperature
 
         self.perturbation = LatentPerturbation(
             latent_dim=latent_dim,
@@ -317,6 +345,29 @@ class CounterfactualTreeSearch(nn.Module):
 
         return all_actions, action_types
 
+    def _advance(
+        self, parents: torch.Tensor, actions: torch.Tensor, level: int = 0
+    ) -> torch.Tensor:
+        """Advance every branch with the configured dynamics plus its action.
+
+        Under the default ``impulse`` mode the action is applied only at the
+        branch point (``level == 0``); deeper levels evolve freely.
+        """
+        B, num_parents, d = parents.shape
+        num_actions = actions.shape[2]
+        parent_expanded = parents.unsqueeze(2).expand(
+            -1, -1, num_actions, -1)
+        z_flat = parent_expanded.reshape(-1, d)
+        action_flat = actions.reshape(-1, d)
+        delta_z = self.rollout._velocity(z_flat).reshape(
+            B, num_parents, num_actions, d)
+        if level > 0 and self.rollout.action_mode == "impulse":
+            action_flat = torch.zeros_like(action_flat)
+        return (
+            parent_expanded + self.rollout.dt * (
+                delta_z + action_flat.reshape(
+                    B, num_parents, num_actions, d)))
+
     def forward(
         self,
         z_current: torch.Tensor,
@@ -324,121 +375,90 @@ class CounterfactualTreeSearch(nn.Module):
         task_cue: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Perform counterfactual tree search with actual branching.
+        Perform a differentiable three-level counterfactual tree search.
 
-        Branch factor: 4 (per plan §2.5)
-        Depth: rollout_steps (default 3)
-        Total leaf trajectories: 4^3 = 64
-
-        Args:
-            z_current: (B, d) current latent state
-            goal_attractors: (B, num_goals, d) goal attractor centers from memory
-            task_cue: (B, d) optional task cue
-        Returns:
-            dict with:
-                - selected_action: (B, d) chosen action perturbation
-                - selected_trajectory: (B, num_steps+1, d) rollout with best action
-                - all_trajectories: (B, num_actions, num_steps+1, d) all rollouts
-                - scores: (B, num_actions) scores for all actions
-                - best_indices: (B,) index of best action per sample
+        The discriminator scores exact dynamics paths.  A soft minimum over
+        those scores selects the returned path for training, while
+        ``best_indices`` remains a hard reporting/inspection value.
         """
-        B = z_current.shape[0]
+        B, d = z_current.shape
+        if self.rollout.num_steps < 1:
+            raise ValueError("rollout_steps must be positive")
         device = z_current.device
-        num_steps = self.rollout.num_steps
+        depth = self.rollout.num_steps
 
-        # Build tree: root -> actions -> actions -> actions
-        # Use batching to process all branches in parallel
-        z_root = z_current  # (B, d)
+        states = [z_current.unsqueeze(1)]
+        actions_by_level = []
+        action_types = []
+        action_counts = []
 
-        # Level 0: generate actions from root
-        actions_0, types_0 = self._generate_actions(z_root, goal_attractors, task_cue)
-        num_a0 = actions_0.shape[1]  # branch_factor
+        for level in range(depth):
+            parent_states = states[-1]
+            num_parents = parent_states.shape[1]
+            parent_flat = parent_states.reshape(B * num_parents, d)
+            if goal_attractors is not None:
+                goal_flat = goal_attractors.unsqueeze(1).expand(
+                    -1, num_parents, -1, -1).reshape(
+                        B * num_parents, *goal_attractors.shape[1:])
+            else:
+                goal_flat = None
+            if task_cue is not None:
+                cue_flat = task_cue.unsqueeze(1).expand(
+                    -1, num_parents, -1).reshape(B * num_parents, d)
+            else:
+                cue_flat = None
 
-        # Rollout step 0 with all level-0 actions
-        # NOTE: Tree search uses geometric action perturbations only (no velocity net).
-        # This is intentional — running the full VelocityBrain for each leaf would be
-        # O(branch_factor^3) forward passes. The TrajectoryRollout class implements
-        # the full dynamics for single-trajectory rollouts when accuracy is needed.
-        z_expanded_0 = z_root.unsqueeze(1).expand(-1, num_a0, -1)  # (B, num_a0, d)
-        z_next_0 = z_expanded_0 + actions_0 * math.sqrt(self.rollout.dt)  # (B, num_a0, d)
+            actions_flat, types = self._generate_actions(
+                parent_flat, goal_flat, cue_flat)
+            num_actions = actions_flat.shape[1]
+            actions = actions_flat.reshape(
+                B, num_parents, num_actions, d)
+            next_states = self._advance(parent_states, actions, level=level)
+            actions_by_level.append(actions)
+            action_counts.append(num_actions)
+            if level == 0:
+                action_types = types
+            states.append(next_states.reshape(B, -1, d))
 
-        # Level 1: generate actions from each level-0 state
-        z_flat_1 = z_next_0.reshape(B * num_a0, self.latent_dim)  # (B*num_a0, d)
+        num_leaves = states[-1].shape[1]
+        leaf_ids = torch.arange(num_leaves, device=device)
+        path_states = []
+        for level, level_states in enumerate(states):
+            # State at level l is indexed by the prefix of actions through l.
+            # Each prefix is repeated for all suffix combinations.
+            suffix = math.prod(action_counts[level + 1:])
+            level_ids = (leaf_ids // suffix) % level_states.shape[1]
+            path_states.append(level_states[:, level_ids])
+        candidate_paths = torch.stack(path_states, dim=2)
+        candidate_paths = candidate_paths.reshape(
+            B, num_leaves, depth + 1, d)
 
-        if goal_attractors is not None:
-            goal_attractors_expanded = goal_attractors.unsqueeze(1).expand(-1, num_a0, -1, -1)
-            goal_attractors_flat = goal_attractors_expanded.reshape(B * num_a0, *goal_attractors.shape[1:])
-        else:
-            goal_attractors_flat = None
+        traj_for_disc = candidate_paths.reshape(
+            B * num_leaves, depth + 1, d)
+        scores_flat = self.discriminator(traj_for_disc).reshape(
+            B, num_leaves)
+        best_leaf_indices = scores_flat.argmin(dim=1)
 
-        if task_cue is not None:
-            task_cue_expanded = task_cue.unsqueeze(1).expand(-1, num_a0, -1)
-            task_cue_flat = task_cue_expanded.reshape(B * num_a0, self.latent_dim)
-        else:
-            task_cue_flat = None
+        soft_weights = torch.softmax(
+            -scores_flat / self.selection_temperature, dim=1)
+        selected_trajectory = torch.einsum(
+            "bn,bntd->btd", soft_weights, candidate_paths)
 
-        actions_1, types_1 = self._generate_actions(z_flat_1, goal_attractors_flat, task_cue_flat)
-        num_a1 = actions_1.shape[1]  # branch_factor
+        first_suffix = math.prod(action_counts[1:]) if depth > 1 else 1
+        first_ids = leaf_ids // first_suffix
+        first_actions = actions_by_level[0][:, 0, first_ids]
+        selected_action = torch.einsum(
+            "bn,bnd->bd", soft_weights, first_actions)
 
-        z_expanded_1 = z_next_0.unsqueeze(2).expand(-1, -1, num_a1, -1)  # (B, num_a0, num_a1, d)
-        z_next_1 = z_expanded_1 + actions_1.reshape(B, num_a0, num_a1, self.latent_dim) * math.sqrt(self.rollout.dt)
-
-        # Level 2: generate actions from each level-1 state
-        z_flat_2 = z_next_1.reshape(B * num_a0 * num_a1, self.latent_dim)
-
-        if goal_attractors_flat is not None:
-            goal_attractors_flat2 = goal_attractors_flat.unsqueeze(1).expand(-1, num_a1, -1, -1)
-            goal_attractors_flat2 = goal_attractors_flat2.reshape(B * num_a0 * num_a1, *goal_attractors.shape[1:])
-        else:
-            goal_attractors_flat2 = None
-
-        if task_cue_flat is not None:
-            task_cue_flat2 = task_cue_flat.unsqueeze(1).expand(-1, num_a1, -1)
-            task_cue_flat2 = task_cue_flat2.reshape(B * num_a0 * num_a1, self.latent_dim)
-        else:
-            task_cue_flat2 = None
-
-        actions_2, types_2 = self._generate_actions(z_flat_2, goal_attractors_flat2, task_cue_flat2)
-        num_a2 = actions_2.shape[1]  # branch_factor
-
-        # Final states after 3 levels of branching
-        z_expanded_2 = z_next_1.unsqueeze(3).expand(-1, -1, -1, num_a2, -1)  # (B, num_a0, num_a1, num_a2, d)
-        z_leaf = z_expanded_2 + actions_2.reshape(B, num_a0, num_a1, num_a2, self.latent_dim) * math.sqrt(self.rollout.dt)
-
-        # Score all leaf states
-        z_leaf_flat = z_leaf.reshape(B, num_a0 * num_a1 * num_a2, self.latent_dim)
-
-        # Create pseudo-trajectories for discriminator (shape: B*num_leaves, 1, d)
-        num_leaves = num_a0 * num_a1 * num_a2
-        traj_for_disc = z_leaf_flat.reshape(B * num_leaves, 1, self.latent_dim)
-        scores = self.discriminator(traj_for_disc)  # (B*num_leaves,)
-        scores_flat = scores.reshape(B, num_leaves)  # (B, num_leaves)
-
-        best_leaf_indices = scores_flat.argmin(dim=1)  # (B,)
-
-        # Decode best leaf index to action path
-        batch_indices = torch.arange(B, device=device)
-        best_leaf = z_leaf_flat[batch_indices, best_leaf_indices]  # (B, d)
-
-        # Build selected trajectory: root -> best path
-        selected_trajectory = torch.zeros(B, num_steps + 1, self.latent_dim, device=device)
-        selected_trajectory[:, 0] = z_root
-        # For tree search, we use the leaf as the final state and interpolate
-        for t in range(1, num_steps + 1):
-            alpha = t / num_steps
-            selected_trajectory[:, t] = (1 - alpha) * z_root + alpha * best_leaf
-
-        # Return first action along best path as selected_action
-        idx0 = best_leaf_indices // (num_a1 * num_a2)
-        selected_action = actions_0[batch_indices, idx0]
-
+        final_shape = [B, *action_counts, d]
+        all_trajectories = states[-1].reshape(final_shape)
         return {
             "selected_action": selected_action,
             "selected_trajectory": selected_trajectory,
-            "all_trajectories": z_leaf,  # (B, num_a0, num_a1, num_a2, d)
+            "all_trajectories": all_trajectories,
             "scores": scores_flat,
             "best_indices": best_leaf_indices,
-            "action_types": types_0,
+            "action_types": action_types,
         }
 
 

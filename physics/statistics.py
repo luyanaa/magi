@@ -69,33 +69,105 @@ def compute_1f_exponent(
     }
 
 
-def compute_lyapunov_exponents(
+def compute_velocity_growth_proxy(
     z_trajectory: torch.Tensor,
     delta_z_trajectory: torch.Tensor,
     k: int = 5,
 ) -> Dict[str, float]:
+    """Summarize velocity-magnitude growth without calling it Lyapunov data.
+
+    A Lyapunov exponent requires perturbation trajectories or tangent-space
+    dynamics with a stated time normalization.  This function only fits the
+    log slope of the supplied velocity magnitudes and reports it as an
+    observational proxy.
     """
-    Estimate largest Lyapunov exponents from trajectory.
+    del z_trajectory, k
+    if delta_z_trajectory.shape[0] < 2:
+        return {"velocity_log_slope": 0.0, "max_v_norm": 0.0, "mean_v_norm": 0.0}
 
-    lambda_i = lim_{t->inf} (1/t) log(||delta_z(t)|| / ||delta_z(0)||)
-    """
-    T = z_trajectory.shape[0]
-    if T < 2:
-        return {"lambda_1": 0.0, "lambda_k": 0.0}
-
-    # Use velocity magnitude as proxy for local expansion
-    v_norms = torch.norm(delta_z_trajectory, p=2, dim=-1).cpu().numpy()
-
-    # Fit exponential growth
+    v_norms = torch.norm(delta_z_trajectory, p=2, dim=-1).detach().cpu().numpy()
     t_vals = np.arange(len(v_norms))
     if v_norms.std() > 1e-6:
-        log_v = np.log(v_norms + 1e-10)
-        slope = np.polyfit(t_vals, log_v, 1)[0]
+        slope = np.polyfit(t_vals, np.log(v_norms + 1e-10), 1)[0]
     else:
         slope = 0.0
 
     return {
-        "lambda_1": float(slope),
+        "velocity_log_slope": float(slope),
         "max_v_norm": float(v_norms.max()),
         "mean_v_norm": float(v_norms.mean()),
+    }
+
+
+def estimate_local_transition_growth(
+    fn,
+    x: torch.Tensor,
+    dt: float = 1.0,
+    iters: int = 15,
+    target_growth: float = 1.0,
+) -> Dict[str, float]:
+    """Estimate local growth of the explicit transition map.
+
+    ``fn`` is interpreted as a continuous-time velocity field:
+
+        dz/dt = fn(z)
+
+    The monitored map is the explicit-Euler transition
+
+        Phi_dt(z) = z + dt * fn(z).
+
+    The returned quantity is the asymptotic JVP growth estimate of
+    ``D Phi_dt``.  It is a local diagnostic, not a proof of global stability:
+    non-normal Jacobians can have transient amplification even when their
+    asymptotic growth is below one.  Use the reported value together with
+    finite-horizon rollout diagnostics.
+
+    ``fn`` must act independently on each batch row.  ``dt`` is required
+    explicitly because a threshold on the velocity Jacobian alone has no
+    time-unit meaning.
+    """
+    if dt <= 0:
+        raise ValueError("dt must be positive")
+    if iters < 1:
+        raise ValueError("iters must be positive")
+    if target_growth <= 0:
+        raise ValueError("target_growth must be positive")
+
+    x = x.detach()
+
+    def transition(y):
+        return y + float(dt) * fn(y)
+
+    v = torch.randn_like(x)
+    v = v / v.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    growth_prev = None
+    converged = False
+    iters_used = 0
+    growth = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
+    for i in range(iters):
+        iters_used = i + 1
+        with torch.enable_grad():
+            _, jv = torch.autograd.functional.jvp(
+                transition, (x,), (v,), create_graph=False)
+        jv = jv.detach()
+        growth = jv.norm(dim=-1)
+        if growth_prev is not None and (growth - growth_prev).abs().max() < 1e-3:
+            converged = True
+            break
+        if growth.max() > 1e6:
+            break
+        growth_prev = growth
+        v = jv / growth[:, None].clamp_min(1e-12)
+
+    growth_mean = float(growth.mean().item())
+    growth_max = float(growth.max().item())
+    return {
+        "transition_growth_mean": growth_mean,
+        "transition_growth_max": growth_max,
+        "converged": bool(converged),
+        "locally_bounded": bool(growth_max <= target_growth),
+        "dt": float(dt),
+        "target_growth": float(target_growth),
+        "iters_used": iters_used,
     }

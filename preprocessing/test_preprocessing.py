@@ -9,7 +9,7 @@ import sys
 import torch
 import numpy as np
 
-from brain_moe_pinn.utils.device_utils import get_device
+from brain_moe_pinn.runtime.device_utils import get_device
 import warnings
 
 warnings.filterwarnings("ignore")

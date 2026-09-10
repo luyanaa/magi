@@ -19,12 +19,23 @@ import math
 
 class OjaUpdate(nn.Module):
     """
-    Oja's rule for online Hebbian weight updates.
+    Oja's principal-subspace rule (generalized Hebbian) for a weight *matrix*.
 
-    Oja's rule: dw/dt = eta * y * (x - w * y)
-    where y = w^T @ x is the neuron output and eta is learning rate.
+    For a single neuron with weight vector ``w`` the rule is
+    ``dw/dt = eta * y * (x - w * y)`` with ``y = w^T x``.  Here ``W`` is a
+    matrix and ``y = W x``, so the implemented form is the matrix
+    generalization::
 
-    This keeps the weight matrix symmetric and with spectral radius <= 1/eta.
+        dW/dt = eta * (E[y x^T] - E[y y^T] W)
+
+    which drives ``W`` onto the principal subspace of the input distribution.
+    The previous docstring quoted only the single-neuron scalar form, which
+    made the matrix update look like an implementation error; it is not.
+
+    ``W`` is updated by this rule, not by the optimizer: ``forward`` writes it
+    through ``.data`` and ``clip_spectral`` returns a detached tensor, so ``W``
+    never receives an SGD gradient.  The periodic spectral clip is a safety
+    projection on top of the rule's own norm bound, not a substitute for it.
     """
 
     def __init__(self, hidden_dim: int = 1024, eta: float = 0.01):
@@ -90,7 +101,12 @@ class SpectralNormalizedHebbianWeight(nn.Module):
         else:
             W_init = torch.eye(dim) * spectral_bound
 
-        self.W = nn.Parameter(W_init.float())
+        # .contiguous(): torch.linalg.qr can return Q with non-standard strides,
+        # and a non-contiguous Parameter breaks DeepSpeed's collective
+        # broadcast ("Tensors must be contiguous") as well as any op that
+        # assumes a packed layout.  .float() alone does not copy when the
+        # tensor is already float32, so it does not fix the strides.
+        self.W = nn.Parameter(W_init.float().contiguous())
 
         self.oja_update = OjaUpdate(dim, eta_oja)
 
@@ -306,10 +322,13 @@ class EngramLandscape(nn.Module):
 
     def consolidate(self):
         """Consolidate high-frequency traces into new attractors.
-        
-        TODO: Implement attractor creation from accumulated traces.
-        Currently a no-op — medium-term memory consolidation is a future feature
-        (see plan §2.4, Engram Landscape).
+
+        TODO: Implement attractor creation from accumulated traces (see plan
+        §2.4, Engram Landscape).
+
+        NOTE (2026-09): intentionally unimplemented future API — currently a
+        no-op. Verified zero callers across core/training/data/diagnostics/
+        tests; never on any hot path. Implement before first use.
         """
         if len(self.recent_traces) >= self.accumulation_threshold:
             pass

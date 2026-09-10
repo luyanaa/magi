@@ -22,10 +22,10 @@ import math
 import sys
 
 try:
-    from brain_moe_pinn.utils.mamba2_ssm import Mamba2EncoderBlock, FLA_MAMBA2_AVAILABLE
+    from brain_moe_pinn.sequence.mamba2_ssm import Mamba2EncoderBlock, FLA_MAMBA2_AVAILABLE
 except ImportError:
     try:
-        from utils.mamba2_ssm import Mamba2EncoderBlock, FLA_MAMBA2_AVAILABLE
+        from sequence.mamba2_ssm import Mamba2EncoderBlock, FLA_MAMBA2_AVAILABLE
     except ImportError:
         FLA_MAMBA2_AVAILABLE = False
         Mamba2EncoderBlock = None
