@@ -11,11 +11,12 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 
 from brain_moe_pinn import BrainMoEPINN
-from brain_moe_pinn.data import PairedBrainDataset
+from brain_moe_pinn.data import EEGDenoiseNetDataset, PairedBrainDataset
 from brain_moe_pinn.data.species_dataset import (
     SpeciesSignalDataset, build_species_dataloaders,
 )
 from brain_moe_pinn.training.losses import TotalLoss, VelocitySmoothnessLoss
+from brain_moe_pinn.training.training_loop import partition_generic_batch
 from brain_moe_pinn.training.training_phases import LossWeights
 
 
@@ -50,6 +51,65 @@ def test_species_dataset_windows_and_batches(tmp_path):
     assert len(val_loader.dataset) >= 0
 
 
+def test_generic_partition_preserves_pair_contract():
+    future = torch.randn(2, 2, 4, 8)
+    _, targets, _ = partition_generic_batch(
+        {
+            "calcium": torch.randn(2, 4, 8),
+            "calcium_future": future,
+            "cross_modal_labels": torch.tensor([1.0, 0.0]),
+        },
+        signal_modalities=("calcium",),
+        recon_modalities=("calcium",),
+        device=torch.device("cpu"),
+        rollout_steps=2,
+        require_future_targets=True,
+        require_multi_horizon=True,
+    )
+    assert torch.equal(targets["cross_modal_labels"],
+                       torch.tensor([1.0, 0.0]))
+
+
+def test_eegdenoisenet_dataset_builds_clean_and_noisy_views(tmp_path):
+    root = tmp_path / "eegdenoisenet"
+    _write_npy(root / "data", "EEG_all_epochs", np.arange(48).reshape(6, 8))
+    _write_npy(root / "data", "EOG_all_epochs",
+               np.ones((6, 8), dtype=np.float32))
+
+    dataset = EEGDenoiseNetDataset(
+        root,
+        train_fraction=0.5,
+        val_fraction=0.25,
+        seed=7,
+    )
+    sample = dataset[0]
+    assert sample["eeg"].shape == (1, 8)
+    assert sample["eeg_view2"].shape == (1, 8)
+    assert sample["channel_types"].tolist() == [0]
+    assert not torch.equal(sample["eeg"], sample["eeg_view2"])
+    batch = EEGDenoiseNetDataset.collate_fn([sample, dataset[1]])
+    assert batch["eeg"].shape == (2, 1, 8)
+    assert len(batch["channel_names"]) == 2
+
+
+def test_build_data_loaders_eegdenoisenet_profile(tmp_path):
+    train_mod = _load_train_module()
+    root = tmp_path / "eegdenoisenet"
+    _write_npy(root / "data", "EEG_all_epochs", np.random.randn(10, 8))
+    _write_npy(root / "data", "EOG_all_epochs", np.random.randn(10, 8))
+    profile = tmp_path / "eegdenoisenet.json"
+    profile.write_text(
+        '{"kind": "eegdenoisenet", "root": "eegdenoisenet", '
+        '"batch_size": 2, "num_workers": 0, "train_fraction": 0.6, '
+        '"val_fraction": 0.2}'
+    )
+    train_loader, val_loader = train_mod.build_data_loaders(profile)
+    batch = next(iter(train_loader))
+    assert batch["eeg"].shape == (2, 1, 8)
+    assert batch["eeg_view2"].shape == (2, 1, 8)
+    assert len(val_loader.dataset) == 2
+
+
 def test_paired_dataset_with_optional_meg(tmp_path):
     root = tmp_path / "paired"
     _write_npy(root / "eeg", "sub1", np.random.randn(4, 64))
@@ -66,7 +126,7 @@ def test_paired_dataset_with_optional_meg(tmp_path):
     assert first["meg"].shape == (306, 64)
     assert "meg" not in second
     assert first["is_paired"] and second["is_paired"]
-
+    assert first["cross_modal_labels"].item() == 1.0
 
 def _make_model():
     torch.manual_seed(0)
@@ -178,3 +238,66 @@ def test_total_loss_fires_temporal_tv_on_rollouts():
     assert torch.allclose(
         torch.tensor(metrics["velocity_smooth"]), manual, atol=1e-6)
     assert torch.isfinite(total)
+
+
+def test_species_multi_horizon_targets(tmp_path):
+    array = np.arange(32, dtype=np.float32).reshape(1, 32)
+    _write_npy(tmp_path / "calcium", "sample", array)
+    ds = SpeciesSignalDataset(
+        tmp_path, ["calcium"], seq_len=8, random_windows=False,
+        return_next_step_targets=True, future_steps=3)
+    item = ds[0]
+    assert item["calcium"].shape == (1, 8)
+    assert item["calcium_future"].shape == (3, 1, 8)
+    assert torch.equal(
+        item["calcium_future"].reshape(3, 8),
+        torch.from_numpy(array[:, 8:].reshape(3, 8)))
+    assert torch.equal(item["calcium_next_2"], item["calcium_future"][1])
+
+
+def test_generic_rollout_emits_per_horizon_reconstructions():
+    model = _make_model()
+    signals = {"calcium": torch.randn(2, 12, 64)}
+    outputs = model.forward_modalities(
+        signals, num_steps=3, reconstruct=True)
+    assert outputs["calcium_recon_sequence"].shape == (2, 3, 12, 64)
+    assert torch.allclose(
+        outputs["calcium_recon_sequence"][:, -1],
+        outputs["calcium_recon"])
+
+
+def test_total_loss_uses_composite_forecast_term():
+    from brain_moe_pinn.training.losses import CompositeForecastLoss
+
+    prediction = torch.randn(2, 3, 2, 8)
+    target = torch.randn(2, 3, 2, 8)
+    criterion = CompositeForecastLoss(horizon_weights=[1.0, 2.0, 3.0])
+    value = criterion(prediction, target)
+    assert torch.isfinite(value)
+
+    weights = LossWeights(
+        recon_extra={"calcium": 1.0}, forecast=1.0,
+        forecast_horizon_weights=(1.0, 2.0, 3.0), sigreg=0.0)
+    total_loss = TotalLoss(weights)
+    total, metrics = total_loss(
+        {
+            "calcium_recon": prediction[:, -1],
+            "calcium_recon_sequence": prediction,
+        },
+        {"calcium": target},
+    )
+    assert torch.isfinite(total)
+    assert "forecast_calcium" in metrics
+
+
+def test_cross_modal_alignment_requires_explicit_labels():
+    from brain_moe_pinn.training.losses import CrossModalAlignmentLoss
+
+    loss = CrossModalAlignmentLoss()
+    eeg = torch.randn(2, 8)
+    fmri = torch.randn(2, 8)
+    with pytest.raises(ValueError, match="cross_modal_labels"):
+        loss(eeg, fmri)
+    value, metrics = loss(eeg, fmri, torch.tensor([1.0, 0.0]))
+    assert torch.isfinite(value)
+    assert metrics["cross_modal_aligned_fraction"] == 0.5

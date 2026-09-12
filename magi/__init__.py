@@ -29,3 +29,10 @@ except ImportError:
     create_magi_v2_from_v1 = None
 else:
     __all__.extend(["MagiV2EEGEncoder", "create_magi_v2_from_v1"])
+
+try:
+    from .pretraining import MagiPretrainingObjective
+except ImportError:
+    MagiPretrainingObjective = None
+else:
+    __all__.append("MagiPretrainingObjective")

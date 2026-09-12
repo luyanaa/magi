@@ -10,27 +10,74 @@
     "use_mamba2": false,
     "use_deep_experts": false,
     "use_generic_moe": true,
-    "use_species_conditioning": true,
+    "use_moe": true,
+    "poisson_rank": 64,
     "use_stochastic_noise": false,
     "use_meg": false,
-    "perturbation_dim": 2
+    "perturbation_dim": 2,
+    "use_sensor_emission": true
   },
   "data": {
-    "modalities": ["calcium", "voltage", "widefield", "fmri", "behavior"],
+    "modalities": [
+      "calcium",
+      "voltage",
+      "widefield",
+      "fmri",
+      "behavior"
+    ],
+    "control_specs": {
+      "opto": {
+        "kind": "optogenetic",
+        "target_scope": "neuron",
+        "target_encoding": "gated_one_hot",
+        "no_op_when_off": true
+      }
+    },
     "sample_rate_hz": 30.0,
+    "sample_rate_hz_source": "manifest",
     "time_unit": "seconds",
     "sequence_seconds": 30.0,
     "channel_count": 64,
     "max_channels": 1024,
     "region_count": 400,
     "atlas": "schaefer_400",
-    "paired_next_step_targets": true
+    "paired_next_step_targets": true,
+    "sensors": {
+      "calcium": {
+        "imaging": "widefield_2p",
+        "reporter": "gcamp6s",
+        "readout": "dff"
+      },
+      "voltage": {
+        "imaging": "electrical",
+        "readout": "absolute"
+      },
+      "widefield": {
+        "imaging": "widefield_2p",
+        "reporter": "gcamp6s",
+        "readout": "dff"
+      },
+      "fmri": {
+        "imaging": "bold_epi",
+        "reporter": "bold_hemodynamic",
+        "readout": "bold",
+        "hrf": {
+          "kappa": 0.65,
+          "gamma": 0.41,
+          "tau": 0.98,
+          "alpha": 0.32,
+          "rho": 0.34,
+          "v0": 0.02
+        },
+        "tr_s": 1.0,
+        "calibration_note": "Rodent haemodynamics are faster than human haemodynamics; fit and report the effective HRF for each corpus."
+      }
+    }
   },
   "training": {
     "ladder_stage": "mouse",
     "freeze_shared_dynamics": false,
     "freeze_observation_adapters": false,
-    "replay_species": ["c_elegans", "zebrafish"],
     "leave_subject_out": true,
     "batch_size": 4
   }

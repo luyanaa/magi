@@ -1,0 +1,32 @@
+{
+  "kind": "species",
+  "root": "../../data_ladder/mouse_crossrepo",
+  "modalities": [
+    "calcium",
+    "voltage",
+    "widefield",
+    "fmri",
+    "behavior"
+  ],
+  "roles": {
+    "calcium": "signal",
+    "voltage": "signal",
+    "widefield": "signal",
+    "fmri": "signal",
+    "behavior": "aux"
+  },
+  "batch_size": 2,
+  "seq_seconds": 30.0,
+  "num_workers": 0,
+  "split_by": "subject",
+  "val_frac": 0.1,
+  "test_frac": 0.1,
+  "align_channels": false,
+  "max_union_channels": 4096,
+  "return_masks": true,
+  "normalization": "global_zscore",
+  "return_next_step_targets": true,
+  "control_reduction": "resample",
+  "rollout_steps": 1,
+  "seed": 0
+}

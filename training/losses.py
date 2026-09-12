@@ -246,6 +246,79 @@ class ReconstructionLoss(nn.Module):
         return stacked.mean()
 
 
+class CompositeForecastLoss(nn.Module):
+    """Horizon-weighted robust signal and increment forecast loss.
+
+    Inputs are ``(B, K, C, T)`` tensors. Each horizon combines Huber error on
+    the signal with correlation error on first differences, so a forecast
+    cannot win only by copying a smooth baseline or by matching amplitude.
+    """
+
+    def __init__(
+        self,
+        huber_weight: float = 1.0,
+        corr_diff_weight: float = 1.0,
+        horizon_weights: Optional[Union[torch.Tensor, list]] = None,
+    ):
+        super().__init__()
+        if huber_weight < 0 or corr_diff_weight < 0:
+            raise ValueError("forecast loss weights must be non-negative")
+        if huber_weight == 0 and corr_diff_weight == 0:
+            raise ValueError("at least one forecast criterion is required")
+        self.huber_weight = float(huber_weight)
+        self.corr_diff_weight = float(corr_diff_weight)
+        self.horizon_weights = (
+            None if horizon_weights is None else torch.as_tensor(
+                horizon_weights, dtype=torch.float32))
+        if self.horizon_weights is not None:
+            if self.horizon_weights.dim() != 1:
+                raise ValueError("horizon_weights must be one-dimensional")
+            if bool((self.horizon_weights < 0).any()):
+                raise ValueError("horizon_weights must be non-negative")
+            if float(self.horizon_weights.sum()) <= 0:
+                raise ValueError("horizon_weights must have positive mass")
+        self.huber = ReconstructionLoss("huber")
+        self.corr_diff = ReconstructionLoss("corr_diff")
+
+    def forward(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if prediction.dim() != 4 or target.dim() != 4:
+            raise ValueError(
+                "forecast prediction and target must have shape (B,K,C,T)")
+        if prediction.shape != target.shape:
+            raise ValueError(
+                "forecast prediction and target shapes must match")
+        if mask is not None and mask.shape != target.shape:
+            raise ValueError("forecast mask must match prediction shape")
+        horizons = prediction.shape[1]
+        if self.horizon_weights is None:
+            weights = prediction.new_ones(horizons)
+        else:
+            if self.horizon_weights.numel() != horizons:
+                raise ValueError(
+                    f"horizon_weights has {self.horizon_weights.numel()} values "
+                    f"for {horizons} horizons")
+            weights = self.horizon_weights.to(prediction)
+        weights = weights / weights.sum().clamp_min(1e-12)
+        total = prediction.sum() * 0.0
+        for horizon in range(horizons):
+            horizon_mask = None if mask is None else mask[:, horizon]
+            robust = self.huber(
+                prediction[:, horizon], target[:, horizon],
+                mask=horizon_mask)
+            increment = self.corr_diff(
+                prediction[:, horizon], target[:, horizon],
+                mask=horizon_mask)
+            total = total + weights[horizon] * (
+                self.huber_weight * robust
+                + self.corr_diff_weight * increment)
+        return total
+
+
 class VelocitySmoothnessLoss(nn.Module):
     """Temporal total-variation of the latent velocity along a rollout.
 
@@ -596,12 +669,12 @@ class NSPLoss(nn.Module):
 
 
 class CrossModalAlignmentLoss(nn.Module):
-    """
-    Aligns EEG and fMRI representations via hub tokens.
+    """Align EEG and fMRI representations using explicit pair labels.
 
-    Encourages:
-    - EEG and fMRI hub tokens to be similar when data is aligned
-    - Orthogonal when data is from different subjects/sessions
+    ``labels`` has one binary value per batch row: 1 means the two modalities
+    are synchronized/aligned and 0 means they are intentionally unmatched.
+    There is no unlabeled fallback because aligning every row would turn
+    subject/session mismatches into false positives.
     """
 
     def __init__(self, weight: float = 0.1):
@@ -614,31 +687,35 @@ class CrossModalAlignmentLoss(nn.Module):
         hub_fmri: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Args:
-            hub_eeg: (B, d) EEG hub token
-            hub_fmri: (B, d) fMRI hub token
-            labels: (B,) optional labels (1=aligned, 0=unaligned)
-        Returns:
-            loss, metrics
-        """
-        hub_eeg_norm = hub_eeg / (hub_eeg.norm(dim=-1, keepdim=True) + safe_epsilon(hub_eeg))
-        hub_fmri_norm = hub_fmri / (hub_fmri.norm(dim=-1, keepdim=True) + safe_epsilon(hub_fmri))
+        """Compute labeled same-row alignment loss."""
+        if labels is None:
+            raise ValueError(
+                "cross-modal alignment requires cross_modal_labels")
+        if hub_eeg.shape != hub_fmri.shape or hub_eeg.dim() != 2:
+            raise ValueError(
+                "cross-modal hubs must have matching shape (B, latent_dim)")
+        labels = labels.to(device=hub_eeg.device).flatten()
+        if labels.numel() != hub_eeg.shape[0]:
+            raise ValueError(
+                "cross_modal_labels must have one value per batch row")
+        if (not torch.isfinite(labels).all()
+                or not bool(((labels == 0) | (labels == 1)).all())):
+            raise ValueError("cross_modal_labels must contain only 0 or 1")
 
-        similarity = (hub_eeg_norm * hub_fmri_norm).sum(dim=-1)
-
-        if labels is not None:
-            aligned_mask = labels == 1
-            loss = F.mse_loss(similarity[aligned_mask], torch.ones_like(similarity[aligned_mask]))
-            if (~aligned_mask).sum() > 0:
-                loss += 0.1 * F.mse_loss(similarity[~aligned_mask], torch.zeros_like(similarity[~aligned_mask]))
-        else:
-            loss = -similarity.mean()
-
+        similarity = F.cosine_similarity(hub_eeg, hub_fmri, dim=-1)
+        aligned = labels == 1
+        terms = []
+        if bool(aligned.any()):
+            terms.append(F.mse_loss(
+                similarity[aligned], torch.ones_like(similarity[aligned])))
+        if bool((~aligned).any()):
+            terms.append(F.mse_loss(
+                similarity[~aligned], torch.zeros_like(similarity[~aligned])))
+        loss = torch.stack(terms).mean()
         metrics = {
             "cross_modal_similarity": similarity.mean().item(),
+            "cross_modal_aligned_fraction": aligned.float().mean().item(),
         }
-
         return self.weight * loss, metrics
 
 
@@ -946,30 +1023,30 @@ class LatentSparsityLoss(nn.Module):
 
 
 class ActionLoss(nn.Module):
-    """
-    Active inference action loss: minimize Expected Free Energy (EFE).
-
-    L_action = E_{q(a)}[EFE(a)]
-    """
+    """Supervise expected free energy against executed-action utility."""
 
     def __init__(self, weight: float = 0.1):
         super().__init__()
         self.weight = weight
 
-    def forward(self, efe: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
-        loss = efe.mean()
+    def forward(
+        self,
+        efe: torch.Tensor,
+        utility_target: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        if efe.shape != utility_target.shape:
+            raise ValueError(
+                "action_utility_target must match the EFE prediction shape")
+        loss = F.smooth_l1_loss(efe, utility_target)
         metrics = {
-            "efe_mean": loss.item(),
+            "efe_mean": efe.mean().item(),
+            "action_utility_huber": loss.item(),
         }
         return self.weight * loss, metrics
 
 
 class ReplayLoss(nn.Module):
-    """
-    Memory replay loss: imagined trajectories should match engram traces.
-
-    L_replay = ||z_imagined - z_engram||^2
-    """
+    """Supervise imagined latent states against an explicit replay target."""
 
     def __init__(self, weight: float = 0.02):
         super().__init__()
@@ -978,22 +1055,74 @@ class ReplayLoss(nn.Module):
     def forward(
         self,
         z_imagined: torch.Tensor,
-        z_engram: torch.Tensor,
+        replay_target: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        loss = F.mse_loss(z_imagined, z_engram)
+        if z_imagined.shape != replay_target.shape:
+            raise ValueError(
+                "replay_target must match the imagined latent shape")
+        loss = F.mse_loss(z_imagined, replay_target)
         metrics = {
             "replay_mse": loss.item(),
         }
         return self.weight * loss, metrics
 
 
-class CrossSoftContrastiveLoss(nn.Module):
-    """
-    Soft contrastive loss for async (non-synchronized) EEG-fMRI subjects.
+class InterventionResponseLoss(nn.Module):
+    """Fit a predicted treated-minus-baseline response to observed effects.
 
-    Stage 2 loss: pulls synchronized EEG-fMRI pairs together while pushing
-    non-synchronized pairs apart, with soft labels for partial alignment.
-    L_cross_soft = -log(exp(sim(z_eeg, z_fmri) / τ) / Σ_k exp(sim(z_eeg, z_fmri_k) / τ))
+    The target is an explicit response/effect vector, not a proxy generated
+    from the model's own rollout.  A mask may be supplied per element or per
+    trailing latent vector.
+    """
+
+    def __init__(self, weight: float = 1.0, beta: float = 1.0):
+        super().__init__()
+        if beta <= 0:
+            raise ValueError("beta must be positive")
+        self.weight = weight
+        self.beta = float(beta)
+
+    def forward(
+        self,
+        predicted_effect: torch.Tensor,
+        target_effect: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        if predicted_effect.shape != target_effect.shape:
+            raise ValueError(
+                "intervention_target must match the predicted effect shape")
+        if predicted_effect.dim() not in (2, 3):
+            raise ValueError(
+                "intervention effects must have shape (B,D) or (B,K,D)")
+        error = F.smooth_l1_loss(
+            predicted_effect, target_effect, beta=self.beta, reduction="none")
+        if mask is not None:
+            if mask.shape == predicted_effect.shape[:-1]:
+                mask = mask.unsqueeze(-1)
+            if mask.shape != predicted_effect.shape:
+                raise ValueError(
+                    "intervention_mask must match effect shape or omit latent dim")
+            mask = mask.to(device=error.device, dtype=error.dtype)
+            denominator = mask.sum().clamp_min(1.0)
+            loss = (error * mask).sum() / denominator
+            valid_fraction = (mask > 0).float().mean()
+        else:
+            loss = error.mean()
+            valid_fraction = error.new_tensor(1.0)
+        metrics = {
+            "response_huber": loss.item(),
+            "valid_fraction": valid_fraction.item(),
+        }
+
+        return self.weight * loss, metrics
+
+class CrossSoftContrastiveLoss(nn.Module):
+    """Contrastive alignment with explicit synchronized/async labels.
+
+    ``labels`` has one binary value per row. Synchronized rows use their
+    same-row cross-modal pair as the positive; async rows are required to
+    have low diagonal similarity. An unlabeled identity fallback would
+    silently train false positives and is therefore rejected.
     """
 
     def __init__(self, weight: float = 0.02, temperature: float = 0.07):
@@ -1007,34 +1136,40 @@ class CrossSoftContrastiveLoss(nn.Module):
         hub_fmri: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Args:
-            hub_eeg: (B, d) EEG hub tokens
-            hub_fmri: (B, d) fMRI hub tokens
-            labels: (B,) optional alignment labels (1=sync, 0=async)
-        Returns:
-            loss, metrics
-        """
+        if labels is None:
+            raise ValueError(
+                "soft cross-modal contrastive loss requires "
+                "cross_modal_labels")
+        if hub_eeg.shape != hub_fmri.shape or hub_eeg.dim() != 2:
+            raise ValueError(
+                "cross-modal hubs must have matching shape (B, latent_dim)")
+        labels = labels.to(device=hub_eeg.device).flatten()
+        if labels.numel() != hub_eeg.shape[0]:
+            raise ValueError(
+                "cross_modal_labels must have one value per batch row")
+        if (not torch.isfinite(labels).all()
+                or not bool(((labels == 0) | (labels == 1)).all())):
+            raise ValueError("cross_modal_labels must contain only 0 or 1")
+
         z_eeg = F.normalize(hub_eeg, dim=-1)
         z_fmri = F.normalize(hub_fmri, dim=-1)
-
-        sim_matrix = torch.matmul(z_eeg, z_fmri.t()) / self.temperature
-
-        if labels is not None:
-            pos_mask = (labels.unsqueeze(1) == labels.unsqueeze(0)).float()
-            pos_mask.fill_diagonal_(0)
-        else:
-            pos_mask = torch.eye(sim_matrix.shape[0], device=sim_matrix.device)
-
-        pos_count = pos_mask.sum(dim=-1).clamp(min=1)
-        log_prob = sim_matrix - torch.logsumexp(sim_matrix, dim=-1, keepdim=True)
-        mean_log_prob_pos = (pos_mask * log_prob).sum(dim=-1) / pos_count
-
-        loss = -mean_log_prob_pos.mean()
-
+        logits = torch.matmul(z_eeg, z_fmri.t()) / self.temperature
+        synchronized = labels == 1
+        terms = []
+        if bool(synchronized.any()):
+            log_prob = logits - torch.logsumexp(
+                logits, dim=-1, keepdim=True)
+            terms.append(-log_prob.diagonal()[synchronized].mean())
+        if bool((~synchronized).any()):
+            diagonal = logits.diagonal()[~synchronized] * self.temperature
+            terms.append(F.mse_loss(
+                diagonal, torch.zeros_like(diagonal)))
+        loss = torch.stack(terms).mean()
         metrics = {
             "cross_soft_loss": loss.item(),
-            "cross_soft_sim_mean": sim_matrix.mean().item(),
+            "cross_soft_sim_mean": (
+                (logits * self.temperature).mean().item()),
+            "cross_soft_aligned_fraction": synchronized.float().mean().item(),
         }
         return self.weight * loss, metrics
 
@@ -1161,6 +1296,13 @@ class LossNormalizer:
 
         scale = min(max(scale, self.min_scale), self.max_scale)
         return loss_value / (scale + self.eps)
+
+    def reset(self) -> None:
+        """Discard calibration state at a phase boundary."""
+        self.ema_abs.clear()
+        self.step_count.clear()
+        self._frozen.clear()
+        self._frozen_scale.clear()
 
     def get_stats(self) -> Dict[str, Dict[str, float]]:
         """Return current scale statistics."""
@@ -1399,6 +1541,7 @@ class TotalLoss(nn.Module):
         self.sparsity = LatentSparsityLoss(weight=1.0)
         self.action = ActionLoss(weight=1.0)
         self.replay = ReplayLoss(weight=1.0)
+        self.intervention_response = InterventionResponseLoss(weight=1.0)
         self.bandpower = BandPowerLoss(weight=1.0)
         self.sigreg = WeakSIGRegLoss(
             sketch_dim=getattr(loss_weights, "sigreg_sketch_dim", 64),
@@ -1408,6 +1551,17 @@ class TotalLoss(nn.Module):
         self.normalizer = LossNormalizer(beta=0.99)
         self.use_loss_normalization = getattr(
             loss_weights, "use_loss_normalization", True)
+        self.forecast = CompositeForecastLoss(
+            huber_weight=getattr(loss_weights, "forecast_huber", 1.0),
+            corr_diff_weight=getattr(
+                loss_weights, "forecast_corr_diff", 1.0),
+            horizon_weights=getattr(
+                loss_weights, "forecast_horizon_weights", None),
+        )
+
+    def reset_loss_normalizer(self) -> None:
+        """Reset per-term scale calibration when a new phase begins."""
+        self.normalizer.reset()
 
     def _add_loss(
         self,
@@ -1442,8 +1596,10 @@ class TotalLoss(nn.Module):
             yield modality, getattr(
                 self.loss_weights, f"recon_{modality}", 0.0)
         extras = getattr(self.loss_weights, "recon_extra", None) or {}
+        dedicated = {"eeg", "fmri", "meg"}
         for modality, weight in extras.items():
-            yield modality, float(weight)
+            if modality not in dedicated:
+                yield modality, float(weight)
 
     def forward(
         self,
@@ -1483,16 +1639,32 @@ class TotalLoss(nn.Module):
                 continue
             pred_key = f"{modality}_recon"
             if pred_key not in predictions or modality not in targets:
-                # Unknown/unavailable modality (e.g. recon_meg before MEG
-                # batches exist) is skipped, never an error.
                 continue
+            target_value = targets[modality]
+            sequence_prediction = predictions.get(
+                f"{modality}_recon_sequence")
+            if (target_value.dim() == 4
+                    and sequence_prediction is not None):
+                forecast_weight = float(
+                    getattr(self.loss_weights, "forecast", 0.0))
+                if forecast_weight > 0:
+                    forecast_value = self.forecast(
+                        sequence_prediction, target_value,
+                        mask=targets.get(f"{modality}_mask"))
+                    total_loss = self._add_loss(
+                        total_loss, forecast_value, forecast_weight,
+                        f"forecast_{modality}", metrics)
+                    metrics[f"forecast_{modality}"] = forecast_value.item()
+                    continue
+            if target_value.dim() == 4:
+                target_value = target_value[:, -1]
+            mask = targets.get(f"{modality}_mask")
+            if mask is not None and mask.dim() == 4:
+                mask = mask[:, -1]
             criteria = (getattr(self.loss_weights, "recon_loss_types", None)
                         or {}).get(modality)
-            # Optional (B, C, T) validity mask: absent channels/invalid
-            # frames contribute nothing to the reconstruction term.
-            mask = targets.get(f"{modality}_mask")
             recon_value = self.recon_loss(
-                predictions[pred_key], targets[modality],
+                predictions[pred_key], target_value,
                 loss_type=criteria, mask=mask)
             total_loss = self._add_loss(
                 total_loss, recon_value, weight, f"recon_{modality}", metrics)
@@ -1516,21 +1688,27 @@ class TotalLoss(nn.Module):
             and "eeg_recon" in predictions
             and "eeg" in targets
         ):
+            nsp_target = targets["eeg"]
+            if nsp_target.dim() == 4:
+                nsp_target = nsp_target[:, -1]
             nsp_loss, nsp_metrics = self.nsp(
-                predictions["eeg_recon"], targets["eeg"])
+                predictions["eeg_recon"], nsp_target)
             total_loss = self._add_loss(
                 total_loss, nsp_loss, self.loss_weights.nsp, "nsp", metrics)
             metrics.update({f"nsp_{k}": v for k, v in nsp_metrics.items()})
 
-        if self.loss_weights.cross_modal > 0 and "hub_eeg" in predictions and "hub_fmri" in predictions:
+        if (self.loss_weights.cross_modal > 0
+                and "hub_eeg" in predictions and "hub_fmri" in predictions):
             cm_loss, cm_metrics = self.cross_modal(
                 predictions["hub_eeg"],
                 predictions["hub_fmri"],
                 targets.get("cross_modal_labels"),
             )
-            total_loss = self._add_loss(total_loss, cm_loss, self.loss_weights.cross_modal, "cross_modal", metrics)
-            metrics.update({f"cross_modal_{k}": v for k, v in cm_metrics.items()})
-
+            total_loss = self._add_loss(
+                total_loss, cm_loss, self.loss_weights.cross_modal,
+                "cross_modal", metrics)
+            metrics.update({
+                f"cross_modal_{k}": v for k, v in cm_metrics.items()})
         if getattr(self.loss_weights, "dissip", 0) > 0 and "delta_z" in predictions and "grad_S" in predictions:
             dissip_loss, dissip_metrics = self.dissip(
                 predictions["delta_z"],
@@ -1546,19 +1724,34 @@ class TotalLoss(nn.Module):
         # penalty could never fire.  It is reported by the monitor instead.
 
         if getattr(self.loss_weights, "spectrum", 0) > 0:
-            # The reference exponent comes from the target signal when one is
-            # available; the aperiodic exponent varies across subjects and
-            # states, so a hardcoded target would fight the data.
             if "eeg_recon" in predictions:
-                spec_eeg_loss, spec_eeg_metrics = self.spectrum(
-                    predictions["eeg_recon"], targets.get("eeg"))
-                total_loss = self._add_loss(total_loss, spec_eeg_loss, self.loss_weights.spectrum, "spectrum_eeg", metrics)
-                metrics.update({f"spectrum_eeg_{k}": v for k, v in spec_eeg_metrics.items()})
+                spectrum_target = targets.get("eeg")
+                if (isinstance(spectrum_target, torch.Tensor)
+                        and spectrum_target.dim() == 4):
+                    spectrum_target = spectrum_target[:, -1]
+                if spectrum_target is not None:
+                    spec_eeg_loss, spec_eeg_metrics = self.spectrum(
+                        predictions["eeg_recon"], spectrum_target)
+                    total_loss = self._add_loss(
+                        total_loss, spec_eeg_loss, self.loss_weights.spectrum,
+                        "spectrum_eeg", metrics)
+                    metrics.update({
+                        f"spectrum_eeg_{k}": v
+                        for k, v in spec_eeg_metrics.items()})
             if "meg_recon" in predictions:
-                spec_meg_loss, spec_meg_metrics = self.spectrum(
-                    predictions["meg_recon"], targets.get("meg"))
-                total_loss = self._add_loss(total_loss, spec_meg_loss, self.loss_weights.spectrum, "spectrum_meg", metrics)
-                metrics.update({f"spectrum_meg_{k}": v for k, v in spec_meg_metrics.items()})
+                spectrum_target = targets.get("meg")
+                if (isinstance(spectrum_target, torch.Tensor)
+                        and spectrum_target.dim() == 4):
+                    spectrum_target = spectrum_target[:, -1]
+                if spectrum_target is not None:
+                    spec_meg_loss, spec_meg_metrics = self.spectrum(
+                        predictions["meg_recon"], spectrum_target)
+                    total_loss = self._add_loss(
+                        total_loss, spec_meg_loss, self.loss_weights.spectrum,
+                        "spectrum_meg", metrics)
+                    metrics.update({
+                        f"spectrum_meg_{k}": v
+                        for k, v in spec_meg_metrics.items()})
         if getattr(self.loss_weights, "moe_load_balance", 0) > 0 and "moe_routing" in predictions:
             rm = predictions["moe_routing"]
             if "gate_weights" in rm and "selected_experts" in rm:
@@ -1577,21 +1770,69 @@ class TotalLoss(nn.Module):
                     for k, v in balance_metrics.items()
                 })
 
-        if getattr(self.loss_weights, "action", 0) > 0 and "efe" in predictions:
-            action_loss, action_metrics = self.action(predictions["efe"])
-            total_loss = self._add_loss(total_loss, action_loss, self.loss_weights.action, "action", metrics)
-            metrics.update({f"action_{k}": v for k, v in action_metrics.items()})
+        action_weight = getattr(self.loss_weights, "action", 0)
+        if action_weight > 0:
+            if "efe" not in predictions:
+                raise ValueError(
+                    "action loss requires an executed-action EFE prediction")
+            if "action_utility_target" not in targets:
+                raise ValueError(
+                    "action loss requires action_utility_target")
+            action_loss, action_metrics = self.action(
+                predictions["efe"], targets["action_utility_target"])
+            total_loss = self._add_loss(
+                total_loss, action_loss, action_weight, "action", metrics)
+            metrics.update({
+                f"action_{k}": v for k, v in action_metrics.items()})
 
-        if getattr(self.loss_weights, "replay", 0) > 0 and "z_imagined" in predictions and "z_engram" in predictions:
-            replay_loss, replay_metrics = self.replay(predictions["z_imagined"], predictions["z_engram"])
-            total_loss = self._add_loss(total_loss, replay_loss, self.loss_weights.replay, "replay", metrics)
-            metrics.update({f"replay_{k}": v for k, v in replay_metrics.items()})
+        replay_weight = getattr(self.loss_weights, "replay", 0)
+        if replay_weight > 0:
+            if "z_imagined" not in predictions:
+                raise ValueError(
+                    "replay loss requires an imagined latent prediction")
+            if "replay_target" not in targets:
+                raise ValueError("replay loss requires replay_target")
+            replay_loss, replay_metrics = self.replay(
+                predictions["z_imagined"], targets["replay_target"])
+            total_loss = self._add_loss(
+                total_loss, replay_loss, replay_weight, "replay", metrics)
+            metrics.update({
+                f"replay_{k}": v for k, v in replay_metrics.items()})
 
-        if getattr(self.loss_weights, "bandpower", 0) > 0 and "eeg_recon" in predictions and "eeg" in targets:
-            bp_loss, bp_metrics = self.bandpower(predictions["eeg_recon"], targets["eeg"])
-            total_loss = self._add_loss(total_loss, bp_loss, self.loss_weights.bandpower, "bandpower", metrics)
-            metrics.update({f"bandpower_{k}": v for k, v in bp_metrics.items()})
+        intervention_weight = getattr(
+            self.loss_weights, "intervention_response", 0)
+        if intervention_weight > 0:
+            if "intervention_effect" not in predictions:
+                raise ValueError(
+                    "intervention response loss requires "
+                    "intervention_effect prediction")
+            if "intervention_target" not in targets:
+                raise ValueError(
+                    "intervention response loss requires intervention_target")
+            response_loss, response_metrics = self.intervention_response(
+                predictions["intervention_effect"],
+                targets["intervention_target"],
+                targets.get("intervention_mask"))
+            total_loss = self._add_loss(
+                total_loss, response_loss, intervention_weight,
+                "intervention_response", metrics)
+            metrics.update({
+                f"intervention_{k}": v
+                for k, v in response_metrics.items()})
 
+        if (getattr(self.loss_weights, "bandpower", 0) > 0
+                and "eeg_recon" in predictions and "eeg" in targets):
+            bandpower_target = targets["eeg"]
+            if bandpower_target.dim() == 4:
+                bandpower_target = bandpower_target[:, -1]
+            bp_loss, bp_metrics = self.bandpower(
+                predictions["eeg_recon"], bandpower_target)
+
+            total_loss = self._add_loss(
+                total_loss, bp_loss, self.loss_weights.bandpower,
+                "bandpower", metrics)
+            metrics.update({
+                f"bandpower_{k}": v for k, v in bp_metrics.items()})
         if self.loss_weights.generic_constraint > 0:
             if "generic_constraint_residual" in predictions:
                 gen_loss = predictions["generic_constraint_residual"]
@@ -1645,6 +1886,9 @@ class TotalLoss(nn.Module):
             metrics.update({f"jacobi_{k}": v for k, v in jac_metrics.items()})
 
         if getattr(self.loss_weights, "cross", 0) > 0 and "hrf_align_loss" in predictions:
+            if "cross_modal_labels" not in targets:
+                raise ValueError(
+                    "cross-HRF loss requires cross_modal_labels")
             cross_loss = predictions["hrf_align_loss"]
             cross_w = getattr(self.loss_weights, "cross", 0)
             total_loss = self._add_loss(total_loss, cross_loss, cross_w, "cross_hrf", metrics)

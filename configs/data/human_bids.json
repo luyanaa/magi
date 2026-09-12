@@ -1,0 +1,30 @@
+{
+  "kind": "species",
+  "species": "human",
+  "root": "../../data_ladder/human_bids",
+  "modalities": [
+    "eeg",
+    "meg",
+    "fmri"
+  ],
+  "roles": {
+    "eeg": "signal",
+    "meg": "signal",
+    "fmri": "signal"
+  },
+  "batch_size": 1,
+  "seq_seconds": 10.0,
+  "num_workers": 0,
+  "split_by": "subject",
+  "val_frac": 0.1,
+  "test_frac": 0.1,
+  "align_channels": false,
+  "max_union_channels": 4096,
+  "return_masks": true,
+  "normalization": "global_zscore",
+  "return_next_step_targets": true,
+  "future_steps": 1,
+  "control_reduction": "resample",
+  "rollout_steps": 1,
+  "seed": 0
+}

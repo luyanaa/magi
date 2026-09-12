@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from brain_moe_pinn import BrainMoEPINNConfig
 from brain_moe_pinn.config import load_experiment_config
-from brain_moe_pinn.data import PairedBrainDataset
+from brain_moe_pinn.data import EEGDenoiseNetDataset, PairedBrainDataset
 from brain_moe_pinn.data.species_dataset import build_species_dataloaders
 from brain_moe_pinn.training.training_loop import BrainMoETrainer
 from brain_moe_pinn.training.training_loop import (
@@ -43,10 +43,15 @@ from brain_moe_pinn.training.training_loop import (
     _PRECISION_DTYPES,
 )
 from brain_moe_pinn.training.training_phases import (
-    NEGATIVE_ONE_PHASE,
-    STAGE_ONE_PHASE,
     STAGE_TWO_PHASE,
     STAGE_THREE_PHASE,
+    get_phase_neg_1,
+    get_stage_1_p1,
+    get_stage_1_p2,
+    get_stage_1_p3,
+    get_stage_1_p4,
+    get_stage_1_p5,
+    get_stage_1_p6,
 )
 
 # Slurm preemption signal handler
@@ -77,7 +82,10 @@ def _install_preemption_handler(trainer):
             pass
 
 
-def build_data_loaders(profile_path: Path, leave_subject_out=None):
+def build_data_loaders(profile_path: Path, leave_subject_out=None, *,
+                       default_batch_size=None, default_seq_seconds=None,
+                       profile_rate_hz=None, rate_hz_source="profile",
+                       species=None):
     """Construct train/val loaders from a --data JSON profile.
 
     ``leave_subject_out`` comes from the species/training profile and binds to
@@ -93,27 +101,86 @@ def build_data_loaders(profile_path: Path, leave_subject_out=None):
       {"kind": "species", "root": "<dir with <modality>/ arrays>",
        "modalities": ["calcium", "voltage"], "batch_size": 8,
        "seq_len": 256, "num_workers": 0}
+      {"kind": "eegdenoisenet", "root": "<EEGdenoiseNet checkout>",
+       "artifact": "EOG", "batch_size": 32, "num_workers": 0}
 
-    Returns (train_loader, val_loader); PairedBrainDataset batches are dicts
-    with eeg/fmri/(meg) keys, species batches map modality -> (B, C, T).
+    Species profiles stay authoritative for quantities they already declare:
+    ``batch_size`` and ``sequence_seconds`` are used when the data profile omits
+    them, and ``sample_rate_hz`` becomes the validated rate contract unless the
+    species profile sets ``sample_rate_hz_source="manifest"`` (per-recording
+    rates, e.g. per-worm C. elegans imaging).
+
+    Returns (train_loader, val_loader); paired batches are dicts with
+    eeg/fmri/(meg) keys, species batches map modality -> (B, C, T), and
+    EEGdenoiseNet batches provide clean/noisy EEG views for Magi pretraining.
     """
     with open(profile_path) as f:
         profile = json.load(f)
     kind = profile.get("kind")
-    if kind not in ("paired", "species"):
-        raise ValueError("--data profile needs \"kind\": \"paired\" or \"species\"")
+    if kind not in ("paired", "species", "eegdenoisenet"):
+        raise ValueError(
+            "--data profile needs \"kind\": \"paired\", \"species\", or "
+            "\"eegdenoisenet\"")
     root = Path(profile["root"])
     if not root.is_absolute():
         root = profile_path.parent / root
-    batch_size = int(profile.get("batch_size", 16))
+    batch_size = (int(profile["batch_size"])
+                  if profile.get("batch_size") is not None else None)
     num_workers = int(profile.get("num_workers", 4))
+    if kind == "eegdenoisenet":
+        snr_db_range = tuple(
+            profile.get("snr_db_range", (-7.0, 2.0)))
+        dataset_kwargs = dict(
+            root=str(root),
+            artifact=profile.get("artifact", "EOG"),
+            train_fraction=float(profile.get("train_fraction", 0.8)),
+            val_fraction=float(profile.get("val_fraction", 0.1)),
+            seed=int(profile.get("seed", 0)),
+            snr_db_range=snr_db_range,
+        )
+        train_set = EEGDenoiseNetDataset(split="train", **dataset_kwargs)
+        val_set = EEGDenoiseNetDataset(split="val", **dataset_kwargs)
+        common = dict(
+            batch_size=int(batch_size if batch_size is not None
+                           else (default_batch_size or 32)),
+            num_workers=num_workers,
+            pin_memory=True,
+            collate_fn=EEGDenoiseNetDataset.collate_fn,
+        )
+        return (
+            torch.utils.data.DataLoader(
+                train_set,
+                shuffle=True,
+                drop_last=bool(profile.get("drop_last", False)),
+                **common,
+            ),
+            torch.utils.data.DataLoader(
+                val_set,
+                shuffle=False,
+                drop_last=False,
+                **common,
+            ),
+        )
 
     if kind == "paired":
         paired_next = bool(profile.get(
             "return_next_step_targets",
             profile.get("paired_next_step_targets", False)))
+        future_steps = max(1, int(profile.get("future_steps", 1)))
+        if future_steps > 1 and not paired_next:
+            raise ValueError(
+                "future_steps > 1 requires return_next_step_targets=true "
+                "or paired_next_step_targets=true")
+        alignment_file = profile.get("alignment_file")
+        if alignment_file:
+            alignment_file = Path(alignment_file)
+            alignment_file = (
+                alignment_file if alignment_file.is_absolute()
+                else profile_path.parent / alignment_file)
         dataset = PairedBrainDataset(
-            data_dir=root, return_next_step_targets=paired_next)
+            data_dir=root, alignment_file=alignment_file,
+            return_next_step_targets=paired_next,
+            future_steps=future_steps)
         if len(dataset) < 2:
             raise ValueError(f"paired dataset at {root} has < 2 aligned samples")
 
@@ -155,8 +222,10 @@ def build_data_loaders(profile_path: Path, leave_subject_out=None):
         train_set = torch.utils.data.Subset(dataset, index_for(train_groups))
         val_set = torch.utils.data.Subset(dataset, index_for(val_groups))
         test_set = torch.utils.data.Subset(dataset, index_for(test_groups))
-        common = dict(batch_size=batch_size, num_workers=num_workers,
-                      pin_memory=True)
+        common = dict(
+            batch_size=int(batch_size if batch_size is not None
+                           else (default_batch_size or 16)),
+            num_workers=num_workers, pin_memory=True)
         loaders = (
             torch.utils.data.DataLoader(
                 train_set, shuffle=True, drop_last=True, **common),
@@ -167,11 +236,31 @@ def build_data_loaders(profile_path: Path, leave_subject_out=None):
             loaders += (torch.utils.data.DataLoader(
                 test_set, shuffle=False, drop_last=False, **common),)
         return loaders
+    seq_len = int(profile["seq_len"]) if profile.get("seq_len") else None
+    seq_seconds = (float(profile["seq_seconds"])
+                   if profile.get("seq_seconds") else None)
+    if seq_len is None and seq_seconds is None:
+        if default_seq_seconds is None:
+            raise ValueError(
+                "species data profile sets neither seq_len (frames) nor "
+                "seq_seconds, and the species profile declares no "
+                "sequence_seconds either")
+        seq_seconds = float(default_seq_seconds)
+    if batch_size is None:
+        batch_size = int(default_batch_size) if default_batch_size else 16
+    if rate_hz_source == "manifest":
+        expected_rate_hz = None
+    else:
+        expected_rate_hz = float(
+            profile.get("expected_rate_hz") or profile_rate_hz or 0.0) or None
+
     loader_kwargs = dict(
         modalities=profile.get("modalities", ("calcium", "voltage")),
         batch_size=batch_size,
-        seq_len=int(profile["seq_len"]) if profile.get("seq_len") else None,
-        seq_seconds=float(profile["seq_seconds"]) if profile.get("seq_seconds") else None,
+        seq_len=seq_len,
+        seq_seconds=seq_seconds,
+        species=species or profile.get("species"),
+        expected_rate_hz=expected_rate_hz,
         num_workers=num_workers,
         seed=int(profile.get("seed", 0)),
         val_frac=float(profile.get("val_frac", 0.1)),
@@ -180,23 +269,27 @@ def build_data_loaders(profile_path: Path, leave_subject_out=None):
             "subject" if leave_subject_out in (None, True) else "none"),
         align_channels=bool(profile.get("align_channels", False)),
         max_union_channels=int(profile.get("max_union_channels", 4096)),
-        return_masks=bool(profile.get("return_masks", True)),
         use_trials=bool(profile.get("use_trials", True)),
         rate_default=(float(profile["rate_default"])
                       if profile.get("rate_default") is not None else None),
         return_next_step_targets=bool(profile.get(
             "return_next_step_targets",
             profile.get("paired_next_step_targets", False))),
+        future_steps=max(1, int(profile.get("future_steps", 1))),
         roles=profile.get("roles"),
+        normalization=profile.get("normalization"),
     )
+    if loader_kwargs["future_steps"] > 1 and not loader_kwargs[
+            "return_next_step_targets"]:
+        raise ValueError(
+            "future_steps > 1 requires return_next_step_targets=true "
+            "or paired_next_step_targets=true")
     if profile.get("test_frac"):
         loader_kwargs["test_frac"] = float(profile["test_frac"])
     if profile.get("region_map"):
         region = Path(profile["region_map"])
         loader_kwargs["region_map"] = (
             region if region.is_absolute() else profile_path.parent / region)
-    if loader_kwargs["seq_len"] is None and loader_kwargs["seq_seconds"] is None:
-        loader_kwargs["seq_len"] = 256
     loaders = build_species_dataloaders(root, **loader_kwargs)
     if len(loaders) == 3:
         print(f"[Data] Test loader built ({len(loaders[2].dataset)} samples)")
@@ -204,20 +297,30 @@ def build_data_loaders(profile_path: Path, leave_subject_out=None):
 
 
 def parse_phases(phase_str: str):
-    """Parse phase string like '-1,1,2,3' into phase configs."""
-    phase_map = {
-        "-1": NEGATIVE_ONE_PHASE,
-        "1": STAGE_ONE_PHASE,
-        "2": STAGE_TWO_PHASE,
-        "3": STAGE_THREE_PHASE,
+    """Parse CLI selections into normalized runtime phase mappings.
+
+    ``1`` is intentionally a selector for the concrete Stage 1 P1-P6
+    schedule, never a synthetic flat phase with one averaged configuration.
+    """
+    selectors = {
+        "-1": (get_phase_neg_1,),
+        "1": (
+            get_stage_1_p1, get_stage_1_p2, get_stage_1_p3,
+            get_stage_1_p4, get_stage_1_p5, get_stage_1_p6,
+        ),
+        "2": (lambda: STAGE_TWO_PHASE,),
+        "3": (lambda: STAGE_THREE_PHASE,),
     }
     phases = []
-    for p in phase_str.split(","):
-        p = p.strip()
-        if p in phase_map:
-            phases.append(phase_map[p])
-        else:
-            raise ValueError(f"Unknown phase: {p}. Available: {list(phase_map.keys())}")
+    tokens = [token.strip() for token in phase_str.split(",")]
+    if not tokens or any(not token for token in tokens):
+        raise ValueError("phase selection must contain non-empty selectors")
+    for token in tokens:
+        factories = selectors.get(token)
+        if factories is None:
+            raise ValueError(
+                f"Unknown phase: {token}. Available: {list(selectors)}")
+        phases.extend(factory().to_runtime_config() for factory in factories)
     return phases
 
 
@@ -231,9 +334,8 @@ def main():
                              "config's own dtype. 'bf16' avoids fp16's 65504 "
                              "ceiling and is required on TPU/XLA, which has no "
                              "fp16 compute path")
-    parser.add_argument("--epochs", type=int, default=100, help="Max epochs (per phase)")
-    parser.add_argument("--phase", type=str, default="-1,1,2,3",
-                        help="Training phases to run, e.g. '-1,1,2,3'")
+    parser.add_argument("--phase", type=str, default="1,2,3",
+                        help="Training phases to run, e.g. '-1,1,2,3'; Phase -1 runs Magi v2 EEG pretraining and requires --eeg_backend v2")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from checkpoint path")
     parser.add_argument("--log_dir", type=str, default="./logs",
@@ -245,7 +347,8 @@ def main():
     parser.add_argument("--config", type=str, default=None,
                         help="Unified JSON experiment profile")
     parser.add_argument("--data", type=str, default=None,
-                        help="JSON dataset profile: {\"kind\": \"paired\"|\"species\", ...}")
+                        help="JSON dataset profile: {\"kind\": "
+                             "\"paired\"|\"species\"|\"eegdenoisenet\", ...}")
     parser.add_argument("--eeg_channels", type=int, default=19)
     parser.add_argument("--fmri_regions", type=int, default=400)
     parser.add_argument("--latent_dim", type=int, default=1024)
@@ -353,6 +456,12 @@ def main():
             use_species_conditioning=args.use_species_conditioning,
             noise_mode=args.noise_mode,
         )
+    magi_pretraining_selected = any(
+        phase.get("task") == "magi_eeg_pretraining" for phase in phases)
+    if magi_pretraining_selected and getattr(config, "eeg_backend", "v1") != "v2":
+        raise ValueError(
+            "Phase -1 requires the v2 EEG backend; pass --eeg_backend v2 "
+            "or --use_magi_v2")
     model = config.to_model()
 
     if args.eeg_checkpoint or args.fmri_checkpoint:
@@ -364,6 +473,7 @@ def main():
     # Initialize trainer
     trainer_config = vars(args).copy()
     trainer_config["model_config"] = dict(config.__dict__)
+    trainer_config["magi_pretraining_enabled"] = magi_pretraining_selected
     if args.config:
         experiment = load_experiment_config(str(config_path))
         trainer_config["experiment_data"] = {
@@ -373,6 +483,7 @@ def main():
             "paired_next_step_targets": (
                 experiment.data.paired_next_step_targets),
             "roles": dict(experiment.data.roles),
+            "control_specs": dict(experiment.data.control_specs),
         }
     train_loader = None
     val_loader = None
@@ -383,7 +494,16 @@ def main():
             data_path = Path(__file__).parent / data_path
         loaders = build_data_loaders(
             data_path,
-            experiment.training.leave_subject_out if args.config else None)
+            experiment.training.leave_subject_out if args.config else None,
+            default_batch_size=(experiment.training.batch_size
+                                if args.config else None),
+            default_seq_seconds=(experiment.data.sequence_seconds
+                                 if args.config else None),
+            profile_rate_hz=(experiment.data.sample_rate_hz
+                             if args.config else None),
+            rate_hz_source=(experiment.data.sample_rate_hz_source
+                            if args.config else "profile"),
+            species=(experiment.species if args.config else None))
         train_loader, val_loader = loaders[:2]
         if len(loaders) == 3:
             test_loader = loaders[2]
@@ -401,12 +521,19 @@ def main():
             trainer_config["require_next_step_targets"] = True
             trainer_config.setdefault("experiment_data", {})[
                 "paired_next_step_targets"] = True
+        if data_profile.get("future_steps") is not None:
+            future_steps = max(1, int(data_profile["future_steps"]))
+            trainer_config["future_steps"] = future_steps
+            trainer_config.setdefault("experiment_data", {})[
+                "future_steps"] = future_steps
         if data_profile.get("control_modalities"):
             trainer_config["control_modalities"] = tuple(
                 data_profile["control_modalities"])
         if data_profile.get("control_reduction"):
             trainer_config["control_reduction"] = str(
                 data_profile["control_reduction"])
+        if data_profile.get("rollout_steps"):
+            trainer_config["rollout_steps"] = int(data_profile["rollout_steps"])
         summary = (f"{len(train_loader.dataset)} train / "
                    f"{len(val_loader.dataset)} val")
         if test_loader is not None:

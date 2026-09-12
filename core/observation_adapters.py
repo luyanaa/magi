@@ -9,7 +9,7 @@ reconstruction of ANY neural signal (calcium, voltage, widefield, ...).
 import torch
 import torch.nn.functional as F
 from torch import nn
-from typing import Optional
+from typing import Optional, Tuple
 
 
 class GenericSignalAdapter(nn.Module):
@@ -33,7 +33,8 @@ class GenericSignalAdapter(nn.Module):
             nn.GroupNorm(1, latent_dim),
         )
 
-    def forward(self, signal: torch.Tensor) -> torch.Tensor:
+    def forward(self, signal: torch.Tensor,
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         if signal.dim() != 3:
             raise ValueError("signal must have shape (B, channels, time)")
         if signal.shape[1] < 1 or signal.shape[2] < self.kernel_size:
@@ -46,11 +47,38 @@ class GenericSignalAdapter(nn.Module):
         # reaching a half-precision conv raises "Input type (float) and bias
         # type (c10::Half) should be the same".
         compute = signal.float() if signal.dtype != torch.float32 else signal
+        mean, std, rms = _masked_channel_statistics(compute, mask)
+        summary = torch.cat((mean, std, rms), dim=1).to(signal.dtype)
+        return self.temporal(summary).transpose(1, 2)
+
+
+def _masked_channel_statistics(
+    compute: torch.Tensor, mask: Optional[torch.Tensor]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-channel mean/std/rms over *valid* frames only.
+
+    Padded or invalid frames are zero-filled upstream, so an unmasked mean
+    would dilute every summary statistic by the invalid fraction (a batch of
+    union-aligned worm samples is ~30-60% valid). ``mask`` is a ``(B, C, T)``
+    boolean validity tensor; ``None`` keeps the unmasked behaviour.
+    """
+    if mask is None:
         mean = compute.mean(dim=1, keepdim=True)
         std = compute.std(dim=1, keepdim=True, unbiased=False)
         rms = compute.square().mean(dim=1, keepdim=True).sqrt()
-        summary = torch.cat((mean, std, rms), dim=1).to(signal.dtype)
-        return self.temporal(summary).transpose(1, 2)
+        return mean, std, rms
+    if mask.shape != compute.shape:
+        raise ValueError(
+            f"mask shape {tuple(mask.shape)} must match signal shape "
+            f"{tuple(compute.shape)}")
+    valid = mask.to(device=compute.device, dtype=compute.dtype)
+    count = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+    mean = (compute * valid).sum(dim=1, keepdim=True) / count
+    centred = (compute - mean) * valid
+    var = centred.square().sum(dim=1, keepdim=True) / count
+    std = var.clamp_min(0.0).sqrt()
+    rms = ((compute.square() * valid).sum(dim=1, keepdim=True) / count).sqrt()
+    return mean, std, rms
 
 
 class ChannelSignalAdapter(nn.Module):
@@ -96,11 +124,24 @@ class ChannelSignalAdapter(nn.Module):
         T_prime = tokens.shape[-1]
         return tokens.reshape(B, C, T_prime, self.latent_dim)
 
-    def forward(self, signal: torch.Tensor) -> torch.Tensor:
+    def forward(self, signal: torch.Tensor,
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Summary tokens (B, T', d), pooled over channels — same layout as
-        ``GenericSignalAdapter`` for the latent path."""
+        ``GenericSignalAdapter`` for the latent path.
+
+        With a validity mask the pool is weighted by each channel's valid
+        fraction, so union-aligned padding channels (all-zero) do not dilute
+        the token that drives the shared dynamics.
+        """
         channel_tokens = self.forward_channels(signal)  # (B, C, T', d)
-        return channel_tokens.mean(dim=1)
+        if mask is None:
+            return channel_tokens.mean(dim=1)
+        if mask.dim() != 3 or mask.shape[:2] != signal.shape[:2]:
+            raise ValueError(
+                "mask must be (B, C, T) matching the signal's channel axis")
+        weight = mask.to(dtype=channel_tokens.dtype).mean(dim=-1, keepdim=True)
+        denominator = weight.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        return (channel_tokens * weight.unsqueeze(-1)).sum(dim=1) / denominator
 
 
 def _linear_resample(x: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -161,16 +202,24 @@ class SignalReconstructionHead(nn.Module):
     removed the waveform must be synthesised from the latent, so reconstruction
     gradients carry real information about the dynamics.
 
-    Layout: channel-count independent, channel-preserving.  A learned temporal
-    basis supplies the time axis, a per-channel embedding supplies identity,
-    and the latent supplies the coefficients (through a FiLM modulation whose
-    gain acts as the per-sample coefficient vector), so the generated waveform
-    shape varies per sample and channel.  Frames are interpolated to the raw
-    sampling grid.
+    Layout: channel-count independent, channel-preserving, and **mode
+    factored**::
 
-    The readout is evaluated in factorised form: because every term is linear in
-    the ``latent_dim`` feature axis, the (B, C, T', d) activation tensor is
-    never materialised and the cost stays O((C + T') * d).
+        signal[b, c, t] = sum_k gain[b, k] * channel_embedding[c, k] * time_basis[t, k]
+                          + channel_bias[c] + time_bias[t] + output_bias
+
+    ``gain`` is produced by a FiLM head from the evolved latent, so the
+    waveform is synthesised from the latent alone, while the ``(channel, mode)``
+    embedding gives every channel its own temporal shape ("channel identity
+    x latent coefficients x shared temporal modes").  This is what makes
+    per-channel reconstruction supervision meaningful: an additive-only
+    channel term would force every channel onto one shared waveform up to a
+    constant, which no per-channel correlation objective can resolve.
+
+    Frames are interpolated to the raw sampling grid.  Cost is
+    O(B * K * (C + T')) for the factorised evaluation, with K modes
+    (``num_modes``, default ``num_time_basis``), and no (B, C, T', d) tensor is
+    materialised.
     """
 
     def __init__(
@@ -179,6 +228,7 @@ class SignalReconstructionHead(nn.Module):
         max_channels: int = 2048,
         num_time_basis: int = 64,
         hidden_dim: int = 128,
+        num_modes: Optional[int] = None,
     ):
         super().__init__()
         if latent_dim <= 0:
@@ -187,19 +237,29 @@ class SignalReconstructionHead(nn.Module):
             raise ValueError("max_channels must be positive")
         if num_time_basis <= 0:
             raise ValueError("num_time_basis must be positive")
+        if num_modes is not None and num_modes <= 0:
+            raise ValueError("num_modes must be positive")
         self.latent_dim = latent_dim
         self.max_channels = max_channels
         self.num_time_basis = num_time_basis
+        self.num_modes = int(num_modes or num_time_basis)
+        # Mode-factorised init: with K modes, var(channel * basis * gain) is
+        # K * s_E^2 * s_B^2 * var(gain); K^-1/4 on each factor keeps the
+        # initial waveform O(1) for a unit-variance latent (a vanishing start
+        # would leave the head scaling up for most of training).
+        mode_scale = float(self.num_modes) ** -0.25
         self.channel_embedding = nn.Parameter(
-            torch.randn(max_channels, latent_dim) * 0.02)
+            torch.randn(max_channels, self.num_modes) * mode_scale)
         self.temporal_basis = nn.Parameter(
-            torch.randn(num_time_basis, latent_dim) * 0.02)
+            torch.randn(num_time_basis, self.num_modes) * mode_scale)
         self.modulation = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 2 * latent_dim),
+            nn.Linear(hidden_dim, self.num_modes),
         )
-        self.readout = nn.Linear(latent_dim, 1)
+        self.channel_bias = nn.Parameter(torch.zeros(max_channels))
+        self.time_bias = nn.Parameter(torch.zeros(num_time_basis))
+        self.output_bias = nn.Parameter(torch.zeros(()))
 
     def forward(
         self,
@@ -227,23 +287,12 @@ class SignalReconstructionHead(nn.Module):
         if target_time_len < 1:
             raise ValueError("target_time_len must be positive")
 
-        gain, shift = self.modulation(latent).chunk(2, dim=-1)   # (B, d)
-        weight = self.readout.weight.reshape(-1)                 # (d,)
-
-        time_coef = weight.unsqueeze(0) * self.temporal_basis     # (T', d)
-        chan_coef = (weight.unsqueeze(0)
-                     * self.channel_embedding[:num_channels])     # (C, d)
-
-        time_mod = time_coef @ gain.transpose(0, 1)               # (T', B)
-        chan_mod = chan_coef @ gain.transpose(0, 1)               # (C, B)
-
-        frames = (
-            time_coef.sum(dim=-1).reshape(1, 1, -1)               # (1, 1, T')
-            + chan_coef.sum(dim=-1).reshape(1, -1, 1)             # (1, C, 1)
-            + time_mod.transpose(0, 1).unsqueeze(1)               # (B, 1, T')
-            + chan_mod.transpose(0, 1).unsqueeze(-1)              # (B, C, 1)
-            + (shift @ weight + self.readout.bias.reshape(())).reshape(-1, 1, 1)
-        )
+        gain = self.modulation(latent)                          # (B, K)
+        channels = self.channel_embedding[:num_channels]         # (C, K)
+        basis = self.temporal_basis                              # (T', K)
+        frames = torch.einsum("bk,ck,tk->bct", gain, channels, basis)
+        frames = frames + self.channel_bias[:num_channels].view(1, -1, 1)
+        frames = frames + self.time_bias.view(1, 1, -1) + self.output_bias
         if target_time_len == self.num_time_basis:
             return frames
         return _resample_time(frames, target_time_len)

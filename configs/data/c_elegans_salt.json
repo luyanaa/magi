@@ -1,0 +1,26 @@
+{
+  "kind": "species",
+  "root": "../../data_ladder/c_elegans_salt",
+  "modalities": [
+    "calcium",
+    "stimulus"
+  ],
+  "roles": {
+    "calcium": "signal",
+    "stimulus": "control"
+  },
+  "batch_size": 4,
+  "seq_seconds": 60.0,
+  "num_workers": 0,
+  "split_by": "subject",
+  "val_frac": 0.1,
+  "align_channels": true,
+  "max_union_channels": 1024,
+  "return_masks": true,
+  "return_next_step_targets": true,
+  "future_steps": 2,
+  "seed": 0,
+  "control_reduction": "resample",
+  "control_note": "The control track is reduced into two half-cycle means for the two-step rollout; future_steps=2 supplies two complete calcium forecast windows.",
+  "rollout_steps": 2
+}

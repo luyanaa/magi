@@ -3,6 +3,7 @@ Data loading pipeline for Brain MoE-PINN.
 
 Supports:
 - EEG datasets with arbitrary channel configurations (BIOT 3D positions)
+- EEGdenoiseNet clean/artifact epochs for Magi EEG pretraining
 - fMRI ROI time series (400 brain regions)
 - Paired EEG-fMRI data for cross-modal training
 - Standard 10-20 and 10-5 electrode systems
@@ -15,6 +16,265 @@ from torch.utils.data import Dataset, DataLoader
 from typing import Optional, List, Dict, Tuple, Callable
 from pathlib import Path
 import json
+
+
+class EEGDenoiseNetDataset(Dataset):
+    """Load EEGdenoiseNet epochs for Magi EEG pretraining.
+
+    EEGdenoiseNet publishes clean EEG plus separate EOG/EMG artifact
+    epochs.  This adapter keeps the source split deterministic and creates
+    one noisy view with the repository's RMS/SNR convention.  The primary
+    ``eeg`` view is clean EEG; ``eeg_view2`` is the matched noisy view.
+
+    The source files are expected under ``root`` or ``root/data`` and may
+    be NumPy ``.npy`` or MATLAB ``.mat`` files.  The public repository can
+    contain annex pointer files instead of materialized arrays; those are
+    rejected with an actionable error instead of being passed to NumPy.
+
+    Args:
+        root: EEGdenoiseNet checkout or extracted dataset directory.
+        split: One of ``"train"``, ``"val"``, or ``"test"``.
+        artifact: ``"EOG"`` or ``"EMG"``.
+        train_fraction: Fraction of clean epochs assigned to train.
+        val_fraction: Fraction assigned to validation after train.
+        seed: Seed for deterministic source pairing and SNR sampling.
+        snr_db_range: Inclusive uniform SNR range for train/validation.
+    """
+
+    _ARTIFACT_FILES = {
+        "EEG": ("EEG_all_epochs", "EEG_all_epochs_512hz"),
+        "EOG": ("EOG_all_epochs",),
+        "EMG": ("EMG_all_epochs", "EMG_all_epochs_512hz"),
+    }
+
+    def __init__(
+        self,
+        root: str,
+        split: str = "train",
+        artifact: str = "EOG",
+        train_fraction: float = 0.8,
+        val_fraction: float = 0.1,
+        seed: int = 0,
+        snr_db_range: Tuple[float, float] = (-7.0, 2.0),
+    ):
+        super().__init__()
+        self.root = Path(root).expanduser()
+        self.split = str(split).lower()
+        if self.split not in {"train", "val", "test"}:
+            raise ValueError("split must be 'train', 'val', or 'test'")
+        self.artifact = str(artifact).upper()
+        if self.artifact not in {"EOG", "EMG"}:
+            raise ValueError("artifact must be 'EOG' or 'EMG'")
+        if not 0.0 < float(train_fraction) < 1.0:
+            raise ValueError("train_fraction must lie in (0, 1)")
+        if not 0.0 <= float(val_fraction) < 1.0:
+            raise ValueError("val_fraction must lie in [0, 1)")
+        if float(train_fraction) + float(val_fraction) >= 1.0:
+            raise ValueError("train_fraction + val_fraction must be < 1")
+        low, high = (float(value) for value in snr_db_range)
+        if low > high:
+            raise ValueError("snr_db_range must be ordered low to high")
+        self.train_fraction = float(train_fraction)
+        self.val_fraction = float(val_fraction)
+        self.seed = int(seed)
+        self.snr_db_range = (low, high)
+
+        clean = self._load_source("EEG")
+        artifact = self._load_source(self.artifact)
+        target_length = int(artifact.shape[-1])
+        if clean.shape[-1] != target_length:
+            clean = self._resample_epochs(clean, target_length)
+        if self.artifact == "EMG":
+            count = max(int(clean.shape[0]), int(artifact.shape[0]))
+        else:
+            count = min(int(clean.shape[0]), int(artifact.shape[0]))
+        if count < 3:
+            raise ValueError(
+                "EEGdenoiseNet requires at least three clean/artifact epochs "
+                "after pairing")
+        clean_indices = np.arange(count, dtype=np.int64) % clean.shape[0]
+        self.clean = np.ascontiguousarray(
+            clean[clean_indices], dtype=np.float32)
+        self.artifact_epochs = np.ascontiguousarray(
+            artifact, dtype=np.float32)
+        self.sample_rate = 512 if self.artifact == "EMG" else 256
+        indices = np.arange(count, dtype=np.int64)
+        rng = np.random.default_rng(self.seed)
+        rng.shuffle(indices)
+        train_end = min(
+            count - 2, max(1, int(round(count * self.train_fraction))))
+        val_end = min(
+            count - 1,
+            max(train_end + 1,
+                train_end + int(round(count * self.val_fraction))),
+        )
+        if self.split == "train":
+            self.indices = indices[:train_end]
+        elif self.split == "val":
+            self.indices = indices[train_end:val_end]
+        else:
+            self.indices = indices[val_end:]
+        if len(self.indices) == 0:
+            raise ValueError(
+                f"EEGdenoiseNet {self.split} split is empty; adjust split "
+                "fractions")
+
+    @staticmethod
+    def _resample_epochs(epochs: np.ndarray, target_length: int) -> np.ndarray:
+        """Linearly resample ``(N, T)`` epochs without a SciPy dependency."""
+        source_length = int(epochs.shape[-1])
+        source_grid = np.linspace(0.0, 1.0, source_length)
+        target_grid = np.linspace(0.0, 1.0, int(target_length))
+        return np.stack(
+            [np.interp(target_grid, source_grid, epoch) for epoch in epochs],
+            axis=0,
+        ).astype(np.float32, copy=False)
+
+    @staticmethod
+    def _load_matrix(path: Path) -> np.ndarray:
+        if path.stat().st_size < 1024:
+            try:
+                prefix = path.read_bytes()[:128]
+            except OSError:
+                prefix = b""
+            if prefix.startswith(b"/annex/") or prefix.startswith(b"annex/"):
+                raise RuntimeError(
+                    f"EEGdenoiseNet file {path} is an annex pointer, not "
+                    "materialized data; fetch the dataset object first")
+        if path.suffix.lower() == ".npy":
+            matrix = np.load(path, allow_pickle=False)
+        elif path.suffix.lower() == ".mat":
+            try:
+                from scipy.io import loadmat
+            except ImportError as exc:
+                raise RuntimeError(
+                    "scipy is required to load EEGdenoiseNet .mat files; "
+                    "use the published .npy files instead") from exc
+            values = loadmat(path)
+            candidates = [
+                np.asarray(value)
+                for key, value in values.items()
+                if not key.startswith("__")
+                and np.asarray(value).ndim >= 2
+            ]
+            if not candidates:
+                raise ValueError(f"no matrix variable found in {path}")
+            matrix = max(candidates, key=lambda value: value.size)
+        else:
+            raise ValueError(f"unsupported EEGdenoiseNet file type: {path}")
+        matrix = np.asarray(matrix, dtype=np.float32).squeeze()
+        if matrix.ndim == 1:
+            matrix = matrix[None, :]
+        if matrix.ndim != 2:
+            raise ValueError(
+                f"EEGdenoiseNet expects (epochs, samples), got "
+                f"{matrix.shape} from {path}")
+        if not np.isfinite(matrix).all():
+            raise ValueError(f"EEGdenoiseNet contains non-finite values: {path}")
+        return matrix
+
+    def _load_source(self, source: str) -> np.ndarray:
+        names = self._ARTIFACT_FILES[source]
+        if self.artifact == "EMG" and source in {"EEG", "EMG"}:
+            names = tuple(reversed(names))
+        candidates = []
+        for name in names:
+            for directory in (self.root, self.root / "data"):
+                candidates.extend(
+                    [directory / f"{name}.npy", directory / f"{name}.mat"])
+        pointer_paths = []
+        for path in candidates:
+            if not path.is_file():
+                continue
+            try:
+                return self._load_matrix(path)
+            except RuntimeError as exc:
+                if "annex pointer" in str(exc):
+                    pointer_paths.append(path)
+                    continue
+                raise
+        if pointer_paths:
+            listed = ", ".join(str(path) for path in pointer_paths)
+            raise RuntimeError(
+                "EEGdenoiseNet arrays are present only as annex pointers: "
+                f"{listed}. Materialize the dataset files before training.")
+        expected = ", ".join(
+            f"{name}.npy/.mat" for name in names)
+        raise FileNotFoundError(
+            f"cannot find EEGdenoiseNet {source} epochs below {self.root}; "
+            f"expected {expected}")
+
+    def _snr_db(self, item_index: int) -> float:
+        if self.split == "test":
+            levels = np.linspace(
+                self.snr_db_range[0], self.snr_db_range[1], num=10)
+            return float(levels[item_index % len(levels)])
+        rng = np.random.default_rng(
+            self.seed + 104729 * (int(self.indices[item_index]) + 1))
+        return float(rng.uniform(*self.snr_db_range))
+
+    def __len__(self) -> int:
+        return int(len(self.indices))
+
+    def __getitem__(self, item_index: int) -> Dict[str, object]:
+        source_index = int(self.indices[item_index])
+        clean = self.clean[source_index]
+        noise_index = (source_index * 1009 + self.seed) % len(
+            self.artifact_epochs)
+        noise = self.artifact_epochs[noise_index]
+        snr_db = self._snr_db(item_index)
+
+        clean_rms = float(np.sqrt(np.mean(np.square(clean))))
+        noise_rms = float(np.sqrt(np.mean(np.square(noise))))
+        if clean_rms <= 1e-8 or noise_rms <= 1e-8:
+            raise ValueError(
+                "EEGdenoiseNet epoch has near-zero RMS; cannot synthesize "
+                "a stable noisy view")
+        # Match the benchmark code's dB-to-amplitude convention.
+        scale = clean_rms / (noise_rms * (10.0 ** (0.1 * snr_db)))
+        noisy = clean + scale * noise
+        noisy_std = float(np.std(noisy))
+        if noisy_std <= 1e-8:
+            raise ValueError(
+                "EEGdenoiseNet synthesized epoch has near-zero standard "
+                "deviation")
+        clean = clean / noisy_std
+        noisy = noisy / noisy_std
+        clean_tensor = torch.from_numpy(
+            np.ascontiguousarray(clean[None, :], dtype=np.float32))
+        noisy_tensor = torch.from_numpy(
+            np.ascontiguousarray(noisy[None, :], dtype=np.float32))
+        return {
+            "eeg": clean_tensor,
+            "eeg_view1": clean_tensor.clone(),
+            "eeg_view2": noisy_tensor,
+            "eeg_noisy": noisy_tensor,
+            "eeg_target": clean_tensor.clone(),
+            "channel_names": ["EEGdenoiseNet"],
+            "channel_types": torch.zeros(1, dtype=torch.long),
+            "sample_rate_hz": self.sample_rate,
+            "snr_db": torch.tensor(snr_db, dtype=torch.float32),
+            "artifact_type": self.artifact,
+            "sample_id": f"{self.split}-{source_index}",
+        }
+
+    @staticmethod
+    def collate_fn(samples: List[Dict[str, object]]) -> Dict[str, object]:
+        """Collate tensors while preserving per-sample channel metadata."""
+        if not samples:
+            raise ValueError("cannot collate an empty EEGdenoiseNet batch")
+        result: Dict[str, object] = {}
+        for key in samples[0]:
+            values = [sample[key] for sample in samples]
+            if key == "channel_names":
+                result[key] = values
+            elif key == "artifact_type" or key == "sample_id":
+                result[key] = values
+            elif isinstance(values[0], torch.Tensor):
+                result[key] = torch.stack(values)
+            else:
+                result[key] = torch.as_tensor(values)
+        return result
 
 
 class EEGDataset(Dataset):
@@ -357,12 +617,15 @@ class PairedBrainDataset(Dataset):
         fmri_dataset: Optional[fMRIDataset] = None,
         alignment_file: Optional[str] = None,
         return_next_step_targets: bool = False,
+        future_steps: int = 1,
     ):
         self.data_dir = Path(data_dir)
         self.eeg_dataset = eeg_dataset
         self.fmri_dataset = fmri_dataset
         self.return_next_step_targets = bool(return_next_step_targets)
-
+        self.future_steps = int(future_steps)
+        if self.future_steps < 1:
+            raise ValueError("future_steps must be positive")
         self.pair_list = []
         self.metadata = {}
 
@@ -467,24 +730,91 @@ class PairedBrainDataset(Dataset):
                 out[modality] = data
                 continue
 
-            next_path = entry.get(f"{modality}_next")
-            if next_path:
-                next_data = self._load_pair_array(next_path, self.data_dir)
-            else:
-                if data.ndim == 0 or data.shape[-1] < 2:
-                    raise ValueError(
-                        f"sample {entry.get('sample_id', idx)!r}, modality "
-                        f"{modality!r} has no future target")
-                if data.shape[-1] % 2:
-                    raise ValueError(
-                        f"sample {entry.get('sample_id', idx)!r}, modality "
-                        f"{modality!r} needs an even-length context+future "
-                        "array or an explicit *_next path")
-                context_len = data.shape[-1] // 2
-                next_data = data[..., context_len:]
-                data = data[..., :context_len]
+            futures = []
+            explicit = True
+            for horizon in range(1, self.future_steps + 1):
+                future_path = entry.get(f"{modality}_next_{horizon}")
+                if horizon == 1 and not future_path:
+                    future_path = entry.get(f"{modality}_next")
+                if not future_path:
+                    explicit = False
+                    break
+                futures.append(self._load_pair_array(
+                    future_path, self.data_dir))
+
+            if not explicit:
+                packed_path = entry.get(f"{modality}_future")
+                if packed_path:
+                    packed = self._load_pair_array(
+                        packed_path, self.data_dir)
+                    if (packed.ndim == data.ndim + 1
+                            and packed.shape[0] == self.future_steps):
+                        futures = [packed[h] for h in range(self.future_steps)]
+                    elif packed.shape[-1] % self.future_steps == 0:
+                        future_len = packed.shape[-1] // self.future_steps
+                        futures = [
+                            packed[..., h * future_len:(h + 1) * future_len]
+                            for h in range(self.future_steps)]
+                    else:
+                        raise ValueError(
+                            f"sample {entry.get('sample_id', idx)!r}, modality "
+                            f"{modality!r} future array has no {self.future_steps}"
+                            " equal horizons")
+                else:
+                    segments = self.future_steps + 1
+                    if data.ndim == 0 or data.shape[-1] % segments:
+                        length_requirement = (
+                            "even-length" if segments == 2
+                            else f"length divisible by {segments}")
+                        raise ValueError(
+                            f"sample {entry.get('sample_id', idx)!r}, modality "
+                            f"{modality!r} needs a {length_requirement} signal "
+                            f"split into {segments} equal context/future "
+                            "segments or explicit future paths")
+                    context_len = data.shape[-1] // segments
+                    futures = [
+                        data[..., (h + 1) * context_len:
+                             (h + 2) * context_len]
+                        for h in range(self.future_steps)]
+                    data = data[..., :context_len]
+
+            if any(future.shape != data.shape for future in futures):
+                raise ValueError(
+                    f"sample {entry.get('sample_id', idx)!r}, modality "
+                    f"{modality!r} context and future shapes must match")
             out[modality] = data
-            out[f"{modality}_next"] = next_data
+            if self.future_steps == 1:
+                out[f"{modality}_next"] = futures[0]
+            else:
+                out[f"{modality}_future"] = torch.stack(futures, dim=0)
+                for horizon, future in enumerate(futures, start=1):
+                    out[f"{modality}_next_{horizon}"] = future
+        for key in (
+                "intervention_target",
+                "intervention_baseline",
+                "intervention_mask",
+                "action_utility_target",
+                "replay_target"):
+            value = entry.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (str, Path)):
+                value = self._load_pair_array(value, self.data_dir)
+            else:
+                value = torch.as_tensor(value).float()
+            out[key] = value
+        label = entry.get(
+            "cross_modal_label", entry.get("cross_modal_labels", 1.0))
+        try:
+            label = float(label)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"pair {entry.get('sample_id', idx)!r} has an invalid "
+                "cross_modal_label") from exc
+        if label not in (0.0, 1.0):
+            raise ValueError(
+                "cross_modal_label must be 0 (async) or 1 (synchronized)")
+        out["cross_modal_labels"] = torch.tensor(label, dtype=torch.float32)
         out["is_paired"] = True
         if entry.get("sample_id"):
             out["sample_id"] = entry["sample_id"]

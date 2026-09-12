@@ -27,8 +27,9 @@ supported by indexing the union of stems.
 
 import csv
 import json
+import warnings
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -37,6 +38,15 @@ from torch.utils.data import DataLoader, Dataset
 _FORMATS = (".npy", ".npz", ".pth")
 _STR_KEYS = ("sample_id", "subject", "session", "origin", "condition")
 _META_KEYS = _STR_KEYS + ("dt",)
+# Companion directories of the canonical layout. Modality-scoped companions
+# are prefixed; the static graph is a single shared directory (``graphs/``),
+# not ``graph_graphs/``.
+_COMPANION_DIRS = {
+    "ids": "{modality}_ids",
+    "mask": "{modality}_mask",
+    "trials": "{modality}_trials",
+    "graphs": "graphs",
+}
 
 
 def _load_array(fpath: Path) -> torch.Tensor:
@@ -148,10 +158,18 @@ class SpeciesSignalDataset(Dataset):
         return_masks: bool = True,
         use_trials: bool = True,
         rate_default: Optional[float] = None,
-        rng_seed: int = 0,
         random_windows: bool = True,
         return_next_step_targets: bool = False,
+        future_steps: int = 1,
         roles: Optional[Dict[str, str]] = None,
+        species: Optional[str] = None,
+        rate_tolerance: float = 1e-3,
+        strict_rate: bool = True,
+        normalization: Optional[str] = None,
+        normalization_stats: Optional[
+            Mapping[str, Mapping[str, float]]] = None,
+        rng_seed: int = 0,
+        expected_rate_hz: Optional[float] = None,
     ):
         if not modalities:
             raise ValueError("at least one modality is required")
@@ -177,6 +195,9 @@ class SpeciesSignalDataset(Dataset):
         self.random_windows = bool(random_windows)
         self.return_next_step_targets = bool(return_next_step_targets)
         self.rng = torch.Generator().manual_seed(int(rng_seed))
+        self.future_steps = int(future_steps)
+        if self.future_steps < 1:
+            raise ValueError("future_steps must be positive")
         roles = dict(roles or {})
         invalid_roles = set(roles.values()) - {"signal", "control", "aux", "graph"}
         if invalid_roles:
@@ -187,6 +208,24 @@ class SpeciesSignalDataset(Dataset):
                 f"roles reference modalities not requested: "
                 f"{sorted(unknown_role_modalities)}")
         self.roles = roles
+        self.species = species
+        self.expected_rate_hz = (
+            None if expected_rate_hz is None else float(expected_rate_hz))
+        if self.expected_rate_hz is not None and self.expected_rate_hz <= 0:
+            raise ValueError("expected_rate_hz must be positive")
+        self.rate_tolerance = float(rate_tolerance)
+        self.strict_rate = bool(strict_rate)
+        self.normalization = str(normalization or "none").lower()
+        if self.normalization not in {"none", "global_zscore"}:
+            raise ValueError(
+                "normalization must be 'none' or 'global_zscore'")
+        self.normalization_stats = {
+            str(modality): {
+                "mean": float(values["mean"]),
+                "std": max(float(values["std"]), 1e-6),
+            }
+            for modality, values in (normalization_stats or {}).items()
+        }
         self.regions = _region_map(Path(region_map) if region_map else None)
         self._mod_files: Dict[str, Path] = {}
 
@@ -204,10 +243,14 @@ class SpeciesSignalDataset(Dataset):
                 self.manifest_path = mp
 
         manifest_rows = read_manifest(self.manifest_path)
-        self.rows: List[Dict[str, str]] = (
-            list(rows) if rows is not None else manifest_rows)
-        if not self.rows:
-            self.rows = self._infer_rows()
+        if rows is None:
+            self.rows = manifest_rows
+            if not self.rows:
+                self.rows = self._infer_rows()
+        else:
+            # An explicit empty split is a valid loader (e.g. val_frac=0).
+            # Do not silently repopulate it from every modality directory.
+            self.rows = list(rows)
 
         # Channel identity / union index / region space, computed once.
         self._ids: Dict[str, Optional[List[str]]] = {}
@@ -236,7 +279,12 @@ class SpeciesSignalDataset(Dataset):
                   ext: str = ".npy") -> Optional[Path]:
         col = f"{modality}_file" if suffix_dir is None else None
         if suffix_dir is not None:
-            base = self.root / f"{modality}_{suffix_dir}"
+            if suffix_dir not in _COMPANION_DIRS:
+                raise ValueError(
+                    f"unknown companion directory {suffix_dir!r}; expected one "
+                    f"of {sorted(_COMPANION_DIRS)}")
+            base = self.root / _COMPANION_DIRS[suffix_dir].format(
+                modality=modality)
             candidate = base / f"{row.get('sample_id', '')}{ext}"
         else:
             override = row.get(col)
@@ -282,18 +330,41 @@ class SpeciesSignalDataset(Dataset):
             self._channel_index()
 
     def _rate_hz(self, row: Dict[str, str], modality: str) -> float:
-        """Return the modality-specific sampling rate for one manifest row."""
+        """Return the modality-specific sampling rate for one manifest row.
+
+        When ``expected_rate_hz`` is set (the species profile declares a
+        single-rate contract), the manifest value must agree: a mismatch means
+        every time constant and physical window derived downstream would be
+        computed with the wrong clock, so it is an error rather than a silent
+        preference for one of the two.
+        """
         value = row.get(f"{modality}_rate_hz") or row.get(
             f"{modality}_hz")
+        explicit = bool(value)
+        dt = row.get(f"{modality}_dt_s")
         if value:
             rate = float(value)
+        elif dt:
+            rate = 1.0 / float(dt)
         else:
-            dt = row.get(f"{modality}_dt_s")
-            rate = 1.0 / float(dt) if dt else float(
-                row.get("rate_hz") or self.rate_default or 1.0)
+            base = row.get("rate_hz") or self.rate_default
+            explicit = bool(base)
+            rate = float(base) if base else 1.0
         if rate <= 0:
             raise ValueError(
                 f"sampling rate for modality {modality!r} must be positive")
+        if (self.expected_rate_hz is not None and self.strict_rate
+                and explicit):
+            rel = abs(rate - self.expected_rate_hz) / self.expected_rate_hz
+            if rel > self.rate_tolerance:
+                raise ValueError(
+                    f"sampling-rate mismatch for sample "
+                    f"{row.get('sample_id', '?')!r} modality {modality!r}: "
+                    f"manifest says {rate:.6g} Hz but the species profile "
+                    f"declares {self.expected_rate_hz:.6g} Hz. Either point the "
+                    f"profile at the corpus rate, set sample_rate_hz_source="
+                    f"\"manifest\" for per-sample rates, or set "
+                    f"strict_rate=False to accept the manifest clock.")
         return rate
 
     def _frame_count(self, row: Dict[str, str], modality: str) -> int:
@@ -328,6 +399,7 @@ class SpeciesSignalDataset(Dataset):
     @staticmethod
     def _slice_window(
         data: torch.Tensor, start: int, win: int
+
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Slice and zero-pad a window, returning its validity mask."""
         channels = data.shape[0]
@@ -343,9 +415,28 @@ class SpeciesSignalDataset(Dataset):
         valid[:, :copied] = True
         return window, valid
 
+    def _normalize_window(
+        self,
+        modality: str,
+        window: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply training-fitted global statistics without touching padding."""
+        if self.normalization != "global_zscore":
+            return window
+        if self.roles.get(modality, "signal") != "signal":
+            return window
+        stats = self.normalization_stats.get(modality)
+        if stats is None:
+            return window
+        valid = mask & torch.isfinite(window)
+        mean = window.new_tensor(stats["mean"])
+        std = window.new_tensor(stats["std"])
+        normalized = (window - mean) / std
+        return torch.where(valid, normalized, torch.zeros_like(window))
+
     def __len__(self) -> int:
         return len(self.rows)
-
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row = self.rows[idx]
         sample_id = row.get("sample_id", f"row{idx}")
@@ -362,14 +453,20 @@ class SpeciesSignalDataset(Dataset):
             win = self._frame_count(row, modality)
             trials = _read_trials(self._row_file(
                 row, modality, suffix_dir="trials", ext=".json"))
-            required = win * 2 if self.return_next_step_targets else win
+            if self.roles.get(modality) == "control":
+                # Control tracks are cut at signal-window starts; their trial
+                # metadata describes stimulus segments, not valid starts.
+                trials = None
+            required = (
+                win * (1 + self.future_steps)
+                if self.return_next_step_targets else win)
             starts = self._allowed_starts(data.shape[1], trials, required)
             if not starts:
                 if self.return_next_step_targets:
                     raise ValueError(
                         f"sample {sample_id!r}, modality {modality!r} has "
-                        f"no context+future window of {win} frames")
-                # Preserve padded-window behavior for observation-only use.
+                        f"no context+{self.future_steps}-horizon window of "
+                        f"{win} frames")
                 starts = [0]
             modality_info.append({
                 "modality": modality,
@@ -382,10 +479,9 @@ class SpeciesSignalDataset(Dataset):
             })
 
         if not modality_info:
-            # no modality present for this row: return empty metadata only
-            for k in _STR_KEYS:
-                if row.get(k):
-                    out[k] = row[k]
+            for key in _STR_KEYS:
+                if row.get(key):
+                    out[key] = row[key]
             return out
 
         if self.seq_len is not None and len({
@@ -395,9 +491,8 @@ class SpeciesSignalDataset(Dataset):
                 "seq_len is frame-based and cannot align modalities with "
                 "different sampling rates; use seq_seconds")
 
-        # Candidate starts are represented in seconds.  Each modality is then
-        # sampled on its own grid, preventing raw frame indices from being
-        # mistaken for synchronized physical time.
+        # Candidate starts are represented in seconds so modalities with
+        # different clocks still select physically aligned windows.
         reference = modality_info[0]
         candidate_times = [
             start / reference["rate"] for start in reference["starts"]]
@@ -432,71 +527,156 @@ class SpeciesSignalDataset(Dataset):
             win = info["win"]
             window, valid = self._slice_window(data, start, win)
             mask_path = self._row_file(row, modality, suffix_dir="mask")
+            mask_data = None
             if mask_path is not None:
                 mask_data = _load_array(mask_path)
                 if mask_data.shape == data.shape:
                     mask_window, mask_valid = self._slice_window(
                         mask_data, start, win)
                     valid = valid & mask_valid & mask_window.bool()
+                else:
+                    warnings.warn(
+                        f"sample {sample_id!r} modality {modality!r}: mask "
+                        f"{tuple(mask_data.shape)} does not match signal "
+                        f"{tuple(data.shape)}; validity information is being "
+                        "ignored for this sample", RuntimeWarning)
+                    mask_data = None
             mask = valid
 
-            next_window = next_mask = None
+            future_windows = []
             if self.return_next_step_targets:
-                next_window, next_valid = self._slice_window(
-                    data, start + win, win)
-                if mask_path is not None and mask_data.shape == data.shape:
-                    next_mask_window, next_mask_valid = self._slice_window(
-                        mask_data, start + win, win)
-                    next_valid = (
-                        next_valid & next_mask_valid
-                        & next_mask_window.bool())
-                next_mask = next_valid
+                for horizon in range(1, self.future_steps + 1):
+                    future_window, future_valid = self._slice_window(
+                        data, start + horizon * win, win)
+                    if mask_data is not None:
+                        next_mask_window, next_mask_valid = (
+                            self._slice_window(
+                                mask_data, start + horizon * win, win))
+                        future_valid = (
+                            future_valid & next_mask_valid
+                            & next_mask_window.bool())
+                    future_windows.append((future_window, future_valid))
+
+            window = self._normalize_window(modality, window, mask)
+            future_windows = [
+                (self._normalize_window(modality, future, future_mask),
+                 future_mask)
+                for future, future_mask in future_windows
+            ]
 
             ids = self._sample_ids(row, modality) if (
                 self.load_ids or self.align_channels or
                 self.regions is not None) else None
             if ids is not None and len(ids) != window.shape[0]:
-                ids = None  # channel count mismatch: treat as unlabeled
+                warnings.warn(
+                    f"sample {sample_id!r} modality {modality!r}: "
+                    f"{len(ids)} channel ids for {window.shape[0]} channels; "
+                    "channel identity is unavailable for this sample "
+                    "(union alignment will skip it)", RuntimeWarning)
+                ids = None
             if self.regions is not None and ids is not None:
                 window, mask = _aggregate_regions(
                     window, mask, ids, self._regions, self.regions)
-                if next_window is not None:
-                    next_window, next_mask = _aggregate_regions(
-                        next_window, next_mask, ids,
-                        self._regions, self.regions)
+                future_windows = [
+                    _aggregate_regions(
+                        future, future_mask, ids, self._regions, self.regions)
+                    for future, future_mask in future_windows
+                ]
                 ids = self._regions
             if self.align_channels and ids is not None:
                 source_ids = list(ids)
                 window, mask, ids = self._align_to_union(
                     window, mask, source_ids, sample_id, modality)
-                if next_window is not None:
-                    next_window, next_mask, _ = self._align_to_union(
-                        next_window, next_mask, source_ids,
-                        sample_id, modality)
+                aligned_future_windows = []
+                for future, future_mask in future_windows:
+                    aligned_future_windows.append(self._align_to_union(
+                        future, future_mask, source_ids, sample_id, modality)[:2])
+                future_windows = aligned_future_windows
+
             out[modality] = window
             if self.return_masks:
                 out[f"{modality}_mask"] = mask
             if self.load_ids:
                 out[f"{modality}_ids"] = ids or []
-            if next_window is not None:
-                out[f"{modality}_next"] = next_window
-                if self.return_masks:
-                    out[f"{modality}_next_mask"] = next_mask
+            if future_windows:
+                if self.future_steps == 1:
+                    out[f"{modality}_next"] = future_windows[0][0]
+                    if self.return_masks:
+                        out[f"{modality}_next_mask"] = future_windows[0][1]
+                else:
+                    out[f"{modality}_future"] = torch.stack(
+                        [future for future, _ in future_windows], dim=0)
+                    if self.return_masks:
+                        out[f"{modality}_future_mask"] = torch.stack(
+                            [future_mask
+                             for _, future_mask in future_windows], dim=0)
+                    for horizon, (future, future_mask) in enumerate(
+                            future_windows, start=1):
+                        out[f"{modality}_next_{horizon}"] = future
+                        if self.return_masks:
+                            out[f"{modality}_next_{horizon}_mask"] = future_mask
 
         if self.load_graphs:
-            gpath = self._row_file(row, "graph", suffix_dir="graphs")
-            gpath = gpath if gpath is not None else (
-                self.root / "graphs" / f"{sample_id}.npy")
-            if gpath and gpath.is_file():
-                out["graph"] = _load_array(gpath)
-        for k in _STR_KEYS:
-            if row.get(k):
-                out[k] = row[k]
+            graph_path = self._row_file(
+                row, "", suffix_dir="graphs", ext=".npy")
+            if graph_path is not None:
+                graph = _load_array(graph_path)
+                if graph.dim() != 2 or graph.shape[0] != graph.shape[1]:
+                    raise ValueError(
+                        f"{graph_path} must be a square graph adjacency matrix")
+                out["graph"] = graph
+
+        for key in (
+                "intervention_target",
+                "intervention_baseline",
+                "intervention_mask",
+                "action_utility_target",
+                "replay_target"):
+            raw_value = row.get(f"{key}_file") or row.get(key)
+            if raw_value in (None, ""):
+                continue
+            path = Path(raw_value)
+            path = path if path.is_absolute() else self.root / path
+            if path.exists():
+                out[key] = _load_array(path)
+            elif key == "action_utility_target":
+                try:
+                    out[key] = torch.tensor(
+                        float(raw_value), dtype=torch.float32)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"sample {sample_id!r} has an invalid "
+                        "action_utility_target") from exc
+            else:
+                raise FileNotFoundError(
+                    f"sample {sample_id!r} contract file for {key!r} "
+                    f"does not exist: {path}")
+
+        for key in _STR_KEYS:
+            if row.get(key):
+                out[key] = row[key]
+        sample_species = row.get("species") or self.species
+        if sample_species:
+            out["species"] = sample_species
         rate = row.get("rate_hz")
         out["dt"] = float(row.get("dt_s") or (
             (1.0 / float(rate)) if rate else
             1.0 / modality_info[0]["rate"]))
         out["window_start_s"] = float(valid_times[chosen_idx])
+        raw_label = row.get(
+            "cross_modal_label", row.get("cross_modal_labels"))
+        if raw_label not in (None, ""):
+            try:
+                label = float(raw_label)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"sample {sample_id!r} has an invalid "
+                    "cross_modal_label") from exc
+            if label not in (0.0, 1.0):
+                raise ValueError(
+                    "cross_modal_label must be 0 (async) or 1 (synchronized)")
+            out["cross_modal_labels"] = torch.tensor(
+                label, dtype=torch.float32)
         return out
 
     def _align_to_union(self, window: torch.Tensor, mask: torch.Tensor,
@@ -625,6 +805,57 @@ def species_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------- builders
+def _fit_global_normalization(
+    root: Path,
+    rows: Sequence[Dict[str, str]],
+    modalities: Sequence[str],
+    roles: Optional[Dict[str, str]],
+) -> Dict[str, Dict[str, float]]:
+    """Fit leakage-safe scalar statistics from training rows only."""
+    role_map = dict(roles or {})
+    signal_modalities = [
+        modality for modality in modalities
+        if role_map.get(modality, "signal") == "signal"
+    ]
+    if not signal_modalities or not rows:
+        return {}
+    probe = SpeciesSignalDataset(
+        root, signal_modalities, seq_len=1, manifest=None,
+        rows=rows, roles=role_map)
+    stats: Dict[str, Dict[str, float]] = {}
+    for modality in signal_modalities:
+        total = 0
+        total_sum = 0.0
+        total_sq_sum = 0.0
+        for row in rows:
+            fpath = probe._row_file(row, modality)
+            if fpath is None:
+                continue
+            data = _load_array(fpath)
+            if data.dim() != 2:
+                raise ValueError(f"{fpath} is not a (C, T) array")
+            valid = torch.isfinite(data)
+            mask_path = probe._row_file(row, modality, suffix_dir="mask")
+            if mask_path is not None:
+                mask = _load_array(mask_path)
+                if mask.shape == data.shape:
+                    valid = valid & mask.bool()
+            values = data[valid].double()
+            if values.numel() == 0:
+                continue
+            total += int(values.numel())
+            total_sum += float(values.sum().item())
+            total_sq_sum += float((values * values).sum().item())
+        if total:
+            mean = total_sum / total
+            variance = max(total_sq_sum / total - mean * mean, 1e-12)
+            stats[modality] = {
+                "mean": mean,
+                "std": float(np.sqrt(variance)),
+            }
+    return stats
+
+
 def build_species_dataloaders(
     data_dir: Union[str, Path],
     modalities: Sequence[str],
@@ -643,19 +874,35 @@ def build_species_dataloaders(
     max_union_channels: int = 4096,
     region_map: Union[str, Path, None] = None,
     load_graphs: bool = False,
-    return_masks: bool = True,
     use_trials: bool = True,
+    return_masks: bool = True,
     rate_default: Optional[float] = None,
     return_next_step_targets: bool = False,
+    future_steps: int = 1,
     roles: Optional[Dict[str, str]] = None,
+    species: Optional[str] = None,
+    strict_rate: bool = True,
+    expected_rate_hz: Optional[float] = None,
+    normalization: Optional[str] = None,
 ) -> Union[Tuple[DataLoader, DataLoader],
            Tuple[DataLoader, DataLoader, DataLoader]]:
     """Train/val(/test) loaders with group-preserving splits.
 
     ``return_next_step_targets`` makes every sample expose
-    ``<modality>_next`` from the adjacent non-overlapping window.  Validation
-    and test datasets always use their first eligible window so metrics are
-    repeatable; only the training dataset samples windows randomly.
+    ``<modality>_next`` for ``future_steps=1``. For ``future_steps > 1`` it
+    additionally exposes ``<modality>_future`` with shape ``(K,C,T)`` and
+    horizon-specific ``<modality>_next_<k>`` tensors. Validation and test
+    datasets always use their first eligible window so metrics are repeatable;
+    only the training dataset samples windows randomly.
+
+    ``normalization="global_zscore"`` fits one global mean/std per signal
+    modality on training rows only and reuses those statistics for validation
+    and test rows; controls and auxiliary modalities remain unchanged.
+
+    ``species``/``expected_rate_hz`` attach the species identity and the
+    single-rate contract of the caller's profile. Each species trains its own
+    model against its own ladder; the *code path* is shared, the model instance
+    is not.
     """
     if seq_len is None and seq_seconds is None:
         seq_len = 256
@@ -663,6 +910,10 @@ def build_species_dataloaders(
     manifest_rows = read_manifest(
         root / manifest if manifest and not Path(manifest).is_absolute()
         else Path(manifest) if manifest else None)
+    normalization_mode = str(normalization or "none").lower()
+    if normalization_mode not in {"none", "global_zscore"}:
+        raise ValueError(
+            "normalization must be 'none' or 'global_zscore'")
     base = dict(
         data_dir=root, modalities=modalities,
         seq_len=seq_len, seq_seconds=seq_seconds, manifest=manifest,
@@ -670,7 +921,11 @@ def build_species_dataloaders(
         max_union_channels=max_union_channels, region_map=region_map,
         load_graphs=load_graphs, return_masks=return_masks,
         use_trials=use_trials, rate_default=rate_default,
-        return_next_step_targets=return_next_step_targets, roles=roles)
+        return_next_step_targets=return_next_step_targets, roles=roles,
+        species=species, expected_rate_hz=expected_rate_hz,
+        strict_rate=strict_rate, normalization=normalization_mode,
+        future_steps=future_steps,
+        normalization_stats={})
 
     if manifest_rows:
         rows = manifest_rows
@@ -678,10 +933,14 @@ def build_species_dataloaders(
         probe = SpeciesSignalDataset(
             root, modalities, seq_len=seq_len, seq_seconds=seq_seconds,
             manifest=None, rows=None, rate_default=rate_default,
-            roles=roles)
+            roles=roles, species=species,
+            expected_rate_hz=expected_rate_hz, strict_rate=strict_rate)
         rows = [dict(r) for r in probe.rows]
     train_rows, val_rows, test_rows = split_rows(
         rows, by=split_by, seed=seed, val_frac=val_frac, test_frac=test_frac)
+    if normalization_mode == "global_zscore":
+        base["normalization_stats"] = _fit_global_normalization(
+            root, train_rows, modalities, roles)
 
     def loader(rowset, do_shuffle):
         ds = SpeciesSignalDataset(

@@ -24,7 +24,7 @@ from .encoders.eeg_encoder import EEGEncoderWrapper, EEGProjection
 from .encoders.fmri_encoder import NeuroSTORMEncoder, BrainLMEncoder, create_fmri_encoder
 from .encoders.meg_encoder import MEGEncoderWrapper, MEGProjection
 from .encoders.hub_fusion import HubTokenFusion, CrossModalAdapter
-from .core.velocity_brain import VelocityBrain, MultiTimeScaleKDA
+from .core.velocity_brain import VelocityBrain, MultiTimeScaleKDA, as_step_dt
 from .runtime.device_utils import safe_epsilon
 from .core.moe import (
     MoEVelocityField,
@@ -33,6 +33,7 @@ from .core.moe import (
     WorkingMemoryRouter,
     ExpertNetwork,
 )
+from .core.emission import SensorEmission
 from .core.observation_adapters import (
     GenericSignalAdapter,
     ChannelSignalAdapter,
@@ -171,6 +172,7 @@ class BrainMoEPINN(nn.Module):
         use_meg: bool = False,
         use_imagination: bool = False,
         use_generic_moe: bool = False,
+        use_moe: bool = True,
         perturbation_dim: Optional[int] = None,
         eeg_backend: str = "v1",
         use_magi_v2: bool = False,
@@ -182,9 +184,12 @@ class BrainMoEPINN(nn.Module):
         moe_num_shared: int = 8,
         moe_num_routed: int = 6,
         moe_top_k: int = 3,
+        poisson_rank: int = 64,
         species: str = "human",
         species_vocab: Optional[List[str]] = None,
         use_species_conditioning: bool = False,
+        use_sensor_emission: bool = False,
+        sensor_specs: Optional[Dict[str, object]] = None,
         generic_observation_only: bool = False,
         initial_context_length: int = 256,
         max_context_length: int = 1024,
@@ -195,6 +200,7 @@ class BrainMoEPINN(nn.Module):
         if latent_dt is not None and latent_dt <= 0:
             raise ValueError("latent_dt must be positive")
         self.latent_dt = latent_dt
+        self._nominal_rate_hz = (1.0 / float(latent_dt)) if latent_dt else 1.0
         self.integration_dt = (
             float(latent_dt) if latent_dt is not None else 1.0)
         if noise_mode not in ("off", "rollout", "train", "always"):
@@ -207,12 +213,14 @@ class BrainMoEPINN(nn.Module):
         self.use_meg = use_meg
         self.use_imagination = use_imagination
         self.use_generic_moe = use_generic_moe
+        self.use_moe = bool(use_moe)
         self.perturbation_dim = perturbation_dim
         self.eeg_backend = "v2" if use_magi_v2 else eeg_backend
         self.use_channel_type_embed = use_channel_type_embed
         self.moe_num_shared = moe_num_shared
         self.moe_num_routed = moe_num_routed
         self.moe_top_k = moe_top_k
+        self.poisson_rank = int(poisson_rank)
         self.species = species
         self.species_vocab = tuple(species_vocab or SUPPORTED_SPECIES)
         self.use_species_conditioning = use_species_conditioning
@@ -222,6 +230,8 @@ class BrainMoEPINN(nn.Module):
             raise ValueError("MoE expert counts are invalid")
         if self.moe_top_k <= 0:
             raise ValueError("moe_top_k must be positive")
+        if self.poisson_rank <= 0 or self.poisson_rank % 2:
+            raise ValueError("poisson_rank must be a positive even integer")
         if self.species not in self.species_vocab:
             raise ValueError("species must be present in species_vocab")
         if initial_context_length <= 0 or max_context_length < initial_context_length:
@@ -232,6 +242,8 @@ class BrainMoEPINN(nn.Module):
         self.max_context_length = max_context_length
         self.context_expansion_steps = context_expansion_steps
         self._current_context_length = initial_context_length
+        self.use_sensor_emission = bool(use_sensor_emission)
+        self.sensor_specs = dict(sensor_specs or {})
         self.generic_observation_only = generic_observation_only
         if generic_observation_only:
             self.eeg_encoder = None
@@ -352,6 +364,28 @@ class BrainMoEPINN(nn.Module):
             for modality in SUPPORTED_MODALITIES
         })
         self.signal_recon_head = SignalReconstructionHead(latent_dim)
+        # Opt-in observation-channel model for calcium (Hill saturation +
+        # indicator low-pass). It models the *measurement*, not the dynamics,
+        # and exposes its fitted per-channel time constants for reporting.
+        # One observation-channel model per modality, built from the species
+        # profile's sensor spec. A ladder stage runs one species per model, so
+        # a worm FRET channel and a zebrafish GCaMP channel never share these
+        # kinetics -- the isolation is structural, not a runtime check.
+        self.sensor_emissions = nn.ModuleDict()
+        if self.use_sensor_emission:
+            for _modality, _spec in self.sensor_specs.items():
+                if not getattr(_spec, "dynamics_valid", True):
+                    continue
+                # Electrical modalities have no fluorescent/vascular reporter
+                # to emulate (their own encoder/decoder carries the physics);
+                # only optical and haemodynamic channels get an emission.
+                _family = getattr(getattr(_spec, "reporter", None), "family", "")
+                if _family == "electrical":
+                    continue
+                self.sensor_emissions[_modality] = SensorEmission(
+                    max_channels=self.signal_recon_head.max_channels,
+                    spec=_spec,
+                    dt_default_s=1.0 / float(self._nominal_rate_hz or 1.0))
         self.generic_modality_embedding = nn.Embedding(
             len(SUPPORTED_MODALITIES), latent_dim)
 
@@ -366,32 +400,34 @@ class BrainMoEPINN(nn.Module):
             use_subject_conditioning=True,
         )
 
-        if use_generic_moe:
-            self.moe_velocity = MoEGenericVelocityField(
-                hidden_dim=latent_dim,
-                num_shared=moe_num_shared,
-                num_routed=moe_num_routed,
-                top_k=moe_top_k,
-                use_deep_bias=use_deep_experts,
-                shared_depth=shared_depth,
-                routed_depth=routed_depth,
-            )
-        else:
-            self.moe_velocity = MoEVelocityField(
-                hidden_dim=latent_dim,
-                num_shared=moe_num_shared,
-                num_routed=moe_num_routed,
-                top_k=moe_top_k,
-                use_deep_experts=use_deep_experts,
-                shared_depth=shared_depth,
-                routed_depth=routed_depth,
-            )
+        self.moe_velocity = None
+        if self.use_moe:
+            if use_generic_moe:
+                self.moe_velocity = MoEGenericVelocityField(
+                    hidden_dim=latent_dim,
+                    num_shared=moe_num_shared,
+                    num_routed=moe_num_routed,
+                    top_k=moe_top_k,
+                    use_deep_bias=use_deep_experts,
+                    shared_depth=shared_depth,
+                    routed_depth=routed_depth,
+                )
+            else:
+                self.moe_velocity = MoEVelocityField(
+                    hidden_dim=latent_dim,
+                    num_shared=moe_num_shared,
+                    num_routed=moe_num_routed,
+                    top_k=moe_top_k,
+                    use_deep_experts=use_deep_experts,
+                    shared_depth=shared_depth,
+                    routed_depth=routed_depth,
+                )
 
         self.velocity_brain = VelocityBrain(
             hidden_dim=latent_dim,
             apply_degeneracy_projection=True,
             use_lowrank_poisson=True,
-            poisson_rank=64,
+            poisson_rank=self.poisson_rank,
             perturbation_dim=perturbation_dim,
             control_gating=self.control_gating,
             latent_dt=self.latent_dt,
@@ -459,11 +495,12 @@ class BrainMoEPINN(nn.Module):
         self.total_loss = TotalLoss(loss_weights=LossWeights())
 
         if use_torch_compile and hasattr(torch, "compile"):
-            self.moe_velocity = torch.compile(
-                self.moe_velocity,
-                mode="reduce-overhead",
-                fullgraph=False,
-            )
+            if self.moe_velocity is not None:
+                self.moe_velocity = torch.compile(
+                    self.moe_velocity,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                )
             if self.eeg_encoder is not None:
                 self.eeg_encoder = torch.compile(
                     self.eeg_encoder,
@@ -523,6 +560,19 @@ class BrainMoEPINN(nn.Module):
         scale, shift = self.species_film(self.species_embedding(ids)).chunk(2, dim=-1)
         return z * (1.0 + 0.1 * torch.tanh(scale)) + 0.1 * shift
 
+    def latent_step_dt(self, dt, reference: torch.Tensor) -> torch.Tensor:
+        """Broadcastable physical step duration for ``z <- z + dt * delta_z``.
+
+        ``dt=None`` keeps the module default (``integration_dt``); a scalar or
+        per-sample tensor makes the step's *physical* duration explicit, which
+        is what the MT-KDA/OU time constants and the reported physical
+        durations must agree with.
+        """
+        if dt is None:
+            return self.integration_dt
+        return as_step_dt(dt, reference.shape[0], reference.device,
+                          reference.dtype)
+
     def _latent_step(
         self,
         z: torch.Tensor,
@@ -530,16 +580,25 @@ class BrainMoEPINN(nn.Module):
         apply_noise: bool = False,
         step_index: int = 0,
         noise_state: Optional[torch.Tensor] = None,
+        dt=None,
     ) -> Dict[str, torch.Tensor]:
         if perturbation is not None and perturbation.dim() == 3:
             k = min(step_index, perturbation.shape[1] - 1)
             perturbation = perturbation[:, k]
         vb_out = self.velocity_brain(
             z, perturbation=perturbation, apply_noise=apply_noise,
-            noise_state=noise_state)
+            noise_state=noise_state, dt=dt)
         generic_delta_z = vb_out["delta_z"]
 
-        if self.use_generic_moe:
+        routing_metrics = {}
+        if self.moe_velocity is None:
+            delta_z = generic_delta_z
+            constraint_residual = (
+                vb_out["L_grad_S"].square().sum(dim=-1).mean()
+                + vb_out["M_grad_E"].square().sum(dim=-1).mean())
+            grassmannian_loss = torch.zeros(
+                (), dtype=z.dtype, device=z.device)
+        elif self.use_generic_moe:
             moe_out = self.moe_velocity(
                 z,
                 grad_E=vb_out["grad_E"],
@@ -564,12 +623,20 @@ class BrainMoEPINN(nn.Module):
             constraint_residual = moe_out.get(
                 "generic_constraint_residual",
                 torch.zeros((), dtype=z.dtype, device=z.device))
+            routing_metrics = moe_out["routing_metrics"]
+            grassmannian_loss = moe_out.get(
+                "grassmannian_loss",
+                torch.zeros((), dtype=z.dtype, device=z.device))
         else:
             moe_out = self.moe_velocity(z)
             delta_z = generic_delta_z + moe_out["velocity"]
             constraint_residual = (
                 vb_out["L_grad_S"].square().sum(dim=-1).mean()
                 + vb_out["M_grad_E"].square().sum(dim=-1).mean())
+            routing_metrics = moe_out["routing_metrics"]
+            grassmannian_loss = moe_out.get(
+                "grassmannian_loss",
+                torch.zeros((), dtype=z.dtype, device=z.device))
 
             # Scope diagnostic.  The cheap MoE adds an unconstrained velocity
             # *after* the degeneracy projections, so with this path the total
@@ -586,12 +653,12 @@ class BrainMoEPINN(nn.Module):
                 backbone_norm = generic_delta_z.norm(dim=-1)
                 total_norm = (expert_norm + backbone_norm).clamp_min(
                     safe_epsilon(expert_norm, 1e-12))
-                moe_out["routing_metrics"]["moe_velocity_share"] = float(
+                routing_metrics["moe_velocity_share"] = float(
                     (expert_norm / total_norm).mean())
                 alignment = (expert_velocity * grad_E).sum(dim=-1).abs() / (
                     expert_norm * grad_E.norm(dim=-1)).clamp_min(
                         safe_epsilon(expert_norm, 1e-12))
-                moe_out["routing_metrics"]["moe_energy_alignment"] = float(
+                routing_metrics["moe_energy_alignment"] = float(
                     alignment.mean())
 
         return {
@@ -599,7 +666,7 @@ class BrainMoEPINN(nn.Module):
             "generic_delta_z": generic_delta_z,
             "delta_z": delta_z,
             "noise_state": vb_out.get("new_noise_state"),
-            "moe_routing": moe_out["routing_metrics"],
+            "moe_routing": routing_metrics,
             "grad_E": vb_out["grad_E"],
             "grad_S": vb_out["grad_S"],
             "E": vb_out.get("E"),
@@ -607,9 +674,7 @@ class BrainMoEPINN(nn.Module):
             "L_z": vb_out["L_z"],
             "M_diag": vb_out["M_diag"],
             "generic_constraint_residual": constraint_residual,
-            "grassmannian_loss": moe_out.get(
-                "grassmannian_loss",
-                torch.zeros((), dtype=z.dtype, device=z.device)),
+            "grassmannian_loss": grassmannian_loss,
         }
 
 
@@ -619,14 +684,29 @@ class BrainMoEPINN(nn.Module):
         *,
         perturbation: Optional[torch.Tensor] = None,
         species_ids: Optional[torch.Tensor] = None,
-        species_names=None,
         masks: Optional[Dict[str, torch.Tensor]] = None,
         num_steps: int = 1,
         return_all: bool = False,
+        return_sequences: bool = False,
         reconstruct: bool = False,
         recon_max_channels: int = 2048,
+        species_names=None,
+        dt=None,
+        frame_dt=None,
+        step_dt=None,
     ) -> Dict[str, torch.Tensor]:
         """Run the shared latent dynamics on arbitrary neural modalities.
+
+        ``dt`` is the physical duration the rollout must cover (normally one
+        window, matching ``<modality>_next``); it is split into ``num_steps``
+        equal substeps, so ``num_steps=2`` over a 60 s window advances 30 s per
+        step and the two segment means of a 60 s control track line up with
+        them. ``dt=None`` keeps the legacy per-step ``integration_dt``
+        behaviour. ``frame_dt`` is the recording's sampling interval, used by
+        the observation-channel emission (its filter runs on the frame grid).
+        ``step_dt`` optionally overrides the divided duration for each rollout
+        step.  Use it when successive outputs represent successive full
+        windows rather than substeps within one window.
 
         ``signals`` maps modality names such as ``calcium``, ``voltage``,
         ``widefield``, ``eeg``, or ``fmri`` to tensors shaped ``(B,C,T)``.
@@ -673,13 +753,14 @@ class BrainMoEPINN(nn.Module):
                 and input_signal.shape[1] <= min(
                     recon_max_channels, self.signal_recon_head.max_channels))
             if want_recon:
-                channel_tokens = self.generic_channel_adapters[
-                    modality].forward_channels(input_signal)
                 recon_channels[modality] = input_signal.shape[1]
-                tokens = channel_tokens.mean(dim=1) + modality_embed
+                # Mask-weighted channel pooling: union-aligned padding
+                # channels must not dilute the token that drives the dynamics.
+                tokens = self.generic_channel_adapters[modality](
+                    input_signal, mask=mask) + modality_embed
             else:
                 tokens = self.generic_signal_adapters[
-                    modality](input_signal)
+                    modality](input_signal, mask=mask)
                 tokens = tokens + modality_embed
             modality_tokens[modality] = tokens
             pooled.append(tokens.mean(dim=1))
@@ -691,19 +772,33 @@ class BrainMoEPINN(nn.Module):
         states = [z_t] if return_all else []
         control_terms = []
         delta_z_seq = []
+        emit_sequences = bool(return_sequences or num_steps > 1)
+        rollout_states = []
         use_noise = (self.noise_mode == "always"
                      or (self.noise_mode == "train" and self.training)
                      or (self.noise_mode == "rollout" and self.training
                          and num_steps > 1))
         noise_state = None
+        # ``dt`` is the total physical time for one context window.  The
+        # legacy multi-step mode divides it into substeps; ``step_dt`` is
+        # explicit for multi-horizon forecasts where each output advances one
+        # complete window.
+        substep_dt = step_dt
+        if substep_dt is None and dt is not None:
+            substep_dt = (
+                dt / float(num_steps)
+                if not isinstance(dt, torch.Tensor)
+                else dt / float(num_steps))
         for k in range(num_steps):
             step_out = self._latent_step(
                 z_t, perturbation=perturbation, apply_noise=use_noise,
-                step_index=k, noise_state=noise_state)
+                step_index=k, noise_state=noise_state, dt=substep_dt)
             noise_state = step_out.get("noise_state")
             delta_z_seq.append(step_out["delta_z"])
-            z_t = z_t + self.integration_dt * step_out["delta_z"]
+            z_t = z_t + self.latent_step_dt(substep_dt, z_t) * step_out["delta_z"]
             control_terms.append(step_out["vb_out"]["control_term"])
+            if emit_sequences:
+                rollout_states.append(z_t)
             if return_all:
                 states.append(z_t)
 
@@ -726,16 +821,36 @@ class BrainMoEPINN(nn.Module):
             "grassmannian_loss": step_out["grassmannian_loss"],
         }
         if len(delta_z_seq) > 1:
-            # Rollout velocity trace for temporal losses (velocity TV, ks).
             result["delta_z_sequence"] = torch.stack(delta_z_seq, dim=1)
-        # Generate each reconstruct-capable modality from the evolved latent
-        # alone (plus channel identity); the encoder's current-window tokens
-        # are deliberately not passed to the decoder.
+        if emit_sequences:
+            result["z_next_sequence"] = torch.stack(rollout_states, dim=1)
+        # Generate each reconstruct-capable modality from every rollout state
+        # when a multi-horizon forecast is requested. The final reconstruction
+        # remains available under the legacy ``{modality}_recon`` key.
         for modality, num_channels in recon_channels.items():
-            result[f"{modality}_recon"] = self.signal_recon_head(
-                z_t,
-                num_channels=num_channels,
-                target_time_len=signals[modality].shape[-1])
+            emission = (self.sensor_emissions[modality]
+                        if modality in self.sensor_emissions else None)
+            states_to_decode = (
+                rollout_states if emit_sequences else [z_t])
+            decoded_steps = []
+            for state in states_to_decode:
+                decoded = self.signal_recon_head(
+                    state,
+                    num_channels=num_channels,
+                    target_time_len=signals[modality].shape[-1])
+                if emission is not None:
+                    decoded = emission(
+                        decoded,
+                        dt=(frame_dt if frame_dt is not None
+                            else self.latent_dt))
+                decoded_steps.append(decoded)
+            if emission is not None:
+                result[f"{modality}_emission"] = emission.parameter_summary(
+                    num_channels)
+            if emit_sequences:
+                result[f"{modality}_recon_sequence"] = torch.stack(
+                    decoded_steps, dim=1)
+            result[f"{modality}_recon"] = decoded_steps[-1]
         if return_all:
             result["states"] = torch.stack(states, dim=1)
             result["control_terms"] = torch.stack(control_terms, dim=1)
@@ -744,7 +859,7 @@ class BrainMoEPINN(nn.Module):
     def forward(
         self,
         eeg: torch.Tensor,
-        fmri: torch.Tensor,
+        fmri: Optional[torch.Tensor] = None,
         meg: Optional[torch.Tensor] = None,
         channel_names: Optional[List[str]] = None,
         channel_types: Optional[torch.Tensor] = None,
@@ -759,9 +874,19 @@ class BrainMoEPINN(nn.Module):
         subject_features: Optional[torch.Tensor] = None,
         num_steps: int = 1,
         return_all: bool = False,
+        return_sequences: bool = False,
         species_ids: Optional[torch.Tensor] = None,
         species_names=None,
         masks: Optional[Dict[str, torch.Tensor]] = None,
+        magi_pretraining: bool = False,
+        magi_eeg_view2: Optional[torch.Tensor] = None,
+        magi_channel_names2: Optional[List[List[str]]] = None,
+        magi_channel_types2: Optional[torch.Tensor] = None,
+        magi_objective_weights: Optional[Dict[str, float]] = None,
+        dt=None,
+        frame_dt=None,
+        step_dt=None,
+        cross_modal_labels: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Full forward pass through Brain MoE-PINN.
@@ -774,10 +899,11 @@ class BrainMoEPINN(nn.Module):
             mode: 'perception' (forced ODE with feedback) or 'imagination' (free)
             goal_attractors: (B, num_goals, d) goal attractor centers
             task_cue: (B, d) task cue for imagination
-            actual_eeg: (B, C_eeg, T) actual EEG at t+1 (for perception feedback)
             action: (B, d) executed action (for Smith predictor)
             perturbation: (B, u) exogenous intervention/control input
             subject_features: (B, 3) optional age/sex/region for HRF conditioning
+            cross_modal_labels: optional binary sync/async pair labels.  The
+                HRF alignment term uses only synchronized rows.
             num_steps: number of latent rollout steps after encoding
             return_all: return latent states and control terms for every step
             species_ids/species_names: per-row species metadata for shared
@@ -785,6 +911,27 @@ class BrainMoEPINN(nn.Module):
         Returns:
             dict with all outputs including reconstructions and latent states
         """
+        if magi_pretraining:
+            objective = getattr(self, "magi_pretraining_objective", None)
+            if objective is None:
+                raise RuntimeError(
+                    "Magi pretraining requested without an initialized "
+                    "objective")
+            weights = dict(magi_objective_weights or {})
+            return objective(
+                eeg,
+                eeg_view2=magi_eeg_view2,
+                channel_names=channel_names,
+                channel_types=channel_types,
+                channel_names2=magi_channel_names2,
+                channel_types2=magi_channel_types2,
+                masked_weight=float(weights.get("masked", 1.0)),
+                ntp_weight=float(weights.get("causal_ntp", 1.0)),
+                contrastive_weight=float(weights.get("contrastive", 0.1)),
+            )
+        if fmri is None:
+            raise ValueError("fmri is required for the standard forward path")
+
         if self.generic_observation_only:
             raise RuntimeError(
                 "generic_observation_only models require forward_modalities()")
@@ -830,10 +977,9 @@ class BrainMoEPINN(nn.Module):
         # --- Slow Manifold Projector + Latent HRF Bridge ---
         # Operate on full token sequences (not just hub tokens)
         eeg_slow = self.slow_projector(eeg_tokens)   # (B, L_eeg, 256)
-        fmri_slow = self.slow_projector(fmri_tokens)  # (B, L_fmri, 256)
         z_pred_fmri_slow, hrf_align_loss = self.latent_hrf(
-            eeg_slow, fmri_slow, subject_features=subject_features
-        )
+            eeg_slow, fmri_slow, subject_features=subject_features,
+            pair_labels=cross_modal_labels)
 
         # Hub token fusion
         if self.use_meg and meg_tokens is not None:
@@ -858,22 +1004,32 @@ class BrainMoEPINN(nn.Module):
         hrf_residual = self.slow_projector.inverse_project(z_pred_fmri_slow.mean(dim=1))
         z_t = z_global
         states = [z_t] if return_all else []
-        control_terms = []
-        delta_z_seq = []
+        emit_sequences = bool(return_sequences or num_steps > 1)
+        rollout_states = []
         use_noise = (self.noise_mode == "always"
                      or (self.noise_mode == "train" and self.training)
                      or (self.noise_mode == "rollout" and self.training
                          and num_steps > 1))
         noise_state = None
+        substep_dt = step_dt
+        if substep_dt is None and dt is not None:
+            substep_dt = (
+                dt / float(num_steps)
+                if not isinstance(dt, torch.Tensor)
+                else dt / float(num_steps))
         for k in range(num_steps):
             step_out = self._latent_step(
                 z_t, perturbation=perturbation, apply_noise=use_noise,
-                step_index=k, noise_state=noise_state)
+                step_index=k, noise_state=noise_state, dt=substep_dt)
             noise_state = step_out.get("noise_state")
+            delta_z_seq.append(step_out["delta_z"])
             z_t = (
-                z_t + self.integration_dt * step_out["delta_z"]
+                z_t + self.latent_step_dt(substep_dt, z_t)
+                * step_out["delta_z"]
                 + 0.05 * hrf_residual)
             control_terms.append(step_out["vb_out"]["control_term"])
+            if emit_sequences:
+                rollout_states.append(z_t)
             if return_all:
                 states.append(z_t)
 
@@ -884,23 +1040,35 @@ class BrainMoEPINN(nn.Module):
         moe_routing = step_out["moe_routing"]
         grassmannian_loss = step_out["grassmannian_loss"]
 
-        # Decoder routing
+        # Decoder routing is shared across rollout states; only the final
+        # decoder output keeps the legacy scalar-horizon keys.
         if self.use_kda_decoder:
-            eeg_patches = (eeg.shape[-1] - 256) // 128 + 1 if eeg.shape[-1] >= 256 else 1
-            fmri_seq_len = fmri.shape[-1]
+            eeg_patches = (
+                (eeg.shape[-1] - 256) // 128 + 1
+                if eeg.shape[-1] >= 256 else 1)
             decoder_kwargs = {
                 "eeg_seq_length": max(1, eeg_patches),
-                "fmri_seq_length": fmri_seq_len,
+                "fmri_seq_length": fmri.shape[-1],
             }
             if self.use_meg and hub_meg is not None:
                 decoder_kwargs["hub_meg"] = hub_meg
-                decoder_kwargs["meg_seq_length"] = meg.shape[-1] if meg is not None else 256
-            decoder_out = self.decoder_router(z_next, hub_eeg, hub_fmri, **decoder_kwargs)
-        else:
+                decoder_kwargs["meg_seq_length"] = (
+                    meg.shape[-1] if meg is not None else 256)
+
+        def decode_state(state):
+            if self.use_kda_decoder:
+                return self.decoder_router(
+                    state, hub_eeg, hub_fmri, **decoder_kwargs)
             if self.use_meg and hub_meg is not None:
-                decoder_out = self.decoder_router(z_next, hub_eeg=hub_eeg, hub_fmri=hub_fmri, hub_meg=hub_meg)
-            else:
-                decoder_out = self.decoder_router(z_next, hub_eeg=hub_eeg, hub_fmri=hub_fmri)
+                return self.decoder_router(
+                    state, hub_eeg=hub_eeg, hub_fmri=hub_fmri,
+                    hub_meg=hub_meg)
+            return self.decoder_router(
+                state, hub_eeg=hub_eeg, hub_fmri=hub_fmri)
+
+        states_to_decode = rollout_states if emit_sequences else [z_next]
+        decoder_steps = [decode_state(state) for state in states_to_decode]
+        decoder_out = decoder_steps[-1]
 
         result = {
             "z_global": z_global,
@@ -926,9 +1094,17 @@ class BrainMoEPINN(nn.Module):
             "control_term": vb_out["control_term"],
             "hebbian_weights": self.hebbian_memory.hebbian_weight.W.data,
         }
+        if emit_sequences:
+            for key in ("eeg_recon", "fmri_recon", "meg_recon"):
+                values = [step.get(key) for step in decoder_steps]
+                if values and all(
+                        isinstance(value, torch.Tensor) for value in values):
+                    result[f"{key}_sequence"] = torch.stack(values, dim=1)
         if len(delta_z_seq) > 1:
             # Rollout velocity trace for temporal losses (velocity TV, ks).
             result["delta_z_sequence"] = torch.stack(delta_z_seq, dim=1)
+        if emit_sequences:
+            result["z_next_sequence"] = torch.stack(rollout_states, dim=1)
         if return_all:
             result["states"] = torch.stack(states, dim=1)
             result["control_terms"] = torch.stack(control_terms, dim=1)
@@ -1152,7 +1328,7 @@ class BrainMoEPINN(nn.Module):
         self, batch_size: Optional[int] = None
     ) -> None:
         """Reset per-sequence router and multiscale dynamical memory."""
-        if hasattr(self, "moe_velocity"):
+        if self.moe_velocity is not None:
             self.moe_velocity.reset_router_state(batch_size)
         if hasattr(self, "velocity_brain"):
             self.velocity_brain.step_counter = 0
@@ -1169,7 +1345,7 @@ class BrainMoEPINN(nn.Module):
 
     def reset_router_state(self, batch_size: Optional[int] = None):
         """Reset the SSM router state (e.g., at phase boundaries)."""
-        if hasattr(self, "moe_velocity"):
+        if self.moe_velocity is not None:
             self.moe_velocity.reset_router_state(batch_size)
 
     def get_num_params(self, trainable_only: bool = False) -> Dict[str, int]:
@@ -1180,6 +1356,27 @@ class BrainMoEPINN(nn.Module):
             counts[name] = n
         total = sum(p.numel() for p in self.parameters() if (not trainable_only or p.requires_grad))
         counts["total"] = total
+        return counts
+    def get_dynamics_num_params(self, trainable_only: bool = False) -> Dict[str, int]:
+        """Return parameter counts for the latent dynamics stack only.
+
+        The dynamics stack is the structured ``velocity_brain`` plus the
+        optional ``moe_velocity`` residual that ``_latent_step`` adds to its
+        output. A disabled MoE is reported as zero. Observation encoders,
+        fusion/adapters, decoders, and active-inference helpers are
+        intentionally excluded: they map observations to/from the latent
+        dynamics and are not the species-capacity reference.
+        """
+        counts = {}
+        for name in ("velocity_brain", "moe_velocity"):
+            module = getattr(self, name, None)
+            counts[name] = 0 if module is None else sum(
+                p.numel()
+                for p in module.parameters()
+                if not trainable_only or p.requires_grad
+            )
+        counts["total"] = counts["velocity_brain"] + counts["moe_velocity"]
+        counts["latent_dim"] = int(self.latent_dim)
         return counts
 
 
@@ -1208,6 +1405,7 @@ class BrainMoEPINNConfig:
         use_meg: bool = False,
         use_imagination: bool = False,
         use_generic_moe: bool = False,
+        use_moe: bool = True,
         perturbation_dim: Optional[int] = None,
         eeg_backend: str = "v1",
         use_magi_v2: bool = False,
@@ -1217,9 +1415,12 @@ class BrainMoEPINNConfig:
         moe_num_shared: int = 8,
         moe_num_routed: int = 6,
         moe_top_k: int = 3,
+        poisson_rank: int = 64,
         species: str = "human",
         species_vocab: Optional[List[str]] = None,
         use_species_conditioning: bool = False,
+        use_sensor_emission: bool = False,
+        sensor_specs: Optional[Dict[str, object]] = None,
         generic_observation_only: bool = False,
         initial_context_length: int = 256,
         max_context_length: int = 1024,
@@ -1245,6 +1446,7 @@ class BrainMoEPINNConfig:
         self.use_meg = use_meg
         self.use_imagination = use_imagination
         self.use_generic_moe = use_generic_moe
+        self.use_moe = bool(use_moe)
         self.perturbation_dim = perturbation_dim
         self.eeg_backend = "v2" if use_magi_v2 else eeg_backend
         self.use_magi_v2 = use_magi_v2
@@ -1254,9 +1456,12 @@ class BrainMoEPINNConfig:
         self.moe_num_shared = moe_num_shared
         self.moe_num_routed = moe_num_routed
         self.moe_top_k = moe_top_k
+        self.poisson_rank = int(poisson_rank)
         self.species = species
         self.species_vocab = tuple(species_vocab or SUPPORTED_SPECIES)
         self.use_species_conditioning = use_species_conditioning
+        self.use_sensor_emission = bool(use_sensor_emission)
+        self.sensor_specs = dict(sensor_specs or {})
         self.generic_observation_only = generic_observation_only
         self.initial_context_length = initial_context_length
         self.max_context_length = max_context_length
@@ -1280,16 +1485,22 @@ class BrainMoEPINNConfig:
             use_meg=features.use_meg,
             use_imagination=features.use_imagination,
             use_generic_moe=features.use_generic_moe,
+            use_moe=features.use_moe,
             perturbation_dim=features.perturbation_dim,
             eeg_backend=features.eeg_backend,
             use_channel_type_embed=features.use_channel_type_embed,
             moe_num_shared=features.moe_num_shared,
             moe_num_routed=features.moe_num_routed,
             moe_top_k=features.moe_top_k,
+            poisson_rank=features.poisson_rank,
             generic_observation_only=features.use_generic_observation_adapter,
             species=config.species,
             species_vocab=list(config.species_vocab),
             use_species_conditioning=features.use_species_conditioning,
+            use_sensor_emission=getattr(features, "use_sensor_emission", False),
+            sensor_specs=(
+                {m: s for m, s in config.sensor_specs().items()}
+                if hasattr(config, "sensor_specs") else None),
             max_channels=config.data.max_channels,
             initial_context_length=config.training.initial_context_length,
             max_context_length=config.training.max_context_length,
@@ -1324,6 +1535,7 @@ class BrainMoEPINNConfig:
             use_meg=self.use_meg,
             use_imagination=self.use_imagination,
             use_generic_moe=self.use_generic_moe,
+            use_moe=self.use_moe,
             perturbation_dim=self.perturbation_dim,
             eeg_backend=self.eeg_backend,
             use_channel_type_embed=self.use_channel_type_embed,
@@ -1332,6 +1544,7 @@ class BrainMoEPINNConfig:
             moe_num_shared=self.moe_num_shared,
             moe_num_routed=self.moe_num_routed,
             moe_top_k=self.moe_top_k,
+            poisson_rank=self.poisson_rank,
             generic_observation_only=self.generic_observation_only,
             initial_context_length=self.initial_context_length,
             max_context_length=self.max_context_length,
@@ -1339,6 +1552,8 @@ class BrainMoEPINNConfig:
             species=self.species,
             species_vocab=list(self.species_vocab),
             use_species_conditioning=self.use_species_conditioning,
+            use_sensor_emission=self.use_sensor_emission,
+            sensor_specs=self.sensor_specs,
         )
 
 

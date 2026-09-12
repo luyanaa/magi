@@ -14,7 +14,7 @@ import sys
 import json
 import time
 from pathlib import Path
-from typing import Dict, Optional, List, Tuple, Any
+from typing import Dict, Optional, List, Tuple, Any, Mapping
 import math
 
 import torch
@@ -51,7 +51,7 @@ except ImportError:
 
 from .stability import StabilityController, AutoRollback, QFactorMonitor, AtaxiaCatalepsyMonitor
 from .losses import TotalLoss
-from .training_phases import LossWeights
+from .training_phases import LossWeights, evaluate_transition_gate
 
 try:
     from brain_moe_pinn.config import SUPPORTED_MODALITIES, SPECIES_PROFILES
@@ -201,11 +201,13 @@ def reduce_control(
     """Reduce windowed control ``(B, U, T)`` to per-step perturbation.
 
     - ``resample`` (default): ``rollout_steps`` segment means -> ``(B, K, U)``
-      for per-latent-step conditioning.  With ``rollout_steps == 1`` this is a
-      single window mean, identical to ``mean``.
+      for per-latent-step conditioning.  With ``rollout_steps == 1`` this is
+      a single window mean, identical to ``mean``.
+    - ``peak``/``max``: segment maxima -> ``(B, K, U)``.  Use this for sparse
+      optogenetic pulses when a segment mean would dilute the intervention.
     - ``mean``: one control vector per window, collapsing all within-window
-      timing.  A salt step, a grating onset, or an event time is reduced to its
-      window average, so the model can no longer see when the stimulus
+      timing.  A salt step, a grating onset, or an event time is reduced to
+      the window average, so the model can no longer see when the stimulus
       happened — keep this only for genuinely stationary controls.
     - ``last``: last frame in the window.
     """
@@ -213,6 +215,10 @@ def reduce_control(
         return control
     if reduction == "last":
         return control[..., -1]
+    if reduction in {"peak", "max"}:
+        steps = max(1, int(rollout_steps))
+        pooled = torch.nn.functional.adaptive_max_pool1d(control, steps)
+        return pooled.permute(0, 2, 1).contiguous()  # (B, K, U)
     if reduction == "resample":
         steps = max(1, int(rollout_steps))
         pooled = torch.nn.functional.adaptive_avg_pool1d(control, steps)
@@ -236,6 +242,37 @@ def _resize_temporal(
     return padded.bool() if is_mask else padded
 
 
+def masked_channel_correlation(
+    prediction: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None
+) -> float:
+    """Mean per-channel Pearson correlation over valid frames.
+
+    Same estimator the correlation reconstruction loss uses, so a trivial
+    baseline and a model score are directly comparable.
+    """
+    if prediction.shape != target.shape:
+        raise ValueError("prediction and target must share a shape")
+    if prediction.dim() == 3:
+        pred, tgt = prediction, target
+    elif prediction.dim() == 2:
+        pred, tgt = prediction.unsqueeze(0), target.unsqueeze(0)
+    else:
+        raise ValueError("expected (B, C, T) or (C, T) tensors")
+    valid = (torch.ones_like(pred, dtype=torch.bool) if mask is None
+             else mask.bool())
+    if valid.dim() == 2:
+        valid = valid.unsqueeze(0)
+    valid = valid.reshape(pred.shape)
+    count = valid.sum(dim=-1, keepdim=True).clamp_min(1)
+    pred_c = pred - (pred * valid).sum(dim=-1, keepdim=True) / count
+    tgt_c = tgt - (tgt * valid).sum(dim=-1, keepdim=True) / count
+    num = (pred_c * tgt_c * valid).sum(dim=-1)
+    den = (((pred_c ** 2) * valid).sum(dim=-1)
+           * ((tgt_c ** 2) * valid).sum(dim=-1)).clamp_min(1e-12).sqrt()
+    rho = (num / den)[count.squeeze(-1) >= 2]
+    return float(rho.detach().mean()) if rho.numel() else 0.0
+
+
 def partition_generic_batch(
     batch,
     signal_modalities,
@@ -245,6 +282,7 @@ def partition_generic_batch(
     control_reduction: str = "resample",
     rollout_steps: int = 1,
     require_future_targets: bool = False,
+    require_multi_horizon: bool = False,
 ):
     """Split a loader batch into current signals, future targets, and control."""
     moved = {
@@ -259,8 +297,36 @@ def partition_generic_batch(
         if modality in moved and modality not in control_modalities
     }
     targets = {}
+    expected_horizons = max(1, int(rollout_steps))
     for modality in recon_modalities:
         if modality not in signals:
+            continue
+        future_key = f"{modality}_future"
+        if future_key in moved:
+            future = moved[future_key]
+            if future.dim() != 4:
+                raise ValueError(
+                    f"{future_key} must have shape (B,K,C,T)")
+            if future.shape[1] != max(1, int(rollout_steps)):
+                raise ValueError(
+                    f"{future_key} provides {future.shape[1]} horizons but "
+                    f"rollout_steps={rollout_steps}")
+            targets[modality] = future
+            future_mask_key = f"{modality}_future_mask"
+            if future_mask_key in moved:
+                targets[f"{modality}_mask"] = moved[future_mask_key]
+            continue
+        horizon_keys = [
+            f"{modality}_next_{horizon}"
+            for horizon in range(1, max(1, int(rollout_steps)) + 1)
+        ]
+        if len(horizon_keys) > 1 and all(key in moved for key in horizon_keys):
+            targets[modality] = torch.stack(
+                [moved[key] for key in horizon_keys], dim=1)
+            masks = [
+                moved.get(f"{key}_mask") for key in horizon_keys]
+            if all(mask is not None for mask in masks):
+                targets[f"{modality}_mask"] = torch.stack(masks, dim=1)
             continue
         future_key = f"{modality}_next"
         alternate_future_key = f"next_{modality}"
@@ -282,11 +348,27 @@ def partition_generic_batch(
                 f"missing future target for modality {modality!r}; "
                 "enable the dataset next-step target contract")
         else:
-            # Legacy callers may still request an observation-only objective.
             targets[modality] = signals[modality]
             mask_key = f"{modality}_mask"
             if mask_key in moved:
                 targets[mask_key] = moved[mask_key]
+        if require_multi_horizon and expected_horizons > 1:
+            target = targets.get(modality)
+            if not isinstance(target, torch.Tensor) or target.dim() != 4:
+                raise ValueError(
+                    f"multi-horizon rollout requires {modality}_future or "
+                    f"{expected_horizons} explicit horizon targets")
+    for label_key in ("cross_modal_labels", "cross_modal_label"):
+        if label_key in moved:
+            targets["cross_modal_labels"] = moved[label_key]
+            break
+    for key in (
+            "intervention_target",
+            "intervention_mask",
+            "action_utility_target",
+            "replay_target"):
+        if key in moved:
+            targets[key] = moved[key]
     perturbation = None
     control_parts = [moved[m] for m in control_modalities if m in moved]
     if control_parts:
@@ -296,31 +378,79 @@ def partition_generic_batch(
     return signals, targets, perturbation
 
 
+def control_diagnostics(
+    control: torch.Tensor, reduction: str = "resample", rollout_steps: int = 1
+) -> Dict[str, float]:
+    """Health metrics for a windowed control track ``(B, U, T)``.
+
+    Two failure modes are common enough to be measured rather than assumed:
+
+    * ``control_active_frac`` -- windows with no stimulus at all (a recording's
+      pre-stimulus baseline is a legitimate sample, but the model cannot tell
+      "no stimulus" from "a stimulus whose window mean is zero").
+    * ``control_collapse_ratio`` -- ``|window mean| / within-window std``. With
+      ``rollout_steps == 1`` the reduction is the window mean, so a *zero-mean
+      alternating* drive (a salt cycle: +30 s / -30 s) collapses to ~0 and the
+      model receives no control information at all. Near 1 means the surviving
+      mean carries the signal; near 0 means the timing was discarded.
+    """
+    if not isinstance(control, torch.Tensor) or control.dim() != 3:
+        return {}
+    with torch.no_grad():
+        per_sample_active = (control.abs().sum(dim=1) > 0).float().mean()
+        std = control.std(dim=-1).clamp_min(1e-12)
+        # What the model actually receives: the reduction's output.
+        delivered = reduce_control(control, reduction, rollout_steps)
+        # Magnitude of what each sample actually delivers, per segment: the
+        # segments must NOT be averaged together, or an alternating drive whose
+        # signs cancel would look identical to a genuinely lost drive.
+        delivered = delivered.reshape(control.shape[0], -1)
+        per_sample = delivered.abs().mean(dim=-1)
+        collapse = per_sample / std.mean(dim=-1)
+        return {
+            "control_active_frac": float(per_sample_active),
+            "control_collapse_ratio": float(collapse.mean()),
+            "control_abs_mean": float(per_sample.mean()),
+            "control_within_window_std": float(std.mean()),
+        }
+
+
 def augment_phase_loss_weights(
     weights,
     recon_modalities,
     recon_loss_types: Optional[Dict[str, str]] = None,
 ):
-    """Return a copy of ``weights`` with species reconstruction terms enabled.
+    """Enable supported generic terms without hiding unsupported objectives.
 
-    Every modality in ``recon_modalities`` gets ``recon_extra[modality]``
-    (default weight 1.0, phase values win) and a default criterion from
-    ``recon_loss_types`` unless the phase already selected one. Generic
-    (non-EEG) runs therefore receive their primary supervised signal without
-    editing the shared phase tables.
+    Generic species models do not emit standard EEG/fMRI hubs or the latent
+    HRF bridge, so cross-modal objectives are explicitly disabled rather than
+    silently skipped.  Policy terms remain user-controlled and are validated
+    per batch by ``TotalLoss``.
     """
     from dataclasses import replace
     extras = dict(getattr(weights, "recon_extra", {}) or {})
     types = dict(getattr(weights, "recon_loss_types", {}) or {})
     changed = False
+    dedicated = {"eeg", "fmri", "meg"}
     for modality in recon_modalities:
+        if modality in dedicated:
+            continue
         if modality not in extras:
             extras[modality] = 1.0
             changed = True
     for modality, criterion in (recon_loss_types or {}).items():
-        if modality in recon_modalities and modality not in types:
+        if (modality in recon_modalities and modality not in dedicated
+                and modality not in types):
             types[modality] = criterion
             changed = True
+    structural = {
+        field: getattr(weights, field, 0.0)
+        for field in ("cross_modal", "cross", "cross_soft")
+    }
+    if any(value > 0 for value in structural.values()):
+        changed = True
+        weights = replace(
+            weights, cross_modal=0.0, cross=0.0, cross_soft=0.0)
     if not changed:
         return weights
     return replace(weights, recon_extra=extras, recon_loss_types=types)
@@ -570,6 +700,9 @@ class BrainMoETrainer:
                 "paired_next_step_targets",
                 experiment.get("require_next_step_targets",
                             config.get("require_next_step_targets", False))))
+        self._forecast_enabled = False
+        self.future_steps = max(1, int(
+            experiment.get("future_steps", config.get("future_steps", 1))))
         self.generic_channels = int(config.get("generic_channels", 64))
         self.generic_time = int(config.get("generic_time", 256))
         self.recon_max_channels = int(config.get("recon_max_channels", 2048))
@@ -583,6 +716,10 @@ class BrainMoETrainer:
         self.control_modalities = tuple(control_modalities)
         self.control_reduction = str(
             config.get("control_reduction", "resample"))
+        # A species/data profile may pin the rollout length (e.g. two 30 s
+        # substeps inside a 60 s salt window); the phase table is the default.
+        override = config.get("rollout_steps")
+        self._rollout_steps_override = int(override) if override else None
         self._perturbation_warned = False
         self.model_use_meg = bool(getattr(model_ref, "use_meg", False))
         self._meg_recon_enabled = False
@@ -592,6 +729,26 @@ class BrainMoETrainer:
                   f"criteria={self.recon_loss_types}")
 
         self.ds_engine = None
+        self.magi_pretraining = None
+        if config.get("magi_pretraining_enabled", False):
+            target_model = (
+                self.model.module
+                if hasattr(self.model, "module") else self.model)
+            eeg_wrapper = getattr(target_model, "eeg_encoder", None)
+            base_encoder = getattr(eeg_wrapper, "encoder", None)
+            from ..magi.pretraining import MagiPretrainingObjective
+            self.magi_pretraining = MagiPretrainingObjective(
+                base_encoder,
+                mask_ratio=float(config.get("magi_mask_ratio", 0.75)),
+                momentum=float(config.get("magi_momentum", 0.999)),
+                projection_dim=int(config.get("magi_projection_dim", 256)),
+                temperature=float(config.get("magi_temperature", 0.2)),
+            ).to(self.device)
+            # Register objective heads/EMA state on the canonical model before
+            # DDP/DeepSpeed initialization so their parameters are optimized
+            # and saved with the production encoder checkpoint.
+            target_model.magi_pretraining_objective = self.magi_pretraining
+
         self.ds_config = None
         self.optimizer = None
         self.scaler = None
@@ -608,7 +765,10 @@ class BrainMoETrainer:
         else:
             self.ds_config = None
             if self.world_size > 1 and dist.is_initialized():
-                self.model = DDP(self.model, device_ids=[self.local_rank])
+                self.model = DDP(
+                    self.model, device_ids=[self.local_rank],
+                    find_unused_parameters=bool(
+                        config.get("magi_pretraining_enabled", False)))
             self.optimizer = None
             self.scaler = grad_scaler(
                 self.device, enabled=True,
@@ -669,6 +829,7 @@ class BrainMoETrainer:
         self._standard_targets: Dict[str, torch.Tensor] = {}
         self._standard_target_masks: Dict[str, torch.Tensor] = {}
         self._standard_signal_masks: Dict[str, torch.Tensor] = {}
+        self._standard_contract_targets: Dict[str, torch.Tensor] = {}
         self._generic_batch_tensors: Dict[str, torch.Tensor] = {}
         self._generic_signal_masks: Dict[str, torch.Tensor] = {}
 
@@ -1011,10 +1172,13 @@ class BrainMoETrainer:
         return checkpoint["step"], checkpoint["phase"]
 
     def _capture_standard_batch(self, batch: Any) -> None:
-        """Store masks and explicit future targets from a loader batch."""
+        """Store masks and explicit future/auxiliary targets."""
         self._standard_targets = {}
         self._standard_target_masks = {}
         self._standard_signal_masks = {}
+        self._standard_contract_targets = {}
+        self._standard_perturbation = None
+        self._standard_baseline_perturbation = None
         if not isinstance(batch, dict):
             return
         for modality in ("eeg", "fmri", "meg"):
@@ -1024,18 +1188,41 @@ class BrainMoETrainer:
                 if isinstance(mask, torch.Tensor):
                     self._standard_signal_masks[modality] = move_to_device(
                         mask, self.device)
-            future = batch.get(
-                f"{modality}_next", batch.get(f"next_{modality}"))
+            future = batch.get(f"{modality}_future")
+            future_mask = batch.get(f"{modality}_future_mask")
+            if not isinstance(future, torch.Tensor):
+                future = batch.get(
+                    f"{modality}_next", batch.get(f"next_{modality}"))
+                future_mask = batch.get(
+                    f"{modality}_next_mask",
+                    batch.get(f"next_{modality}_mask"))
             if isinstance(future, torch.Tensor):
                 self._standard_targets[modality] = move_to_device(
                     future, self.device)
-                mask = batch.get(
-                    f"{modality}_next_mask",
-                    batch.get(f"next_{modality}_mask"))
-                if isinstance(mask, torch.Tensor):
+                if isinstance(future_mask, torch.Tensor):
                     self._standard_target_masks[modality] = move_to_device(
-                        mask, self.device)
+                        future_mask, self.device)
 
+        for key in (
+                "cross_modal_labels",
+                "intervention_target",
+                "intervention_baseline",
+                "intervention_mask",
+                "action_utility_target",
+                "replay_target"):
+            value = batch.get(key)
+            if isinstance(value, torch.Tensor):
+                self._standard_contract_targets[key] = move_to_device(
+                    value, self.device)
+        perturbation = batch.get("perturbation")
+        baseline = batch.get(
+            "baseline_perturbation", batch.get("intervention_baseline"))
+        if isinstance(perturbation, torch.Tensor):
+            self._standard_perturbation = move_to_device(
+                perturbation, self.device)
+        if isinstance(baseline, torch.Tensor):
+            self._standard_baseline_perturbation = move_to_device(
+                baseline, self.device)
     def _get_batch(self, batch_size: int, step: int = 0, total_steps: int = 1):
         """Get a standard batch and capture its supervision contract."""
         self._capture_standard_batch(None)
@@ -1127,13 +1314,18 @@ class BrainMoETrainer:
                 except StopIteration:
                     batch = None
             if isinstance(batch, dict):
+                batch_values = {}
+                for key, value in batch.items():
+                    if isinstance(value, torch.Tensor):
+                        batch_values[key] = move_to_device(value, self.device)
+                    elif key in {"dt", "species", "sample_rate_hz", "rate_hz"}:
+                        batch_values[key] = value
                 tensors = {
-                    key: move_to_device(value, self.device)
-                    for key, value in batch.items()
+                    key: value for key, value in batch_values.items()
                     if isinstance(value, torch.Tensor)
                 }
                 if tensors:
-                    self._generic_batch_tensors = tensors
+                    self._generic_batch_tensors = batch_values
                     self._generic_signal_masks = {
                         m: tensors[f"{m}_mask"]
                         for m in self.signal_modalities
@@ -1166,6 +1358,74 @@ class BrainMoETrainer:
             return None
         return perturbation
 
+    def _forward_intervention_baseline(
+        self,
+        model,
+        *,
+        signals,
+        dummy_eeg,
+        dummy_fmri,
+        dummy_meg,
+        actual_eeg,
+        actual_fmri,
+        actual_meg,
+        signal_masks,
+        rollout_steps,
+        perturbation,
+        cross_modal_labels=None,
+    ):
+        """Run the matched baseline control for response supervision."""
+        if self.generic_model:
+            return model.forward_modalities(
+                signals,
+                masks=signal_masks,
+                num_steps=rollout_steps,
+                return_sequences=rollout_steps > 1,
+                reconstruct=True,
+                recon_max_channels=self.recon_max_channels,
+                perturbation=perturbation,
+                **self._generic_step_kwargs(self._generic_batch_tensors))
+        return model(
+            dummy_eeg,
+            dummy_fmri,
+            meg=dummy_meg,
+            actual_eeg=actual_eeg,
+            actual_fmri=actual_fmri,
+            actual_meg=actual_meg,
+            masks=signal_masks,
+            action=None,
+            perturbation=perturbation,
+            mode=("forecast" if rollout_steps > 1 else "perception"),
+            num_steps=rollout_steps,
+            return_sequences=rollout_steps > 1,
+            cross_modal_labels=cross_modal_labels,
+        )
+
+    @staticmethod
+    def _attach_intervention_effect(
+        outputs: Dict[str, torch.Tensor],
+        baseline_outputs: Dict[str, torch.Tensor],
+        target: torch.Tensor,
+    ) -> None:
+        """Attach treated-minus-baseline latent response with strict shapes."""
+        if target.dim() == 3:
+            state_key = "z_next_sequence"
+        elif target.dim() == 2:
+            state_key = "z_next"
+        else:
+            raise ValueError(
+                "intervention_target must have shape (B,D) or (B,K,D)")
+        treated = outputs.get(state_key)
+        baseline = baseline_outputs.get(state_key)
+        if treated is None or baseline is None:
+            raise ValueError(
+                f"intervention response requires {state_key} from both "
+                "treated and baseline rollouts")
+        if treated.shape != baseline.shape or treated.shape != target.shape:
+            raise ValueError(
+                "intervention_target must match treated-minus-baseline "
+                f"{state_key} shape")
+        outputs["intervention_effect"] = treated - baseline
     def _enable_meg_recon(self) -> None:
         """Enable the recon_meg weight once real MEG batches are present.
 
@@ -1188,13 +1448,51 @@ class BrainMoETrainer:
         raw_targets: Dict[str, torch.Tensor],
         raw_masks: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Align future targets and validity masks to decoder outputs."""
+        """Align current or multi-horizon targets to decoder time grids."""
         raw_masks = raw_masks or {}
         targets = {}
         for modality, raw in raw_targets.items():
             prediction = outputs.get(f"{modality}_recon")
+            sequence_prediction = outputs.get(
+                f"{modality}_recon_sequence")
             if prediction is None:
                 continue
+            mask = raw_masks.get(modality)
+            if raw.dim() == 4:
+                if sequence_prediction is not None:
+                    if sequence_prediction.dim() != 4:
+                        raise ValueError(
+                            f"{modality} forecast output must be rank 4")
+                    if raw.shape[:3] != sequence_prediction.shape[:3]:
+                        raise ValueError(
+                            f"{modality} forecast target/output shapes do "
+                            f"not match: {tuple(raw.shape)} vs "
+                            f"{tuple(sequence_prediction.shape)}")
+                    raw = torch.stack([
+                        _resize_temporal(
+                            raw[:, horizon],
+                            sequence_prediction.shape[-1])
+                        for horizon in range(raw.shape[1])
+                    ], dim=1)
+                    if mask is not None:
+                        if mask.shape[:3] != sequence_prediction.shape[:3]:
+                            raise ValueError(
+                                f"{modality} forecast mask shape does not "
+                                "match decoder sequence")
+                        mask = torch.stack([
+                            _resize_temporal(
+                                mask[:, horizon],
+                                sequence_prediction.shape[-1],
+                                is_mask=True)
+                            for horizon in range(mask.shape[1])
+                        ], dim=1)
+                    targets[modality] = raw
+                    if mask is not None:
+                        targets[f"{modality}_mask"] = mask
+                    continue
+                raw = raw[:, -1]
+                if mask is not None:
+                    mask = mask[:, -1]
             if raw.dim() != 3 or prediction.dim() != 3:
                 raise ValueError(
                     f"{modality} reconstruction requires rank-3 tensors")
@@ -1204,36 +1502,505 @@ class BrainMoETrainer:
                     f"{tuple(raw.shape)} vs {tuple(prediction.shape)}")
             targets[modality] = _resize_temporal(
                 raw, prediction.shape[-1])
-            mask = raw_masks.get(modality)
             if mask is not None:
                 if mask.shape[:2] != prediction.shape[:2]:
                     raise ValueError(
                         f"{modality} target mask channels do not match decoder")
                 targets[f"{modality}_mask"] = _resize_temporal(
                     mask, prediction.shape[-1], is_mask=True)
+        for key in (
+                "cross_modal_labels",
+                "intervention_target",
+                "intervention_baseline",
+                "intervention_mask",
+                "action_utility_target",
+                "replay_target"):
+            if key in raw_targets:
+                targets[key] = raw_targets[key]
         return targets
 
     def _standard_raw_targets(
         self, eeg: torch.Tensor, fmri: torch.Tensor,
         meg: Optional[torch.Tensor],
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        """Return future targets when supplied, otherwise legacy current data."""
+        """Return validated future targets or legacy current observations."""
         fallback = {"eeg": eeg, "fmri": fmri}
         if meg is not None:
             fallback["meg"] = meg
-        targets = {
-            modality: self._standard_targets.get(modality, value)
-            for modality, value in fallback.items()
-        }
+        targets = {}
+        for modality, value in fallback.items():
+            target = self._standard_targets.get(modality, value)
+            if target.dim() == 4:
+                expected = max(1, int(getattr(
+                    self, "_rollout_steps", self.future_steps)))
+                if target.shape[1] != expected:
+                    raise ValueError(
+                        f"{modality} future target has {target.shape[1]} "
+                        f"horizons but rollout_steps={expected}")
+            elif getattr(self, "_forecast_enabled", False):
+                raise ValueError(
+                    f"multi-horizon forecast requires {modality}_future with "
+                    f"{getattr(self, '_rollout_steps', 1)} horizons")
+            targets[modality] = target
         return targets, dict(self._standard_target_masks)
 
-    def train_phase(self, phase_config: Dict, start_step: int = 0):
-        """Train for one phase."""
+    @staticmethod
+    def _batch_frame_dt(batch: Dict[str, Any]) -> Optional[float]:
+        """Median sampling interval (seconds per frame) of a collated batch.
+
+        Metrics that convert frame lags to seconds must use the recording's
+        own interval; using a global `latent_dt` silently reports another
+        species' (or another stage's) clock.
+        """
+        values = batch.get("dt") if isinstance(batch, dict) else None
+        if isinstance(values, (list, tuple)) and values:
+            finite = [float(v) for v in values
+                      if v is not None and float(v) > 0]
+            if finite:
+                return float(sorted(finite)[len(finite) // 2])
+        if isinstance(values, torch.Tensor) and values.numel():
+            finite = values.detach().flatten().float()
+            finite = finite[finite > 0]
+            if finite.numel():
+                return float(finite.median())
+        return None
+
+    def _generic_control_metrics(self, tensors: Optional[Dict[str, Any]] = None
+                                 ) -> Dict[str, float]:
+        """Control health for the live batch, with a one-time warning.
+
+        A zero-mean alternating drive (salt +/- half-cycles) inside one window
+        reduces to ~0 under the default window-mean reduction, so the control
+        input silently disappears; say so once instead of training blind.
+        """
+        tensors = self._generic_batch_tensors if tensors is None else tensors
+        metrics: Dict[str, float] = {}
+        reduction = getattr(self, "control_reduction", "resample")
+        for modality in getattr(self, "control_modalities", ()) or ():
+            track = tensors.get(modality)
+            if not isinstance(track, torch.Tensor) or track.dim() != 3:
+                continue
+            stats = control_diagnostics(track, reduction,
+                                        getattr(self, "_rollout_steps", 1))
+            metrics.update({f"{modality}_{k}": v for k, v in stats.items()})
+            if (not getattr(self, "_control_warned", False)
+                    and reduction == "resample"
+                    and int(getattr(self, "_rollout_steps", 1)) == 1
+                    and stats.get("control_active_frac", 0.0) > 0.0
+                    and stats.get("control_collapse_ratio", 1.0) < 0.1):
+                self._control_warned = True
+                print(
+                    f"[Control] '{modality}': with rollout_steps=1 the window "
+                    f"mean is the only control the model sees "
+                    f"(collapse ratio "
+                    f"{stats.get('control_collapse_ratio', 0.0):.3f}, "
+                    f"active {stats.get('control_active_frac', 0.0):.2f}). "
+                    f"For an alternating drive use "
+                    f"control_reduction=\"last\" or rollout_steps>1, "
+                    f"otherwise the stimulus timing is discarded.")
+        return metrics
+
+    def _generic_step_kwargs(self, tensors: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Physics/species kwargs for one generic forward from the live batch.
+
+        One latent step advances one *window*, so its physical duration in
+        seconds is ``frames_per_window * dt_row``: the sampling interval comes
+        from the manifest per sample (worms are imaged at 3.69-5.72 Hz), not
+        from a global constant. Passing it makes the MT-KDA/OU time constants
+        mean seconds for whatever rate the batch carries, and the per-sample
+        species tags keep replay batches from being conditioned as the stage
+        species.
+        """
+        tensors = self._generic_batch_tensors if tensors is None else tensors
+        kwargs: Dict[str, Any] = {}
+        frame_counts = None
+        for modality, value in tensors.items():
+            if not isinstance(value, torch.Tensor) or value.dim() != 3:
+                continue
+            mask = tensors.get(f"{modality}_mask")
+            if isinstance(mask, torch.Tensor) and mask.shape == value.shape:
+                # Collapse channels first: frame_counts must be one value per
+                # sample, not one value per channel.
+                valid_frames = mask.detach().to(value.device).bool().any(dim=1)
+                frame_counts = valid_frames.sum(dim=-1).clamp_min(1)
+            else:
+                frame_counts = torch.full(
+                    (value.shape[0],), float(value.shape[-1]),
+                    device=value.device)
+            break
+        dt_values = tensors.get("dt")
+        if frame_counts is not None and dt_values is not None:
+            try:
+                if isinstance(dt_values, torch.Tensor):
+                    per_sample = dt_values.detach().flatten().to(self.device).float()
+                elif isinstance(dt_values, (list, tuple)):
+                    per_sample = torch.tensor(
+                        [float(v) for v in dt_values], device=self.device)
+                else:
+                    per_sample = torch.tensor(
+                        [float(dt_values)], device=self.device)
+            except (TypeError, ValueError):
+                per_sample = None
+            if per_sample is not None and per_sample.numel() == 1:
+                per_sample = per_sample.expand(frame_counts.shape[0])
+            if (per_sample is not None
+                    and per_sample.numel() == frame_counts.numel()
+                    and torch.isfinite(per_sample).all()
+                    and bool((per_sample > 0).all())):
+                kwargs["dt"] = per_sample * frame_counts.to(per_sample.dtype)
+                kwargs["frame_dt"] = per_sample
+                if int(getattr(self, "_rollout_steps", 1)) > 1:
+                    kwargs["step_dt"] = kwargs["dt"]
+        species_tags = tensors.get("species")
+        if isinstance(species_tags, (list, tuple)) and species_tags:
+            kwargs["species_names"] = [str(tag) for tag in species_tags]
+        return kwargs
+
+    @staticmethod
+    def _validate_runtime_phase(phase_config: Mapping[str, Any]) -> None:
+        """Reject legacy dataclass/partial phase objects at the boundary."""
+        if not isinstance(phase_config, Mapping):
+            raise TypeError(
+                "BrainMoETrainer requires a normalized phase mapping; call "
+                "TrainingPhase.to_runtime_config() first")
+        required = {
+            "name", "stage", "task", "total_steps", "learning_rate",
+            "loss_weights", "freeze_policy", "rollout", "context",
+            "transition_gate",
+        }
+        missing = sorted(required - set(phase_config))
+        if missing:
+            raise ValueError(
+                "phase runtime mapping is missing required fields: "
+                + ", ".join(missing))
+        if not isinstance(phase_config["freeze_policy"], Mapping):
+            raise TypeError("phase freeze_policy must be a mapping")
+        if not isinstance(phase_config["rollout"], Mapping):
+            raise TypeError("phase rollout settings must be a mapping")
+        if not isinstance(phase_config["context"], Mapping):
+            raise TypeError("phase context settings must be a mapping")
+        if int(phase_config.get("gradient_accumulation", 1)) < 1:
+            raise ValueError("phase gradient_accumulation must be positive")
+
+        if phase_config["task"] not in {
+                "model_training", "magi_eeg_pretraining"}:
+            raise ValueError(
+                f"unsupported phase task: {phase_config['task']!r}")
+
+    def _apply_freeze_policy(self, policy: Mapping[str, Any]) -> None:
+        """Apply the phase's explicit freeze policy before optimizer creation."""
+        if not isinstance(policy, Mapping):
+            raise TypeError("freeze policy must be a mapping")
+        model = self.ds_engine if self.ds_engine is not None else self.model
+        target = model.module if hasattr(model, "module") else model
+
+        def set_frozen(component, frozen: bool) -> None:
+            if component is None:
+                return
+            setter = getattr(component, "set_freeze", None)
+            if callable(setter):
+                setter(bool(frozen))
+                return
+            for parameter in component.parameters():
+                parameter.requires_grad = not frozen
+
+        components = {
+            "eeg_encoder": getattr(target, "eeg_encoder", None),
+            "fmri_encoder": getattr(target, "fmri_encoder", None),
+            "decoder": getattr(
+                target, "decoder", getattr(target, "decoder_router", None)),
+        }
+        for name, component in components.items():
+            if name in policy:
+                set_frozen(component, bool(policy[name]))
+        router = getattr(getattr(target, "moe_velocity", None), "router", None)
+        if "moe_router" in policy:
+            set_frozen(router, bool(policy["moe_router"]))
+        self._active_freeze_policy = dict(policy)
+
+    def _apply_timed_freeze_policy(
+        self,
+        policy: Mapping[str, Any],
+        elapsed_steps: int,
+        steps_per_epoch: int,
+    ) -> bool:
+        """Thaw frozen components at their configured phase-local epoch."""
+        model = self.ds_engine if self.ds_engine is not None else self.model
+        target = model.module if hasattr(model, "module") else model
+        components = {
+            "eeg_encoder": getattr(target, "eeg_encoder", None),
+            "fmri_encoder": getattr(target, "fmri_encoder", None),
+        }
+        changed = False
+        thawed = getattr(self, "_phase_thawed_components", set())
+        for name, component in components.items():
+            if not policy.get(name, False) or name in thawed or component is None:
+                continue
+            epochs_key = (
+                "eeg_epochs_thawed" if name == "eeg_encoder"
+                else "fmri_epochs_thawed")
+            thaw_step = max(0, int(policy.get(epochs_key, 1))) * max(
+                1, int(steps_per_epoch))
+            if elapsed_steps < thaw_step:
+                continue
+            setter = getattr(component, "set_freeze", None)
+            if callable(setter):
+                setter(False)
+            else:
+                for parameter in component.parameters():
+                    parameter.requires_grad = True
+            thawed.add(name)
+            changed = True
+        self._phase_thawed_components = thawed
+        return changed
+
+    def _validate_context_settings(self, phase_config: Mapping[str, Any]) -> None:
+        schedule = phase_config.get("context_expansion_schedule")
+        context = phase_config.get("context", {})
+        if schedule is None:
+            schedule = context.get("expansion_schedule")
+        if schedule is None:
+            return
+        schedule = list(schedule)
+        steps = []
+        for entry in schedule:
+            if not isinstance(entry, (tuple, list)) or len(entry) != 2:
+                raise ValueError("context expansion entries must be (step, length)")
+            step, length = map(int, entry)
+            if step < 0 or length < 1:
+                raise ValueError("context expansion entries must be non-negative")
+            steps.append(step)
+        if steps != sorted(steps):
+            raise ValueError("context expansion schedule must be ordered")
+        model = self.ds_engine if self.ds_engine is not None else self.model
+        target = model.module if hasattr(model, "module") else model
+        if not callable(getattr(target, "set_context_length", None)):
+            raise NotImplementedError(
+                "phase requests context expansion, but the model does not "
+                "implement set_context_length()")
+
+    def _apply_phase_context(self, phase_config: Mapping[str, Any]) -> None:
+        """Apply non-scheduled context declarations instead of ignoring them."""
+        requested = phase_config.get("base_context")
+        if requested is None:
+            sequence_length = phase_config.get("max_seq_len_eeg")
+            if sequence_length is not None and int(sequence_length) != 2560:
+                requested = int(sequence_length)
+        if requested is None:
+            return
+        model = self.ds_engine if self.ds_engine is not None else self.model
+        target = model.module if hasattr(model, "module") else model
+        setter = getattr(target, "set_context_length", None)
+        if not callable(setter):
+            raise NotImplementedError(
+                f"phase '{phase_config['name']}' declares context length "
+                f"{requested}, but the model does not implement "
+                "set_context_length()")
+        setter(int(requested))
+        self._current_context_length = int(requested)
+
+    def _train_magi_pretraining(
+        self,
+        phase_config: Mapping[str, Any],
+        start_step: int = 0,
+    ) -> int:
+        """Run Magi self-supervision against the production EEG encoder."""
+        if self.magi_pretraining is None:
+            raise RuntimeError(
+                "Magi pretraining was requested without an initialized Magi "
+                "objective; use the v2 EEG backend")
+        if self.train_dataloader is None:
+            raise ValueError(
+                "Magi EEG pretraining requires a real train dataloader")
+
+        self.reset_loss_normalizer()
+        self._validate_context_settings(phase_config)
+        self._apply_freeze_policy(phase_config["freeze_policy"])
+        total_steps = int(phase_config.get("total_steps", 10000))
+        warmup_steps = int(phase_config.get("warmup_steps", 500))
+        gradient_accumulation = int(
+            phase_config.get("gradient_accumulation", 1))
+        if gradient_accumulation != 1:
+            raise ValueError(
+                "Magi pretraining currently requires gradient_accumulation=1")
+
+        use_deepspeed = self.ds_engine is not None
+        if not use_deepspeed:
+            self.create_optimizer(phase_config)
+            self.optimizer.zero_grad(set_to_none=True)
+        model = self.ds_engine if use_deepspeed else self.model
+        model.train()
+        self.magi_pretraining.train()
+        iterator = iter(self.train_dataloader)
+        step = int(start_step)
+        phase_name = str(phase_config.get("name", "Magi EEG Pretraining"))
+        weights = dict(phase_config.get("magi_objective_weights") or {})
+        masked_weight = float(weights.get("masked", 1.0))
+        ntp_weight = float(weights.get("causal_ntp", 1.0))
+        contrastive_weight = float(weights.get("contrastive", 0.1))
+
+        while step < total_steps:
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                iterator = iter(self.train_dataloader)
+                batch = next(iterator)
+            if not isinstance(batch, Mapping):
+                raise TypeError("Magi pretraining batches must be mappings")
+
+            eeg = batch.get(
+                "eeg",
+                batch.get("ecog", batch.get("eeg_data")))
+            if not isinstance(eeg, torch.Tensor):
+                raise ValueError(
+                    "Magi pretraining batches must contain tensor key "
+                    "'eeg' or 'ecog'")
+            eeg = move_to_device(eeg, self.device)
+            channel_types = batch.get(
+                "channel_types", batch.get("ecog_channel_types"))
+            if isinstance(channel_types, torch.Tensor):
+                channel_types = move_to_device(channel_types, self.device)
+            channel_names = batch.get(
+                "channel_names",
+                batch.get("ecog_channel_names", batch.get("eeg_channel_names")))
+            view1 = batch.get("eeg_view1", batch.get("ecog_view1"))
+            view2 = batch.get("eeg_view2", batch.get("ecog_view2"))
+            if isinstance(view1, torch.Tensor):
+                view1 = move_to_device(view1, self.device)
+            else:
+                view1 = eeg
+            if isinstance(view2, torch.Tensor):
+                view2 = move_to_device(view2, self.device)
+            if step < warmup_steps:
+                base_lr = float(phase_config.get("learning_rate", 3e-5))
+                lr = base_lr * step / max(1, warmup_steps)
+            else:
+                lr = get_learning_rate_schedule(
+                    step,
+                    float(phase_config.get("learning_rate", 3e-5)),
+                    warmup_steps,
+                    total_steps,
+                    float(phase_config.get("min_lr", 1e-6)),
+                    schedule=phase_config.get("lr_schedule", "cosine"),
+                )
+            optimizer = self.optimizer
+            if optimizer is None:
+                optimizer = getattr(model, "optimizer", None)
+            if optimizer is not None:
+                for group in optimizer.param_groups:
+                    group["lr"] = lr
+
+            with autocast_context(self.device, enabled=True):
+                # Call through the wrapped model. DDP/DeepSpeed then observes
+                # gradients for both the production Magi encoder and the
+                # registered pretraining heads.
+                result = model(
+                    eeg=view1,
+                    fmri=None,
+                    channel_names=channel_names,
+                    channel_types=channel_types,
+                    magi_pretraining=True,
+                    magi_eeg_view2=view2,
+                    magi_objective_weights=weights,
+                )
+                loss = result["loss"]
+
+            if use_deepspeed:
+                model.backward(loss)
+                model.step()
+                self.magi_pretraining.update_momentum_encoder()
+            else:
+                old_scale = self.scaler.get_scale()
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    float(phase_config.get("grad_clip", 1.0)),
+                )
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
+                if self.scaler.get_scale() >= old_scale:
+                    self.magi_pretraining.update_momentum_encoder()
+
+            self._current_step = step
+            if self.logger and step % 10 == 0:
+                self.logger.log(
+                    step,
+                    {
+                        "total_loss": float(result["loss"].detach()),
+                        "masked_loss": float(result["masked_loss"].detach()),
+                        "causal_ntp_loss": float(result["ntp_loss"].detach()),
+                        "contrastive_loss": float(
+                            result["contrastive_loss"].detach()),
+                        "lr": lr,
+                    },
+                    phase_name,
+                )
+            step += 1
+
+        self.save_checkpoint(step, phase_name)
+        return step
+
+
+    def evaluate_phase_transition_gate(
+        self, phase_config: Mapping[str, Any], metrics: Mapping[str, Any]
+    ) -> bool:
+        """Evaluate a normalized phase gate with a deterministic result."""
+        self._validate_runtime_phase(phase_config)
+        return evaluate_transition_gate(phase_config["transition_gate"], metrics)
+
+    def reset_loss_normalizer(self) -> None:
+        """Reset loss-scale calibration at a phase boundary."""
+        reset = getattr(self.total_loss, "reset_loss_normalizer", None)
+        if callable(reset):
+            reset()
+        elif hasattr(getattr(self.total_loss, "normalizer", None), "reset"):
+            self.total_loss.normalizer.reset()
+
+    def train_phase(self, phase_config: Mapping[str, Any], start_step: int = 0):
+        """Train one normalized runtime phase mapping."""
+        self._validate_runtime_phase(phase_config)
+        if phase_config["task"] == "magi_eeg_pretraining":
+            return self._train_magi_pretraining(
+                phase_config, start_step=start_step)
         phase_name = phase_config.get("name", "unknown")
-        total_steps = phase_config.get("total_steps", 10000)
+        loss_weights = phase_config.get("loss_weights")
+        forecast_requested = bool(
+            getattr(loss_weights, "forecast", 0.0) > 0)
+        self.reset_loss_normalizer()
+        self._validate_context_settings(phase_config)
+        rollout_steps = max(1, int(
+            self._rollout_steps_override
+            if getattr(self, "_rollout_steps_override", None)
+            else phase_config.get("rollout_steps", 1)))
+        self._forecast_enabled = forecast_requested and rollout_steps > 1
+        if self._forecast_enabled and not self.require_future_targets:
+            raise ValueError(
+                f"phase {phase_name!r} enables forecast supervision but "
+                "the data contract does not enable explicit future targets")
+        self._apply_freeze_policy(phase_config["freeze_policy"])
+        self._phase_thawed_components = set()
+        total_steps = int(phase_config.get("total_steps", 10000))
+        self._apply_phase_context(phase_config)
         warmup_steps = phase_config.get("warmup_steps", 500)
         batch_size = phase_config.get("batch_size", 16)
-        gradient_accumulation = phase_config.get("gradient_accumulation", 1)
+        if self.train_dataloader is not None and self.train_dataloader.batch_size:
+            # The loader (built from the data + species profile) is
+            # authoritative: a phase table's batch_size cannot describe a
+            # species run whose profile chose another one, and silently
+            # training at a different effective batch than the profile says is
+            # exactly the failure this assert prevents.
+            loader_batch = int(self.train_dataloader.batch_size)
+            if int(batch_size) != loader_batch:
+                print(f"[BATCH] phase '{phase_name}' declares batch_size="
+                      f"{batch_size} but the loader yields {loader_batch}; "
+                      f"using the loader (data/species profile is the source "
+                      f"of truth)")
+            batch_size = loader_batch
+        gradient_accumulation = int(phase_config.get("gradient_accumulation", 1))
+        if gradient_accumulation < 1:
+            raise ValueError("phase gradient_accumulation must be positive")
 
         if self.ds_config is not None:
             # DeepSpeed fixes its micro batch at engine init and never re-reads
@@ -1245,16 +2012,23 @@ class BrainMoETrainer:
                 self.ds_config.get("train_micro_batch_size_per_gpu", 0) or 0)
             configured_accum = int(
                 self.ds_config.get("gradient_accumulation_steps", 1) or 1)
-            if configured_micro and (
-                    batch_size != configured_micro
-                    or gradient_accumulation != configured_accum):
-                print(
-                    f"[DEEPSPEED] WARNING: phase '{phase_name}' asks for "
-                    f"batch={batch_size}, accum={gradient_accumulation} but the "
-                    f"engine was initialised with micro_batch="
-                    f"{configured_micro}, accum={configured_accum}. DeepSpeed "
-                    f"does not re-read these per phase; the effective batch is "
-                    f"{configured_micro * configured_accum} per rank per step.")
+            if configured_micro and int(batch_size) != configured_micro:
+                raise ValueError(
+                    f"DeepSpeed was initialised with "
+                    f"train_micro_batch_size_per_gpu={configured_micro} but the "
+                    f"loader yields {batch_size} samples per step (phase "
+                    f"'{phase_name}'). DeepSpeed never re-reads the micro batch, "
+                    f"so the run would train at a different effective batch than "
+                    f"this configuration states; align the data profile / "
+                    f"DeepSpeed config (train.py rewrites the micro batch from "
+                    f"the loader, so this means a hand-edited config).")
+            if gradient_accumulation != configured_accum:
+                raise ValueError(
+                    f"DeepSpeed was initialised with gradient_accumulation_steps="
+                    f"{configured_accum}, but phase '{phase_name}' requests "
+                    f"{gradient_accumulation}. DeepSpeed cannot change "
+                    "gradient accumulation after engine initialization; use "
+                    "one accumulation value for all selected phases.")
         base_lr = phase_config.get("learning_rate", 3e-5)
         min_lr = phase_config.get("min_lr", 1e-6)
 
@@ -1375,14 +2149,20 @@ class BrainMoETrainer:
             self._current_lr = lr
             curriculum_progress = min(1.0, (step - start_step) / max(1, curriculum_steps))
 
+            steps_per_epoch = (
+                len(self.train_dataloader)
+                if self.train_dataloader is not None
+                else max(1, int(warmup_steps))
+            )
+
             self._apply_pending_thaw(step)
+            thaw_changed = self._apply_timed_freeze_policy(
+                phase_config["freeze_policy"], step - start_step,
+                steps_per_epoch)
+            if thaw_changed and not use_deepspeed:
+                self.create_optimizer(phase_config)
             self._current_step = step
 
-            # Update encoder freeze state
-            if hasattr(model, "set_training_step"):
-                model.set_training_step(step - start_step, freeze_epochs_steps=warmup_steps)
-            elif hasattr(model, "module") and hasattr(model.module, "set_training_step"):
-                model.module.set_training_step(step - start_step, freeze_epochs_steps=warmup_steps)
 
             if use_deepspeed:
                 for param_group in self.optimizer.param_groups:
@@ -1393,18 +2173,15 @@ class BrainMoETrainer:
 
             # Generic species runs feed forward_modalities with raw signals
             # per modality; the EEG/fMRI(+MEG) path is unchanged.
-            rollout_steps = max(1, int(phase_config.get("rollout_steps", 1)))
+            rollout_steps = max(1, int(
+                self._rollout_steps_override
+                if getattr(self, "_rollout_steps_override", None)
+                else phase_config.get("rollout_steps", 1)))
+            self._rollout_steps = rollout_steps
             generic_signals = None
+            signals = None
             dummy_meg = None
-            if self.generic_model:
-                generic_signals = self._next_generic_signals(
-                    batch_size, step, total_steps)
-            else:
-                fetched = self._get_batch(batch_size, step, total_steps)
-                dummy_eeg, dummy_fmri = fetched[0], fetched[1]
-                if len(fetched) > 2:
-                    dummy_meg = fetched[2]
-            # Auto-enable recon_meg once real MEG batches arrive (and the
+            actual_eeg = actual_fmri = actual_meg = None
             # model has a MEG branch); phases may still override the weight.
             meg_present = (not self.generic_model and dummy_meg is not None)
             if meg_present and getattr(self, "_meg_recon_enabled", False) is False:
@@ -1419,7 +2196,9 @@ class BrainMoETrainer:
             target._wiener_q_factor = q_report.get("q_factor_current", 1.0)
             target._wiener_ataxia = ac_report.get("ataxia_current", 0.0)
             target._wiener_catalepsy = ac_report.get("catalepsy_current", 0.0)
+            step_metrics = {}
 
+            step_metrics.update(self._generic_control_metrics())
             if self.generic_model:
                 signals, raw_targets, perturbation = partition_generic_batch(
                     self._generic_batch_tensors, self.signal_modalities,
@@ -1427,16 +2206,23 @@ class BrainMoETrainer:
                     control_modalities=self.control_modalities,
                     control_reduction=self.control_reduction,
                     rollout_steps=rollout_steps,
-                    require_future_targets=self.require_future_targets)
+                    require_future_targets=self.require_future_targets,
+                    require_multi_horizon=self._forecast_enabled)
                 signal_masks = dict(self._generic_signal_masks)
             else:
                 raw_targets, raw_target_masks = self._standard_raw_targets(
                     dummy_eeg, dummy_fmri, dummy_meg)
-                actual_eeg = raw_targets["eeg"]
-                actual_fmri = raw_targets["fmri"]
-                actual_meg = raw_targets.get("meg")
+                actual_eeg = (
+                    raw_targets["eeg"]
+                    if raw_targets["eeg"].dim() == 3 else None)
+                actual_fmri = (
+                    raw_targets["fmri"]
+                    if raw_targets["fmri"].dim() == 3 else None)
+                actual_meg = (
+                    raw_targets.get("meg")
+                    if (raw_targets.get("meg") is not None
+                        and raw_targets["meg"].dim() == 3) else None)
                 signal_masks = dict(self._standard_signal_masks)
-                raw_target_masks = dict(self._standard_target_masks)
             if self.generic_model:
                 raw_target_masks = {
                     modality: raw_targets[f"{modality}_mask"]
@@ -1449,7 +2235,40 @@ class BrainMoETrainer:
                 }
             perturbation = (
                 self._sanitize_perturbation(perturbation, model)
-                if self.generic_model else None)
+                if self.generic_model else
+                self._sanitize_perturbation(
+                    self._standard_perturbation, model))
+            intervention_weight = getattr(
+                self.total_loss.loss_weights, "intervention_response", 0.0)
+            intervention_enabled = intervention_weight > 0
+            baseline_perturbation = (
+                self._generic_batch_tensors.get(
+                    "intervention_baseline",
+                    self._generic_batch_tensors.get(
+                        "baseline_perturbation"))
+                if self.generic_model
+                else self._standard_baseline_perturbation)
+            if intervention_enabled:
+                target_map = (raw_targets if self.generic_model
+                              else self._standard_contract_targets)
+                if "intervention_target" not in target_map:
+                    raise ValueError(
+                        "intervention response loss requires "
+                        "intervention_target in each batch")
+                if perturbation is None or baseline_perturbation is None:
+                    raise ValueError(
+                        "intervention response loss requires treated and "
+                        "baseline perturbation tensors")
+                baseline_perturbation = self._sanitize_perturbation(
+                    baseline_perturbation, model)
+                if baseline_perturbation is None:
+                    raise ValueError(
+                        "intervention response loss requires a model "
+                        "perturbation channel")
+                if baseline_perturbation.shape != perturbation.shape:
+                    raise ValueError(
+                        "intervention_baseline must match the treated "
+                        "perturbation shape")
 
             imagination_interval = phase_config.get("imagination_interval", 0)
             if imagination_interval > 0:
@@ -1458,7 +2277,6 @@ class BrainMoETrainer:
                 if hasattr(tgt_model, "_imagination_active"):
                     tgt_model._imagination_active = is_imag_step
 
-            step_metrics = {}
             if imagination_interval > 0 and is_imag_step:
                 step_metrics["imagination_step"] = 1.0
 
@@ -1470,9 +2288,11 @@ class BrainMoETrainer:
                     outputs = model.forward_modalities(
                         signals, masks=signal_masks,
                         num_steps=rollout_steps,
+                        return_sequences=rollout_steps > 1,
                         reconstruct=True,
-                        recon_max_channels=self.recon_max_channels,
-                        perturbation=perturbation)
+                        perturbation=perturbation,
+                        **self._generic_step_kwargs(
+                            self._generic_batch_tensors))
                 else:
                     outputs = model(
                         dummy_eeg, dummy_fmri,
@@ -1482,10 +2302,43 @@ class BrainMoETrainer:
                         actual_meg=actual_meg,
                         masks=signal_masks,
                         action=None,
+                        perturbation=perturbation,
+                        mode=("forecast" if rollout_steps > 1
+                              else "perception"),
                         num_steps=rollout_steps,
+                        return_sequences=rollout_steps > 1,
+                        cross_modal_labels=self._standard_contract_targets.get(
+                            "cross_modal_labels"),
                     )
+                if intervention_enabled:
+                    baseline_outputs = self._forward_intervention_baseline(
+                        model,
+                        signals=(signals if self.generic_model else None),
+                        dummy_eeg=dummy_eeg,
+                        dummy_fmri=dummy_fmri,
+                        dummy_meg=dummy_meg,
+                        actual_eeg=actual_eeg,
+                        actual_fmri=actual_fmri,
+                        actual_meg=actual_meg,
+                        signal_masks=signal_masks,
+                        rollout_steps=rollout_steps,
+                        perturbation=baseline_perturbation,
+                        cross_modal_labels=(
+                            self._standard_contract_targets.get(
+                                "cross_modal_labels")
+                            if not self.generic_model else None),
+                    )
+                    target_effect = (
+                        raw_targets["intervention_target"]
+                        if self.generic_model
+                        else self._standard_contract_targets[
+                            "intervention_target"])
+                    self._attach_intervention_effect(
+                        outputs, baseline_outputs, target_effect)
                 targets = self._prepare_reconstruction_targets(
                     outputs, raw_targets, raw_target_masks)
+                if not self.generic_model:
+                    targets.update(self._standard_contract_targets)
                 total_loss, loss_metrics = self.total_loss(outputs, targets)
                 model.backward(total_loss)
                 model.step()
@@ -1501,9 +2354,12 @@ class BrainMoETrainer:
                         outputs = model.forward_modalities(
                             signals, masks=signal_masks,
                             num_steps=rollout_steps,
+                            return_sequences=rollout_steps > 1,
                             reconstruct=True,
                             recon_max_channels=self.recon_max_channels,
-                            perturbation=perturbation)
+                            perturbation=perturbation,
+                            **self._generic_step_kwargs(
+                                self._generic_batch_tensors))
                     else:
                         outputs = model(
                             dummy_eeg, dummy_fmri,
@@ -1513,10 +2369,45 @@ class BrainMoETrainer:
                             actual_meg=actual_meg,
                             masks=signal_masks,
                             action=None,
+                            perturbation=perturbation,
+                            mode=("forecast" if rollout_steps > 1
+                                  else "perception"),
                             num_steps=rollout_steps,
+                            return_sequences=rollout_steps > 1,
+                            cross_modal_labels=self._standard_contract_targets.get(
+                                "cross_modal_labels"),
                         )
+                    if intervention_enabled:
+                        baseline_outputs = (
+                            self._forward_intervention_baseline(
+                                model,
+                                signals=(signals if self.generic_model
+                                         else None),
+                                dummy_eeg=dummy_eeg,
+                                dummy_fmri=dummy_fmri,
+                                dummy_meg=dummy_meg,
+                                actual_eeg=actual_eeg,
+                                actual_fmri=actual_fmri,
+                                actual_meg=actual_meg,
+                                signal_masks=signal_masks,
+                                rollout_steps=rollout_steps,
+                                perturbation=baseline_perturbation,
+                                cross_modal_labels=(
+                                    self._standard_contract_targets.get(
+                                        "cross_modal_labels")
+                                    if not self.generic_model else None),
+                            ))
+                        target_effect = (
+                            raw_targets["intervention_target"]
+                            if self.generic_model
+                            else self._standard_contract_targets[
+                                "intervention_target"])
+                        self._attach_intervention_effect(
+                            outputs, baseline_outputs, target_effect)
                     targets = self._prepare_reconstruction_targets(
                         outputs, raw_targets, raw_target_masks)
+                    if not self.generic_model:
+                        targets.update(self._standard_contract_targets)
                     total_loss, loss_metrics = self.total_loss(outputs, targets)
                     total_loss = total_loss / gradient_accumulation
 
@@ -1604,8 +2495,8 @@ class BrainMoETrainer:
             # species runs without eeg_recon skip it)
             eeg_recon = outputs.get("eeg_recon")
             z_global = outputs.get("z_global")
-            # Use the same target slice that was fed to TotalLoss for consistency
-            actual_signal = eeg_target if eeg_recon is not None else None
+            # TotalLoss consumed this exact aligned target mapping.
+            actual_signal = targets.get("eeg") if eeg_recon is not None else None
             if run_monitors and eeg_recon is not None and actual_signal is not None:
                 ac_result = self.ataxia_catalepsy_monitor.update(
                     predicted_signal=eeg_recon,
@@ -1858,26 +2749,41 @@ class BrainMoETrainer:
         one_step_corr = []
         one_step_variance = []
         one_step_autocorr = []
+        metric_dt_used = []
         free_step_norm = []
         free_tail_ratio = []
+        intervention_enabled = getattr(
+            self.total_loss.loss_weights, "intervention_response", 0.0) > 0
         val_steps = 0
         max_val_steps = 100
         rollout_steps = max(1, int(phase_config.get("rollout_steps", 1)))
-
+        phase_weights = phase_config.get("loss_weights")
+        if self.generic_model and self.recon_modalities:
+            phase_weights = augment_phase_loss_weights(
+                phase_weights or LossWeights(), self.recon_modalities,
+                getattr(self, "recon_loss_types", {}))
+            self.total_loss.loss_weights = phase_weights
+        self._forecast_enabled = bool(
+            getattr(phase_weights, "forecast", 0.0) > 0
+            and rollout_steps > 1)
         try:
             # Physics fields use autograd internally; validation disables
             # parameter updates by omitting backward, not by disabling autograd.
             with torch.enable_grad():
                 for i, batch in enumerate(loader):
-                    if i >= max_val_steps:
-                        break
-                    reset_eval_state()
                     if self.generic_model:
-                        batch_tensors = {
-                            key: move_to_device(value, self.device)
-                            for key, value in batch.items()
-                            if isinstance(value, torch.Tensor)
-                        }
+                        batch_tensors = {}
+                        for key, value in batch.items():
+                            if isinstance(value, torch.Tensor):
+                                batch_tensors[key] = move_to_device(
+                                    value, self.device)
+                            elif key in {
+                                    "dt", "species", "sample_rate_hz",
+                                    "rate_hz"}:
+                                # Keep non-tensor manifest metadata available
+                                # to the same per-recording physics kwargs
+                                # used by the training path.
+                                batch_tensors[key] = value
                         signals, batch_targets, perturbation = (
                             partition_generic_batch(
                                 batch_tensors, self.signal_modalities,
@@ -1886,7 +2792,9 @@ class BrainMoETrainer:
                                 control_reduction=self.control_reduction,
                                 rollout_steps=rollout_steps,
                                 require_future_targets=(
-                                    self.require_future_targets)))
+                                    self.require_future_targets),
+                                require_multi_horizon=(
+                                    self._forecast_enabled)))
                         if not signals:
                             continue
                         signal_masks = {
@@ -1908,8 +2816,10 @@ class BrainMoETrainer:
                         outputs = model.forward_modalities(
                             signals, masks=signal_masks,
                             num_steps=rollout_steps, return_all=True,
+                            return_sequences=rollout_steps > 1,
                             reconstruct=True,
                             recon_max_channels=self.recon_max_channels,
+                            **self._generic_step_kwargs(batch_tensors),
                             perturbation=perturbation)
                     else:
                         self._capture_standard_batch(batch)
@@ -1925,6 +2835,8 @@ class BrainMoETrainer:
                                if isinstance(meg, torch.Tensor) else None)
                         raw_targets, raw_target_masks = (
                             self._standard_raw_targets(eeg, fmri, meg))
+                        perturbation = self._sanitize_perturbation(
+                            self._standard_perturbation, model)
                         if self.require_future_targets:
                             missing = [
                                 m for m in ("eeg", "fmri")
@@ -1937,19 +2849,92 @@ class BrainMoETrainer:
                                 raise ValueError(
                                     "missing future targets for validation: "
                                     + ", ".join(missing))
-                        signal_masks = dict(self._standard_signal_masks)
                         outputs = model(
                             eeg, fmri, meg=meg,
-                            actual_eeg=raw_targets["eeg"],
-                            actual_fmri=raw_targets["fmri"],
-                            actual_meg=raw_targets.get("meg"),
+                            actual_eeg=(
+                                raw_targets["eeg"]
+                                if raw_targets["eeg"].dim() == 3 else None),
+                            actual_fmri=(
+                                raw_targets["fmri"]
+                                if raw_targets["fmri"].dim() == 3 else None),
+                            actual_meg=(
+                                raw_targets.get("meg")
+                                if (raw_targets.get("meg") is not None
+                                    and raw_targets["meg"].dim() == 3)
+                                else None),
                             masks=signal_masks,
+                            perturbation=perturbation,
+                            mode=("forecast" if rollout_steps > 1
+                                  else "perception"),
                             num_steps=rollout_steps,
                             return_all=True,
+                            return_sequences=rollout_steps > 1,
+                            cross_modal_labels=self._standard_contract_targets.get(
+                                "cross_modal_labels"),
                         )
 
+                    if intervention_enabled:
+                        target_map = (raw_targets if self.generic_model
+                                      else self._standard_contract_targets)
+                        target_effect = target_map.get(
+                            "intervention_target")
+                        baseline_perturbation = (
+                            batch_tensors.get(
+                                "intervention_baseline",
+                                batch_tensors.get("baseline_perturbation"))
+                            if self.generic_model
+                            else self._standard_baseline_perturbation)
+                        if target_effect is None:
+                            raise ValueError(
+                                "intervention response loss requires "
+                                "intervention_target in validation batch")
+                        if perturbation is None or baseline_perturbation is None:
+                            raise ValueError(
+                                "intervention response loss requires treated "
+                                "and baseline perturbation tensors")
+                        baseline_perturbation = self._sanitize_perturbation(
+                            baseline_perturbation, model)
+                        if baseline_perturbation is None:
+                            raise ValueError(
+                                "intervention response loss requires a model "
+                                "perturbation channel")
+                        if baseline_perturbation.shape != perturbation.shape:
+                            raise ValueError(
+                                "intervention_baseline must match the "
+                                "treated perturbation shape")
+                        baseline_outputs = self._forward_intervention_baseline(
+                            model,
+                            signals=(signals if self.generic_model else None),
+                            dummy_eeg=(eeg if not self.generic_model else None),
+                            dummy_fmri=(fmri if not self.generic_model else None),
+                            dummy_meg=(meg if not self.generic_model else None),
+                            actual_eeg=(
+                                raw_targets["eeg"]
+                                if not self.generic_model
+                                and raw_targets["eeg"].dim() == 3 else None),
+                            actual_fmri=(
+                                raw_targets["fmri"]
+                                if not self.generic_model
+                                and raw_targets["fmri"].dim() == 3 else None),
+                            actual_meg=(
+                                raw_targets.get("meg")
+                                if not self.generic_model
+                                and raw_targets.get("meg") is not None
+                                and raw_targets["meg"].dim() == 3 else None),
+                            signal_masks=signal_masks,
+                            rollout_steps=rollout_steps,
+                            perturbation=baseline_perturbation,
+                            cross_modal_labels=(
+                                self._standard_contract_targets.get(
+                                    "cross_modal_labels")
+                                if not self.generic_model else None),
+                        )
+                        self._attach_intervention_effect(
+                            outputs, baseline_outputs, target_effect)
                     targets = self._prepare_reconstruction_targets(
                         outputs, raw_targets, raw_target_masks)
+                    if not self.generic_model:
+                        targets.update(self._standard_contract_targets)
                     batch_loss, loss_metrics = self.total_loss(
                         outputs, targets, update_normalizer=False)
                     total_loss_value += float(batch_loss.item())
@@ -2010,6 +2995,24 @@ class BrainMoETrainer:
                     for modality in self.recon_modalities:
                         prediction = outputs.get(f"{modality}_recon")
                         real = targets.get(modality)
+                        # Trivial baselines on the same targets and mask:
+                        # without them a reconstruction correlation is not
+                        # interpretable (calcium is a low-passed, aliased
+                        # observable, so 'persistence' is a real competitor).
+                        observed = signals.get(modality)
+                        if (isinstance(observed, torch.Tensor)
+                                and isinstance(real, torch.Tensor)
+                                and observed.shape == real.shape):
+                            tgt_mask = targets.get(f"{modality}_mask")
+                            val_metrics.setdefault(
+                                f"recon_{modality}_baseline_persistence",
+                                []).append(masked_channel_correlation(
+                                    observed, real, tgt_mask))
+                            val_metrics.setdefault(
+                                f"recon_{modality}_baseline_channel_mean",
+                                []).append(masked_channel_correlation(
+                                    observed.mean(dim=-1, keepdim=True)
+                                    .expand_as(real), real, tgt_mask))
                         if (isinstance(prediction, torch.Tensor)
                                 and isinstance(real, torch.Tensor)
                                 and prediction.shape[-1] >= 3
@@ -2018,13 +3021,18 @@ class BrainMoETrainer:
                             # output for the next window scored against that
                             # window.  The latent advanced a single step from a
                             # real observation, so this is not a free run.
+                            frame_dt_s = (
+                                self._batch_frame_dt(batch)
+                                if isinstance(batch, dict) else None) or float(
+                                    getattr(target_model, "latent_dt", None)
+                                    or 1.0)
                             pair = run_free_run_suite(
                                 real[0].detach().transpose(0, 1).cpu().numpy(),
                                 prediction[0].detach().transpose(0, 1).cpu().numpy(),
                                 max_lag=min(
                                     prediction.shape[-1] // 3, 20),
-                                dt=float(getattr(
-                                    target_model, "latent_dt", None) or 1.0))
+                                dt=frame_dt_s)
+                            metric_dt_used.append(float(frame_dt_s))
                             one_step_corr.append(float(pair["corr_matrix_mse"]))
                             one_step_variance.append(
                                 float(pair["variance_ratio"]["mean"]))
@@ -2045,6 +3053,11 @@ class BrainMoETrainer:
         if causal_gaps:
             result[f"{prefix}_causal_forward_reverse_gap"] = (
                 sum(causal_gaps) / len(causal_gaps))
+        if metric_dt_used:
+            # Seconds-per-frame actually used by the time-converting metrics,
+            # so a reported lag/dwell can always be traced to its clock.
+            result[f"{prefix}_metric_dt_s"] = (
+                sum(metric_dt_used) / len(metric_dt_used))
         if one_step_corr:
             result[f"{prefix}_one_step_corr_matrix_mse"] = (
                 sum(one_step_corr) / len(one_step_corr))
@@ -2073,10 +3086,12 @@ class BrainMoETrainer:
 
     def train(
         self,
-        phases: List[Dict],
+        phases: List[Mapping[str, Any]],
         resume_from: Optional[str] = None,
     ):
         """Run full training pipeline across all nodes."""
+        for phase in phases:
+            self._validate_runtime_phase(phase)
         self.global_barrier()
 
         start_step = 0
@@ -2104,6 +3119,30 @@ class BrainMoETrainer:
                 print(f"{'='*60}\n")
 
             self.global_barrier()
+            gate = phase.get("transition_gate")
+            if gate is not None:
+                status = {"ok": True, "error": None}
+                if self.is_main_process:
+                    metrics = getattr(self, "_last_phase_metrics", None)
+                    if metrics is None:
+                        status = {
+                            "ok": False,
+                            "error": "no completed-phase metrics are available",
+                        }
+                    else:
+                        try:
+                            if not self.evaluate_phase_transition_gate(phase, metrics):
+                                status = {
+                                    "ok": False,
+                                    "error": "gate returned false",
+                                }
+                        except Exception as exc:
+                            status = {"ok": False, "error": str(exc)}
+                status = self.broadcast_object(status)
+                if not status["ok"]:
+                    raise RuntimeError(
+                        f"transition gate rejected phase '{phase['name']}': "
+                        f"{status['error']}")
 
             # Reset SSM router state at phase boundaries
             # The router accumulates temporal context; old context is stale after a phase change
@@ -2120,6 +3159,8 @@ class BrainMoETrainer:
             else:
                 trained_steps = self.train_phase(phase)
 
+            if self.logger and self.logger.metrics_history:
+                self._last_phase_metrics = dict(self.logger.metrics_history[-1])
             self.global_barrier()
 
             if self.logger:

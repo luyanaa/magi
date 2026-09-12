@@ -1,26 +1,27 @@
 {
   "name": "cross_species_data_ladder",
-  "order": ["c_elegans", "zebrafish", "mouse", "human"],
+  "order": [
+    "c_elegans",
+    "zebrafish",
+    "mouse",
+    "human"
+  ],
   "stages": [
     {
       "species": "c_elegans",
-      "profile": "configs/species/c_elegans.json",
-      "replay_species": []
+      "profile": "configs/species/c_elegans.json"
     },
     {
       "species": "zebrafish",
-      "profile": "configs/species/zebrafish.json",
-      "replay_species": ["c_elegans"]
+      "profile": "configs/species/zebrafish.json"
     },
     {
       "species": "mouse",
-      "profile": "configs/species/mouse.json",
-      "replay_species": ["c_elegans", "zebrafish"]
+      "profile": "configs/species/mouse.json"
     },
     {
       "species": "human",
-      "profile": "configs/species/human.json",
-      "replay_species": ["c_elegans", "zebrafish", "mouse"]
+      "profile": "configs/species/human.json"
     }
   ],
   "contract": {

@@ -2,7 +2,7 @@
 
 **A technical introduction for computational neuroscience and bioinformatics researchers.**
 
-Brain MoE-PINN is a multi-hundred-million-parameter model that learns to *generate* brain dynamics from multimodal neuroimaging data — EEG, fMRI, and optionally MEG — while using physics-inspired inductive biases and diagnostics rather than claiming a thermodynamically valid model. Unlike a conventional encoder that maps brain data to a static embedding, this model learns a **velocity field** over a latent state space: given the current brain state, it predicts how the state will *evolve*. This lets it both *represent* brain activity (like a foundation model) and *simulate* its temporal evolution (like a biophysical model). The architecture sits at the intersection of representation learning and dynamical systems theory, targeting a regime — mesoscopic whole-brain dynamics with learned physics — that needs empirical validation.
+Brain MoE-PINN is a species-conditioned model family spanning approximately 2.8M parameters for the current C. elegans profile to approximately 1.41B for the current human profile. It learns to *generate* brain dynamics from multimodal neuroimaging data — EEG, fMRI, and optionally MEG — while using physics-inspired inductive biases and diagnostics rather than claiming a thermodynamically valid model. Unlike a conventional encoder that maps brain data to a static embedding, this model learns a **velocity field** over a latent state space: given the current brain state, it predicts how the state will *evolve*. This lets it both *represent* brain activity (like a foundation model) and *simulate* its temporal evolution (like a biophysical model). The architecture sits at the intersection of representation learning and dynamical systems theory, targeting a regime — mesoscopic whole-brain dynamics — where neither purely biophysical simulation nor static representation learning is sufficient.
 
 ---
 
@@ -56,13 +56,13 @@ Each encoder produces a sequence of token embeddings. Two learnable *hub tokens*
 
 This is the core of the model. Given a latent state $z$, we predict its velocity $\dot{z}$ — how fast and in which direction the state changes:
 
-$$\dot{z} = \underbrace{L(z)\nabla E}_{\text{antisymmetric candidate}} + \underbrace{M(z)\nabla S}_{\text{nonnegative dissipative candidate}} + \underbrace{\text{MoE}(z)}_{\text{learned experts}}$$
+$$\dot{z} = \underbrace{L(z)\nabla E}_{\text{antisymmetric candidate}} + \underbrace{M(z)\nabla S}_{\text{nonnegative dissipative candidate}} + \underbrace{\mathbf{1}_{\mathrm{MoE}}\operatorname{MoE}(z)}_{\text{optional learned residual}}$$
 
 **GENERIC-inspired inductive bias.** $E(z)$ and $S(z)$ are learned scalar fields, not physiological energy or entropy. $L(z)$ is constructed to be antisymmetric, while $M(z)$ supplies nonnegative diagonal mobility values learned from the state (a sigmoid gate calibrated so a fresh model reproduces the historical constant mobility). $\nabla E$ and $\nabla S$ are true autograd gradients of the potentials, scaled by learned positive factors — never unit-normalized, since a direction field that is not a gradient voids every degeneracy projection built on it. $L\nabla S$ is removed by a pointwise projector; the mobility is applied through an Öttinger projector $P_E M P_E$ with $P_E = I - \nabla E\nabla E^{\top}/\lVert\nabla E\rVert^{2}$, so the effective dissipative operator satisfies $M\nabla E = 0$ exactly instead of only being penalized toward zero. These properties are useful structural biases, but they do not establish the differential Jacobi identity, a globally valid GENERIC bracket, or stochastic thermodynamic entropy production.
 
 The learned potentials are evaluated by their observable consequences—reconstruction, forecasting, free-run statistics, state transitions, and external behavioral alignment—not by assigning them physical units or physiological meaning.
 
-**The MoE contribution** adds learned complexity. By default (since the 2026-05-16 architecture revision) eight *shared experts* — 2-layer residual MLPs at 1.0× width, ~2.1M parameters each at latent_dim=1024 — are always active, providing a dense backbone. Six *routed experts* (0.7× width, ~1.5M each) are selectively activated via a Top-3 gating mechanism, giving the model the capacity to learn specialized dynamical modes — perhaps one expert for resting-state dynamics, another for visual task processing, etc. The measured default MoE velocity block is ~26M parameters. An opt-in **deep-expert configuration** (`--use_deep_experts`) replaces the shared stack with 50-layer residual MLPs (52.5M each) and the routed stack with 14-layer MLPs (7.6M each), raising …
+**The MoE contribution** is an optional learned residual, not a universal species default. The C. elegans and zebrafish profiles disable it because their nervous systems are much smaller; mouse and human retain it for the higher-capacity end of the ladder. When enabled, eight *shared experts* — 2-layer residual MLPs at 1.0× width, ~2.1M parameters each at latent_dim=1024 — provide a dense backbone. Six *routed experts* (0.7× width, ~1.5M each) are selectively activated via a Top-3 gating mechanism, giving the model capacity to learn specialized dynamical modes. The measured default human MoE velocity block is ~26M parameters. An opt-in **deep-expert configuration** (`--use_deep_experts`) replaces the shared stack with 50-layer residual MLPs (52.5M each) and the routed stack with 14-layer MLPs (7.6M each), raising the parameter count sharply.
 
 The router is a **recurrent selective state-space model** (a Mamba S6 core with 64-dimensional hidden state), not a stateless MLP. This is important: expert routing at time $t$ depends on the entire history of latent states $z_{<t}$, not just the current state. A stateful router produces smoother, more contextually appropriate expert allocation. The router's state is a registered PyTorch buffer, surviving device transfers and checkpoint save/load. A temperature parameter $\tau$ controls routing softness, annealed from 2.0 (near-uniform, encouraging exploration) to 0.7 (sharp, encouraging specialization) over the course of training.
 
@@ -80,7 +80,7 @@ The velocity field operates at multiple timescales through three mechanisms:
 
 **OU-Structured Noise and the SDE policy.** Colored (Ornstein-Uhlenbeck) noise is applied according to an explicit `noise_mode` policy — `off | rollout | train | always` (default `off`: deterministic latent steps). The OU state uses the exact discrete recursion $a = e^{-\Delta t/\tau}$ with unit stationary variance, and the noise enters the velocity as $\sqrt{2 D_{eff}/\Delta t}\,\eta$, so the integrated latent increment has the Euler–Maruyama magnitude $\sqrt{2 D_{eff}\Delta t}$ — noise scales with $\sqrt{\Delta t}$, not $\Delta t$. The integrator and the noise share one clock (`integration_dt`, derived from `latent_dt`) by construction. When enabled, the Wiener Homeostat scales $D_{eff}$ for the active mode (tensor-native EMA, periodic update, optional per-component calibration via `calibrate_dim_gain`).
 
-**Stimulus control conditioning.** Loaders may declare control-role modalities (stimulus tracks: salt steps, drifting gratings, temperature gradients, task events); the trainer reduces the windowed control to a per-step perturbation — `(B, K, U)` with `K = rollout_steps` segment means (the default `control_reduction="resample"`), so stimulus timing survives into the latent steps. `control_reduction="mean"` collapses the whole window to a single vector and is only appropriate for stationary controls. `VelocityBrain` then (a) adds a bias-free, zero-initialized control readout (so $u = 0$ is an exact no-op in any trained state) and (b) applies zero-initialized input-conditioned gates — identity at init — that modulate the mobility and arousal terms, letting stimuli reshape dynamics rather than merely offset velocity.
+**Stimulus and intervention control conditioning.** Loaders may declare control-role modalities (stimulus tracks: salt steps, drifting gratings, temperature gradients, task events); the trainer reduces the windowed control to a per-step perturbation — `(B, K, U)` with `K = rollout_steps` segment means (the default `control_reduction="resample"`), so stimulus timing survives into the latent steps. `control_reduction="mean"` collapses the whole window to a single vector and is only appropriate for stationary controls; `control_reduction="peak"` preserves sparse optogenetic pulse amplitudes. For single-neuron optogenetics, `opto` is encoded as `[waveform, waveform * target_one_hot]` from a fixed species-specific target vocabulary, so light-off gives an exact zero control and target identity cannot act without the intervention. Its contribution to `perturbation_dim` is waveform width plus target-vocabulary width; the total width also includes every other active control modality. `VelocityBrain` then (a) adds a bias-free, zero-initialized control readout (so $u = 0$ is an exact no-op in any trained state) and (b) applies zero-initialized input-conditioned gates — identity at init — that modulate the mobility and arousal terms, letting stimuli reshape dynamics rather than merely offset velocity.
 
 ### 2.5 Decoders
 
@@ -131,6 +131,50 @@ The implementation is split across the vendored `magi/` package and
   variable channel counts, MNI coordinates, and paired ECoG-fMRI windows.
   `data/ecog_preprocessing.py` provides resampling, filtering, rereferencing,
   z-scoring, bad-channel detection, and coordinate extraction.
+- `data_loader.EEGDenoiseNetDataset` consumes the public
+  [EEGdenoiseNet](https://github.com/ncclabsustech/EEGdenoiseNet) epoch
+  files from either the checkout root or its `data/` directory. It accepts
+  the published NumPy/MAT formats, keeps deterministic train/validation/test
+  splits, and synthesizes the benchmark's clean-plus-EOG/EMG views using its
+  RMS/SNR convention. The release has 4,514 clean 2-s epochs, 3,400 ocular
+  artifact epochs, and 5,598 muscular artifact epochs; EOG is 256 Hz and EMG
+  is 512 Hz, with clean EEG resampled for the EMG path. The primary clean
+  epoch is used for Magi masked/causal pretraining and the matched
+  artifact-contaminated epoch is the contrastive view; source arrays must be
+  materialized rather than annex pointer files.
+- `configs/data/eegdenoisenet.json` is the ready-to-use Phase -1 profile
+  (`--phase -1 --eeg_backend v2 --eeg_channels 1 --data
+  configs/data/eegdenoisenet.json`); this EEG-only path does not fabricate
+  fMRI targets.
+
+- Human EEG/MEG/fMRI ingestion is manifest-first and local-only.  The
+  `data/ingest_human.py bids-session` command discovers BIDS EEG/MEG files,
+  reads EDF/BDF/FIF/BrainVision/EEGLAB/CTF recordings through lazy MNE
+  adapters, extracts atlas-parcel or bounded voxel time series from BOLD
+  NIfTI, and writes the canonical `(C, T)` ladder plus channel IDs, masks,
+  per-modality rates, and provenance.  Existing fMRIPrep or SPM NIfTI
+  derivatives are valid inputs; neither acquisition nor spatial
+  preprocessing is hidden in the command.  Example:
+
+  ```bash
+  python -m brain_moe_pinn.data.ingest_human bids-session \
+    --bids-root /data/openneuro/ds006040 --subject 01 \
+    --task rest --modalities eeg fmri --eeg-rate 256 \
+    --atlas /data/atlas.nii.gz --origin OpenNeuro:ds006040 \
+    --out /data/data_ladder/human_bids
+  ```
+
+  Heterogeneous records use `data/corpus_pipeline.py` source manifests:
+  `format: mne` for EEG/MEG and `format: nifti` for fMRI.  Relative paths are
+  resolved against the manifest, no dataset is downloaded implicitly, and
+  `SpeciesSignalDataset` selects physical-second windows at training time.
+  Different EEG/MEG/fMRI clocks remain separate in
+  `<modality>_rate_hz`; `cross_modal_label` must be explicitly set to `1`
+  only for verified synchronization and to `0` for an intentional async pair.
+  Install the optional readers only for the formats used (`mne-python` for
+  electrical recordings and `nibabel` for NIfTI).  TorchEEG remains optional
+  for dataset-specific EEG transforms; the canonical adapter does not require
+  it because the same profile also handles MEG and fMRI.
 
 The canonical construction path is:
 
@@ -150,11 +194,21 @@ one model/configuration surface.
 
 ## 3. The Loss Function: Physics Through Supervision
 
-`LossWeights` (in `training/training_phases.py`) separates **steering terms** — weights $> 0$, applied with stage-dependent weights — from **monitor/dormant terms** kept at weight 0 so their metrics keep being logged without warping the optimization landscape. All classes remain; no loss was deleted. The steering set per dense stage is:
+`LossWeights` (in `training/training_phases.py`) separates **steering terms** —
+weights $> 0$, applied with stage-dependent weights — from monitor/dormant
+terms kept at weight 0.  Positive weights are executable only when their data
+contract is present; missing future, pairing, policy, or intervention targets
+raise instead of silently skipping supervision.
 
 $$\mathcal{L}_{\text{total}} = \sum_{\ell \in \text{steering}} w_\ell \cdot \tilde{\mathcal{L}}_\ell$$
 
-Where $\tilde{\mathcal{L}}_\ell$ is an EMA-normalized version of each steering loss (mean/std calibrated over 1,000 warmup steps and frozen thereafter). This prevents one loss from dominating due to scale differences. Default steering set (dense stages): EEG/fMRI reconstruction, dissipation proxy, MoE load balancing, grassmannian (single weight on the raw orthogonality emitted by `MoEVelocityField`), spectral slope (the sole 1/f term), band power (band matching only), cross-modal alignment, HRF bridge, and SIGReg anti-collapse. Stage 3 additionally steers action (EFE) and replay. Monitored at weight 0: dissipative form, latent concentration, Hebbian weight norm (logged every step); the degeneracy constraint is enforced by projection rather than by its weight (see below); Jacobi (diagnostic), velocity smoothness and velocity-difference (need rollout sequences), NSP (band-power clone of bandpower until implemented as latent→statistics prediction), tsallis (dormant; sign bug rewards concentration), cross-soft (hub contrastive; trainer never supplies labels), Hebbian regularization (Oja already controls its norm), recon_meg (wired; enable once the trainer feeds MEG batches).
+Where $\tilde{\mathcal{L}}_\ell$ is an EMA-normalized version of each steering
+loss (mean/std calibrated over warmup and frozen thereafter).  Dense stages
+steer EEG/fMRI reconstruction, dissipation, MoE load balancing, grassmannian
+regularization, spectral slope, band power, and SIGReg.  P3-P6 additionally
+declare two-horizon forecast supervision.  Stage 2 steers labelled cross-modal
+and HRF alignment; Stage 3 leaves action, replay, and intervention-response
+terms disabled until their explicit contracts are supplied.
 
 **Reconstruction losses** (EEG, fMRI, MEG): Standard MSE between decoder output and input signal. These are the primary training signal — all other losses are auxiliary.
 
@@ -163,25 +217,36 @@ Where $\tilde{\mathcal{L}}_\ell$ is an EMA-normalized version of each steering l
 - *Jacobi diagnostic*: requires derivatives of a callable Poisson map and explicit state points. It raises an error when those inputs are absent rather than reporting a false score; it remains disabled for the high-dimensional training path.
 - *Grassmannian regularization*: encourages expert attractor subspaces to be orthogonal, preventing expert collapse.
 
-**Dissipative proxies:**
-- *Dissipation*: penalizes decreases in the learned scalar field $S$ along the total model update. Since the update also contains conservative, learned-bias, and noise terms, this is an entropy-potential change proxy.
-- *Dissipative form (monitor, no longer a loss)*: reports $\nabla S \cdot M(z)\nabla S / D$, the quadratic form of the mobility along the entropy gradient, plus the mobility's mean and minimum. It is worth watching because it collapses to zero exactly when the mobility dies. It **cannot** be a steering term: $\sigma \ge 0$ for any PSD $M$, so the old `relu(-\sigma)` penalty was identically zero and its weight could never fire. It is also not a pathwise stochastic entropy-production rate — that would need the Ito/divergence term $\nabla\cdot(M\nabla S)$.
-
-**Spectral losses:**
-- *Band-power loss*: Compares power in five frequency bands (delta/theta/alpha/beta/gamma, 0.5–50 Hz) between reconstructed and real EEG. This enforces frequency-domain fidelity beyond pixel-level MSE. Band matching only: the built-in 1/f estimator is gated behind `include_one_over_f=True` (standalone/ablation) because the spectral slope loss below is the single 1/f authority.
-- *Spectral slope loss*: Constrains the **aperiodic exponent** of reconstructed EEG and MEG. In the default data-driven mode the reference is the target signal's own exponent, estimated with the same peak-robust estimator, so the model reproduces whatever aperiodic structure the recording actually has — including the flattened exponents reported in epileptogenic tissue and seizure-onset zones (changes in 1/f-like scaling are a documented spectral biomarker there). A *fixed* pink target of $-1$ is the wrong objective for that reason: deviations from 1/f are the signal of interest, not an error to be penalised, and the exponent additionally varies with subject, cortical region, state, and the fitting range. `target_slope` (default $-1.0$) remains available as an explicit standalone/ablation fallback. The estimator is an iteratively reweighted log-log regression that rejects oscillatory peaks before the final fit, because peaks sit above the aperiodic background and bias a naive least-squares line — the specparam comparison reports Cohen's $d \approx 2.3$ between naive and peak-aware fitting. Operates on the reconstructed signal (not latent states) because 1/f is an observable signature, not a dynamical invariant. Requires at least 16 temporal samples; shorter sequences return zero loss and the fitting range is reported in the metrics. fMRI is excluded: the BOLD signal lives at 0.01–0.1 Hz, a different timescale where these constraints do not apply. Per-window exponents are logged (`psd_slope`, `psd_slope_reference`), which is the right artifact if the goal is *detecting* exponent shifts rather than enforcing them.
-
-**Why spectral constraints operate on reconstructed signals, not latent states.** We initially tracked a rolling buffer of latent states (`z_sequence`) and computed the spectral slope over this trajectory. This was incorrect for two reasons: (1) the buffer mixed states from 128 different batches/subjects, and computing the PSD of a mixed sequence is mathematically meaningless; (2) the 1/f property is an observable signature of neural signals, not a guaranteed property of latent dynamical trajectories. The corrected approach computes spectral constraints on the decoder output — the actual signal a neuroscientist would measure — which is where neurophysiological constraints properly belong.
-
 **Auxiliary losses:**
-- *NSP (Neurodynamics Statistics Prediction)*: Predicts band powers and functional connectivity from latent representations, inspired by the DeeperBrain model. Monitor/dormant at weight 0: the current implementation only matches band powers between reconstruction and target, duplicating the band-power loss; re-enable after implementing the latent→statistics prediction head.
-- *Cross-modal alignment*: Cosine similarity between active hub tokens (EEG/fMRI by default; MEG included when enabled). The class also implements a labeled mode (sync vs. async pairs) that subsumes the old soft-contrastive term; `cross_soft` is dormant at weight 0 because the trainer does not yet supply `cross_modal_labels`.
-- *Velocity smoothness*: Dormant at weight 0. The current implementation takes the TV over the *batch* axis of single-step `delta_z`, which shrinks inter-sample velocity diversity rather than enforcing temporal smoothness. Reactivate only as true temporal TV once rollouts emit `delta_z_sequence`.
-- *MoE load balancing*: Encourages uniform utilization across routed experts, preventing a single expert from dominating.
-- *Hebbian regularization*: Dormant at weight 0; Oja's rule already keeps $W^\top W \approx I$, and its input is detached `.data` (no gradient). The weight norm is logged as a monitor; spectral control happens through the periodic normalization pass in the training loop.
-- *Latent concentration (tsallis)*: Dormant at weight 0; SIGReg is the chosen anti-collapse term. The sign bug that rewarded concentration is fixed, so the term now penalises peaked softmax latents as intended and its monitor reads `latent_concentration`.
-- *Action loss*: Minimizes Expected Free Energy for active inference; active in Stage 3 when imagination is enabled.
-- *Replay loss*: Compares imagined states against engram traces for memory consolidation; active in Stage 3.
+- *NSP (Neurodynamics Statistics Prediction)*: Predicts band powers and
+  functional connectivity from latent representations, inspired by the
+  DeeperBrain model.  Monitor/dormant at weight 0: the current implementation
+  only matches band powers between reconstruction and target, duplicating the
+  band-power loss; re-enable after implementing the latent-to-statistics head.
+- *Cross-modal alignment*: Cosine similarity between active hub tokens
+  (EEG/fMRI by default; MEG included when enabled).  Every row carries an
+  explicit `cross_modal_labels` value: 1 for synchronized pairs and 0 for
+  intentionally asynchronous pairs.  The HRF bridge uses the same labels and
+  excludes asynchronous rows; missing labels fail closed.
+- *Velocity smoothness*: Temporal TV over emitted rollout
+  `delta_z_sequence`; it is dormant unless a phase enables it.
+- *MoE load balancing*: Encourages uniform utilization across routed experts,
+  preventing a single expert from dominating.
+- *Hebbian regularization*: Dormant at weight 0; Oja's rule already keeps
+  $W^\top W \approx I$, and its input is detached `.data` (no gradient).  The
+  weight norm is logged as a monitor; spectral control happens through the
+  periodic normalization pass in the training loop.
+- *Latent concentration (tsallis)*: Dormant at weight 0; SIGReg is the chosen
+  anti-collapse term.
+- *Action loss*: Matches predicted EFE to an explicit executed-action utility
+  target; it is not enabled by default because a self-generated EFE is not a
+  supervised action outcome.
+- *Replay loss*: Matches imagined states to an explicit replay target.  It
+  does not use the model's engram output as its own target.
+- *Intervention response*: Runs matched treated and baseline perturbations and
+  fits their predicted latent effect to an explicit `intervention_target`;
+  missing perturbation/effect contracts raise.
+
 
 ---
 
@@ -189,51 +254,115 @@ Where $\tilde{\mathcal{L}}_\ell$ is an EMA-normalized version of each steering l
 
 ### 4.1 Phased Curriculum
 
-Training proceeds through a single continuous run with nine sub-phases, progressively introducing complexity. No checkpoint save/restore gaps — the schedule is continuous.
+Training has two distinct representations: executable phase configurations
+and older token-ledger hypotheses. The executable CLI schedule is:
 
-| Phase | Tokens | Key Changes |
-|-------|--------|-------------|
-| **P0 (warmup)** | 0–0.8B | Encoder warmup. Magi EEG+MEG encoder trained from scratch or loaded from Phase -1. Backbone frozen after warmup. |
-| **P1** | 0.8–30B | Alignment + routing differentiation (τ=2.0). NSP + modal_align + meg_align active. Physics losses are **monitoring-only** (weight=0). |
-| **P2** | 30–60B | Dissipation (`L_dissip`) + spectral losses activated. NSP decays. Physical constraints begin guiding dynamics. |
-| **P3** | 60–90B | TV weight decay 0.1→0.02. Dissipation proxy active. |
-| **P4** | 90–120B | Router temperature tightens (2.0→0.7). EMA startup. Expert specialization begins. |
-| **P5** | 120–200B | Full physics-inspired constraint suite. Energy-change + Landauer diagnostics. Trajectory diagnostics audited; no stochastic EPR claim. |
-| **P6** | 200–260B | Long context (seq=4096). Async cross-modal contrastive (`L_cross_soft`) + slow manifold projection. |
-| **P7 (Stage 2)** | 260–334B | Seq→16384. Mamba-2 SSM. Full latent HRF bridge (`L_cross`). Adafactor switch. Grassmannian + Waddington. |
-| **P8 (Stage 3)** | 334–364B | Shared experts frozen. Hebbian Oja + online assimilation. Imagination 50%. Seq returns to 4096. |
+| CLI phase | Loop steps | Configured batch | Nominal batch visits* | Role |
+|---|---:|---:|---:|---|
+| **Phase -1** | 10,000 | 32 | 0.32M | Executable Magi v2 masked/causal/contrastive EEG pretraining |
+| **Stage 1 (P1–P6)** | 235,000 | 16 | 3.76M | Reconstruction, two-horizon forecast where declared, routing, and physics-inspired diagnostics |
+| **Stage 2** | 20,000 | 16 | 0.32M | Labelled cross-modal latent and HRF bridge |
+| **Stage 3** | 50,000 | 16 | 0.80M | Hebbian memory and online-assimilation hooks; policy losses are opt-in |
+| **Total** | **315,000** | — | **5.20M** | Current executable phase schedule |
 
-> **Phase -1** (Magi encoder standalone pretraining, ~800M tokens) is optional. If skipped, P0 trains the encoder from scratch.
+`*` Nominal batch visits are `loop steps × configured phase batch`; they are
+not token counts. DeepSpeed gradient accumulation, sampler reuse, and dataset
+windowing determine the effective global-sample count.
 
-**Total**: ~364B tokens, ~74 days on 64× V100 (16 nodes × 4 GPUs) at ~14.5% effective MFU.
+Stage 2 expands its model context from 4,096 to 8,192 to 16,384. Stage 3
+expands from 16,384 to 32,768 to 65,536. These schedules update model-side
+context buffers; they do **not** automatically change the `seq_seconds`
+windows constructed by the data loader. A valid long-context budget therefore
+requires an explicit data-window contract and a measured batch trace.
+
+The previous 67B/364B token plans and the 74-day estimate are retained only as
+historical arithmetic comparisons in §4.4. They are not validated execution
+targets.
 
 ### 4.2 Why MoE From the Start (No Dense Pretraining)
 
-Standard practice in MoE models (e.g., Mixtral) pretrains a dense model and then converts to MoE. MoE scaling laws (Krajewski et al., 2024; Ludziejewski et al., 2025; Zhao et al., 2025) show this is unnecessary for our scale: starting with E=4 MoE from step 1 requires 16B tokens, while dense initialization would need 140B tokens — infeasible on our hardware. We start with 8 shared + 6 routed experts directly, with a temperature curriculum that encourages broad exploration early and sharp specialization later.
+MoE-from-start remains an architectural hypothesis, not a measured scaling
+result. The current configuration starts with shared and routed experts to
+avoid a dense-to-MoE conversion, but the earlier 16B/140B token comparison
+has not been established by convergence or throughput measurements. Treat
+expert specialization, active-parameter counts, and data requirements as
+validation questions on held-out corpora.
 
 ### 4.3 Hardware and Distributed Training
 
-- **64× NVIDIA V100 16GB SXM2** (16 nodes × 4 GPUs)
-- **DeepSpeed ZeRO-2**: Gradients and optimizer states sharded across data-parallel nodes (~0.88 GB/GPU)
-- **Mixed precision**: FP16 compute with selective FP32 casting for numerically sensitive operations (router, Hebbian, KDA state accumulation). Non-CUDA backends (Intel XPU, Huawei Ascend NPU, Moore Threads MUSA, Cambricon MLU) default to FP16 in autocast (Ascend NPU is not bf16-friendly).
-- **Device-agnostic design**: All device references are centralized in `runtime/device_utils.py` with auto-detection priority CUDA→XPU→NPU→MUSA→MLU→CPU. No hardcoded `torch.cuda` or `.cuda()` calls outside this module.
+- **Local development:** CPU-only development is supported for tests, manifest inspection, and preprocessing. No local GPU throughput is assumed.
+- **16 GiB cards:** candidate tier for C. elegans, zebrafish, and mouse short-window runs with microbatch 1; peak memory must be measured on the target topology.
+- **24 GiB cards:** animal-profile pilot tier and human short-context ZeRO-3 smoke tests across multiple cards.
+- **32 GiB cards:** human short-context calibration tier; do not infer 16k or 65k feasibility without a real batch trace.
+- **48–80 GiB cards:** candidate tier for human medium/long-context experiments; 65,536-context training remains unclaimed until activation and communication peaks are measured.
+- **DeepSpeed ZeRO-2/3:** use the checked-in configs as starting points, with activation partitioning enabled and CPU checkpointing/offload disabled by default.
+- **Mixed precision:** FP16 autocast is configured with selective FP32-sensitive operations. The configuration keeps FP32 master weights, so parameter-only memory estimates must not be treated as FP16-weight estimates.
+- **Device-agnostic runtime:** all device references are centralized in `runtime/device_utils.py`; there is no hardcoded `.cuda()` path outside that module.
 
-### 4.4 MoE-aware token and data plan
+### 4.4 Compute budget: measured parameters, not a token target
 
-The current planning baseline is MoE-aware rather than dense-Chinchilla:
+The 67B and 364B token ledgers are historical planning hypotheses. Current parameter counts from the active species configurations are:
 
-| Stage | Active-parameter assumption | Planned tokens |
-|---|---:|---:|
-| Stage 0 | E=4 MoE, approximately 2B active parameters | 16B |
-| Stage 1 | Shared latent dynamics + multimodal adapters | 18B |
-| Stage 2 | Long-context Mamba-2 + cross-modal bridge | 20B |
-| Stage 3 | Frozen shared experts + online assimilation | 13B |
-| **Total** | — | **~67B** |
+| Profile | Parameters | FP16 export | Static training-state lower bound |
+|---|---:|---:|---:|
+| C. elegans | 2.81M | 0.005 GiB | 0.042 GiB |
+| Zebrafish | 14.78M | 0.028 GiB | 0.220 GiB |
+| Mouse | 60.33M | 0.112 GiB | 0.899 GiB |
+| Human core | ~1.411B | ~2.63 GiB | ~21.03 GiB |
 
-These are training-planning targets, not measured throughput or convergence
-results. The rationale is that dense Stage 0 would require roughly 140B tokens,
-whereas starting with MoE reduces the initial budget and preserves the
-specialization objective.
+The static lower bound uses approximately 16 bytes per parameter for FP16 model weights, FP32 master weights, gradients, and Adam states. It excludes activations, second-order physics graphs, temporary tensors, communication buckets, allocator fragmentation, and checkpoint duplication. Because the checked-in configuration keeps FP32 master weights and may retain FP32-sensitive live tensors, the actual static term can be closer to 20 bytes per parameter before those overheads.
+
+For an order-of-magnitude parameter-only comparison:
+
+$$
+F_{\mathrm{lower}} \approx 6PN
+$$
+
+where $P$ is the parameter count and $N$ is the number of sequence positions. The current human core therefore contributes approximately 8.466 GFLOP per position before model-specific overhead.
+
+| Position ledger | Parameter-only lower bound | Time at 1 effective PFLOP/s | Status |
+|---|---:|---:|---|
+| Historical 67B ledger | 0.567 ZFLOP | 6.57 days | Arithmetic comparison only |
+| Historical 364B ledger | 3.082 ZFLOP | 35.67 days | Arithmetic comparison only |
+| Historical 74-day claim | 7.417 ZFLOP | 85.84 days | Not reproduced; not a budget |
+
+The old 64×V100 assumption (`125 TFLOP/s × 14.5% effective MFU`) corresponds to approximately 1.16 effective PFLOP/s. At that rate, the 364B lower bound is approximately 30.75 days, so the 74-day claim contains an unmeasured approximately 2.41× overhead factor. Replace all such estimates with measured `FLOP/update × updates` after a representative cluster calibration.
+
+### 4.5 Data, storage, and controlled-intervention plan
+
+The first intervention ladder uses processed traces and explicit event metadata rather than raw imaging movies:
+
+| Corpus | Current measured source size | Intervention scope | Status |
+|---|---:|---|---|
+| Local C. elegans salt pilot | 0.197 GiB | Salt stimulus; not optogenetic | Ingested and verified |
+| Randi C. elegans PumpProbe, [OSF e2syt](https://api.osf.io/v2/nodes/e2syt/files/osfstorage/) | 0.858 GiB extracted data, 678 files | Neuron-targeted optogenetic stimulation; target IDs and stimulus files are present | First acquisition target |
+| [DANDI:001569](https://dandiarchive.org/dandiset/001569/draft) | 2.833 GiB, 13 NWB assets | Targeted two-photon photostimulation of rsChRmine-expressing neurons | Inspect one asset before full download |
+| [OpenNeuro ds001541](https://openneuro.org/datasets/ds001541/versions/1.1.3) | 6.947 GiB, 597 snapshot files | DRN population optogenetic fMRI | Use population/region scope, not neuron one-hot |
+| Velez-Angel et al. zebrafish lateral-line study | No public archive identified | Single-neuromast stimulation plus whole-brain calcium imaging | Contact-gated; not included in the storage budget |
+
+The four locally measurable sources above total approximately **10.835 GiB raw**. A conservative `raw + conversion + canonical cache` factor of 3 gives approximately **32.5 GiB** for a sequential working set; use **at least 100 GiB of cluster scratch** for the three-species pilot, including logs and checkpoints. A 25 GiB local volume is not sufficient to stage all sources safely. Collections above 100 GiB should be streamed or staged on **at least 500 GiB** of scratch/object storage.
+
+Optogenetic records must register a fixed target vocabulary and target scope before training. Sparse pulses use `control_reduction="peak"` or an equivalent pulse-preserving reduction; population fMRI controls must not be encoded as single-neuron identities. Human-scale training remains blocked until the intervention data contract, window lengths, and cluster calibration are all measured.
+
+### 4.6 VRAM feasibility and execution gates
+
+For the current human parameter count, static ZeRO estimates are:
+
+| Data-parallel world | ZeRO-2 static estimate/GPU | ZeRO-3 static estimate/GPU |
+|---:|---:|---:|
+| 4 cards | 9.20 GiB | 5.26 GiB |
+| 8 cards | 7.23 GiB | 2.63 GiB |
+| 16 cards | 6.24 GiB | 1.31 GiB |
+
+These values omit activation and communication peaks. A human run is considered cluster-ready only after a 1,000-update calibration records peak allocated/reserved VRAM, updates/s, measured FLOP/update, communication wait, and held-out-subject intervention metrics. The resulting budget is:
+
+$$
+\text{GPU-days} =
+\frac{11.574 \times F_{\mathrm{ZFLOP}}}
+{T_{\mathrm{effective,PF/s}}}
+$$
+
+No VRAM tier currently carries an unconditional 65,536-context guarantee.
 
 The cross-modal inventory is organized around:
 
@@ -244,14 +373,13 @@ The cross-modal inventory is organized around:
   protocols rather than simultaneous EEG-fMRI recordings.
 - Low-resolution EEG: TUH EEG, LEMON, and MPI-Leipzig.
 
-Dataset sizes and token counts remain acquisition/planning estimates until the
-corresponding files are downloaded, standardized, and measured locally.
+Dataset sizes and token/position counts remain acquisition estimates until the corresponding files are downloaded, standardized, and measured locally or on cluster scratch.
 
 ---
 
 ## 5. Stability and Monitoring
 
-Training a ~770M-parameter model (default) with a ~12-term steering loss stack, monitored auxiliary terms, and physical constraints requires layered defenses:
+Training this model family — from 2.8M/14.8M/60.3M animal profiles to the approximately 1.41B human profile — with a multi-term steering loss stack, monitored auxiliary terms, second-order physics graphs, and physical constraints requires layered defenses:
 
 **Seven-layer stability defense:**
 1. KDA state L1 normalization every 64 steps
@@ -311,7 +439,7 @@ Several design choices distinguish this project from conventional deep learning 
 ## 8. Current Status and Limitations
 
 **What works (verified by smoke tests on CPU; re-verified in the 2026-09 checkout):**
-- Full forward and backward pass — parameter totals are configuration-dependent. The `magi` encoder is vendored in-repo but needs the `transformers` package (absent from the local dev venv), so end-to-end totals could not be re-measured locally (2026-09); re-measure at first cluster launch. Measured in this checkout: MoE velocity block = 25.6M (default shallow experts) / 466.1M (`--use_deep_experts`). Historical smoke-test figures (~770M default / 147M reduced) date from the pre-revision deep-expert-default architecture (2026-05).
+- Full forward and backward pass — parameter totals are configuration-dependent. The `magi` encoder is vendored in-repo but needs the `transformers` package (absent from the local dev venv), so end-to-end totals could not be re-measured locally (2026-09); re-measure at first cluster launch. Measured in this checkout: MoE velocity block = 25.6M (default shallow experts) / 466.1M (`--use_deep_experts`). Older 770M/147M smoke-test totals came from a pre-revision architecture and are not valid resource estimates.
 - All steering loss terms compute correctly, including the spectral slope loss on reconstructed EEG/MEG; dormant terms are exercised in monitoring/ablation mode (2026-09)
 - Gradient flow verified across all components (encoder stack, velocity field, MoE, decoder)
 - Router state persists correctly across forward calls and resets
@@ -387,7 +515,18 @@ The canonical model lifecycle surface is intentionally small:
   `reset_router_state()` (phase-boundary state reset).
 - **Retained as useful model operations:** `forward_modalities()`,
   `reset_history()` (clears replay/KDA/active-inference state), and
-  `get_num_params()` (configuration diagnostics).
+  `get_num_params()` (all-module configuration diagnostics).
+- **Species-capacity reference:** use `get_dynamics_num_params()` plus the
+  configured `latent_dim`. It counts only `velocity_brain` and the optional
+  `moe_velocity` residual that contribute to `delta_z`; a disabled MoE reports
+  zero parameters. The profiles use latent dimensions 192/384/512/1024 and
+  Poisson ranks 32/64/64/128 for C. elegans/zebrafish/mouse/human. Encoders,
+  observation adapters, fusion, decoders, and active-inference modules are
+  observation transforms or auxiliary consumers, not the species-dynamics
+  capacity. This keeps the dynamics stack dominant in the small-animal and
+  mouse full-model budgets; the full human end-to-end checkpoint also contains
+  a deliberately large observation backbone and decoder, so its raw total is
+  not a valid dynamics-capacity comparison.
 - **Removed after consolidation:** `compute_loss()` duplicated the trainer's
   `TotalLoss` call and had no caller; `BrainMoEPINNConfig.from_dict()` and
   `.to_dict()` duplicated serialization already owned by `ExperimentConfig`.
@@ -398,10 +537,13 @@ The canonical training entrypoint is `train.py`; it accepts
 This is a breaking consolidation: old model-module imports and the former
 split training entrypoint are intentionally removed.
 
-**Hardware requirements:**
-- 64× V100 16GB SXM2 (16 nodes × 4 GPUs) for full-scale training
+**Hardware planning is profile-dependent:**
+- CPU-only local development for tests, manifest inspection, and preprocessing; no local GPU throughput claim
+- 16 GiB cards for animal-profile short-window pilots
+- 24–32 GiB cards for multi-card animal runs and human short-context calibration
+- 48–80 GiB cards for measured human long-context candidates
 - DeepSpeed ZeRO-2/3 with torchrun elastic training
-- ~74 days estimated training time at full scale
+- No fixed 64×V100 requirement or 74-day full-scale estimate is currently validated
 
 ### Magi v2 readiness and validation
 
@@ -417,21 +559,21 @@ Implemented in this checkout:
 
 Operational work still required before claiming cluster-scale readiness:
 
-- Download and validate NeuroSTORM, BrainLM, and Magi checkpoints.
-- Acquire priority DANDI datasets, starting with synchronized iEEG-fMRI
-  (`DANDI:000623`) and AJILE12 (`DANDI:000055`).
-- Re-measure end-to-end memory and throughput for the selected Magi/MoE
-  configuration; update DeepSpeed ZeRO settings accordingly.
-- Run multi-node forward/backward, checkpoint-resume, and elastic-recovery
-  tests on the target topology.
-- Run Magi Phase -1 pretraining or explicitly document that P0 trains the
-  encoder from scratch.
+- Acquire and validate the first intervention corpora: Randi C. elegans PumpProbe, DANDI:001569, and OpenNeuro ds001541; preserve target IDs, population scope, event timing, and source provenance.
+- Download one DANDI:001569 NWB asset and inspect target coordinates, photostimulation intervals, ROI traces, and clock units before staging the full draft.
+- Re-measure end-to-end memory and throughput for each target VRAM tier; record peak VRAM, FLOP/update, updates/s, communication wait, and checkpoint size.
+- Rebuild the token/position ledger from actual dataloader windows and phase configs; do not use the historical 67B/364B/74-day claims as resource commitments.
+- Run multi-node forward/backward, checkpoint-resume, and elastic-recovery tests on the target topology.
+- Run Magi Phase -1 against a real EEG loader and verify checkpoint/resume,
+  masked leakage, causal NTP, and EMA updates on the target topology.
 
 Validation is considered meaningful only when it covers reconstruction loss,
 gradient flow, router behavior, free-run stability, spectral fidelity,
 cross-modal alignment, parameter/memory budgets, and throughput. The
-architecture summary's predicted gains are hypotheses for those ablations,
-not results already established by this repository.
+historical compute numbers above are planning comparisons, not results already
+established by this repository. The architecture summary's predicted gains are
+hypotheses for those ablations, not results already established by this
+repository.
 
 ---
 
@@ -813,10 +955,11 @@ removed design documents live in git history.*
 - Trainer auto-routes generic models through that path and auto-enables
   per-modality reconstruction weights and criteria per phase
   (`augment_phase_loss_weights`, `make_dummy_generic_signals`).
-- Data plumbing: `train.py --data <profile.json>` builds real loaders -
-  paired EEG/fMRI/MEG (`PairedBrainDataset`, MEG optional per stem) and
+  Data plumbing: `train.py --data <profile.json>` builds real loaders -
+  paired EEG/fMRI/MEG (`PairedBrainDataset`, MEG optional per stem),
   manifest-driven species dict batches (`SpeciesSignalDataset`, contract
-  `{modality: (B, C, T)}` + optional masks/metadata). P0-P2 loader layer
+  `{modality: (B, C, T)}` + optional masks/metadata), and EEGdenoiseNet
+  clean/artifact view batches for Magi Phase -1. P0-P2 loader layer
   (2026-09): subject/session/condition manifests, group-preserving
   train/val/test splits (leave-subject-out), per-channel masks threaded
   into masked reconstruction, seconds-based windows with time padding,
@@ -829,18 +972,80 @@ removed design documents live in git history.*
   `delta_z_sequence`; `VelocitySmoothnessLoss` is true temporal TV over
   that axis (single-step inputs return zero - legacy batch-axis TV
   semantics removed).
-- Time conventions: `latent_dt` (seconds per latent frame) flows from the
-  species sample rate through `BrainMoEPINNConfig` to the model; the OU
-  noise integrator and deterministic drift synchronize to it when provided
-  (default None keeps legacy per-module values). One latent step advances
-  `z <- z + latent_dt * delta_z`; physical durations are
-  `frames * latent_dt`.
+- Time conventions: every time-valued quantity is declared in **seconds**
+  (species profile: `sample_rate_hz`, `sequence_seconds`; modules: `tau`s),
+  frame counts are derived (`frames = seconds * rate`) at the data boundary,
+  and a latent step's physical duration is supplied per batch. One latent
+  step advances `z <- z + dt * delta_z`, where `dt` is scalar (legacy) or one
+  value per sample; the MT-KDA time constants, the OU transition and the
+  emission filter all evaluate with that duration, so their seconds semantics
+  hold for any sampling rate. `latent_dt` remains the nominal per-species
+  clock used when a batch supplies none.
+- Per-sample rates: `species.sample_rate_hz_source` is `"profile"` (uniform
+  corpus; the loader *validates* every manifest row against `sample_rate_hz`
+  and raises on mismatch) or `"manifest"` (rates vary per recording, e.g.
+  per-worm C. elegans imaging; the manifest clock is authoritative). Batches
+  carry `dt` (seconds per frame) and, when replay mixes species, a per-sample
+  `species` tag that reaches the model's conditioning.
+- One model per species, one shared code path: a ladder stage runs its own
+  `BrainMoEPINN` against its own ladder, profile and observation channels.
+  Species are never mixed inside a batch or a model instance -- channel
+  spaces and reporters differ, so a joint batch is not representable;
+  cross-stage continuity comes from checkpoint transfer between stages.
+- Dynamics -> fMRI (`core/hrf.py`, `readout: "bold"`): the observation
+  channel for BOLD. Friston et al. 2003 (NeuroImage 19:1273-1302,
+  Eq. (3)-(4) + Table 1) supplies the *structure and the initialisation* --
+  the Balloon-Windkessel impulse response (kappa/gamma/tau/alpha/rho/V0 =
+  0.65/0.41/0.98/0.32/0.34/0.02) -- but not fixed physics: our drive is an
+  internal latent with an arbitrary scale, not the DCM's neuronal state, so
+  the emission is `reference HRF + zero-initialised smooth correction`,
+  fitted with the corpus's own objective. It is causal, TR-aware (the
+  recording's frame interval is the TR; the drive is held across each TR)
+  and reports measured descriptors of the *effective* HRF (peak latency,
+  FWHM, undershoot ratio, deviation from the reference), which is what makes
+  a human (~5 s peak) and a mouse (~1-2 s) response comparable without
+  trusting the parameterisation. `human.json`/`mouse.json` declare it under
+  `data.sensors.fmri`; electrical modalities are skipped (their own
+  encoder/decoder carries the physics), and a non-haemodynamic reporter
+  under `fmri` is rejected.
+- Zebrafish (`data/zapbench.py`): ZAPBench (arXiv:2503.02618) whole-brain
+  light-sheet traces (71,721 cells x 7,879 volumes at 914 ms/volume, nuclear
+  GCaMP7f) mapped to the ladder as **one session per stimulus condition**
+  (`subject` = animal, `session`/`condition` = gain/dots/flash/taxis/turning/
+  position/open loop/rotation/dark; `taxis` is the benchmark holdout), the
+  26-d stimulus-feature bank as a control-role `stimulus` modality, and
+  `--region-bins`/`--max-cells` reduction because 71,721 cells exceed every
+  channel cap. `--rate-hz` is required: the volume interval is never assumed.
 - Ingestion + sanity for real calcium recordings:
   `data/ingest_c_elegans.py` (time-major CSV -> `(C, T)` npy ladder +
-  manifest) and `tools/real_data_sanity.py` (real-data forward/backward
-  with species reconstruction criteria). Verified on the salt-stimulus
-  C. elegans recordings (batch-1; per-worm channel counts differ).
-
+  manifest) and `tools/real_data_sanity.py` (real-data forward/backward with
+  species reconstruction criteria, reported next to persistence/channel-mean
+  baselines). The ingest takes per-sample frame rates and the salt-stimulus
+  timing from `stimulation_timing.xlsx` (gKDR-GMM), applies the reference
+  channel quality filter (`autocorr(lag=20) > 0.3`, ~46% of named channels on
+  the pilot), writes the salt drive as a control-role `stimulus` modality plus
+  `stimulus_trials/*.json`, and records animal/anaesthesia provenance so a
+  re-imaged animal cannot be split across train and val. Verified on the
+  24-worm salt pilot: 1,625 canonical channels, rates 3.69-5.72 fps,
+  60 s windows (244 frames at the median rate).
+- Observation channel (`data.sensors`, resolved by `core/sensors.py`): every
+  optical modality declares its **imaging method** (LSFM/SPIM, LFM/XLFM,
+  remote-scanning LSFM, SCAPE/3D-AOD two-photon, spinning-disk 4D, widefield
+  2P) and its **functional reporter** (GCaMP6f/6s/7f, jGCaMP8f/s,
+  H2B-GCaMP6s/7f, YC2.60 FRET, Positron2-Kv, Voltron, Arch, pERK). That pair
+  fixes the frame-integration window, the slice/plane phase smear, the readout
+  kind (`dff`/`ratio`/`voltage`/`static`) and whether windowed dynamics are
+  meaningful at all (a pERK fixed-tissue map is refused for next-step
+  targets). With `features.use_sensor_emission` (on for `c_elegans` and
+  `zebrafish`) the decoder emits through that channel -- per-channel
+  indicator low-pass in **seconds** plus a Hill saturation for
+  calcium-family reporters, skipped for GEVI voltage -- and reports the
+  fitted `tau`/`h`/`Kd` with its provenance (`imaging`, `reporter`,
+  `calibration_required`). The latent dynamics are untouched; reconstruction
+  metrics carry their units and their persistence/channel-mean baselines.
+  Control tracks are validated too: `control_diagnostics` reports
+  `control_active_frac` and `control_collapse_ratio`, and training warns once
+  when a single-step rollout reduces an alternating drive to ~0.
 **Diagnostics, stability, preprocessing**
 - Offline diagnostics: `diagnostics/free_run_metrics.py` (multi-axis
   generative quality), `diagnostics/scaling_probe.py`,
@@ -928,19 +1133,22 @@ removed design documents live in git history.*
 | Priority | Item | Action |
 |---|---|---|
 | HIGH | Pretrained checkpoints | Download NeuroSTORM/BrainLM/Magi weights; CLI and loaders are ready |
-| HIGH | Real corpora ingestion | Loader layer complete (P0-P2) and ingestion scripts run-ready: `data/hf_celegans.py` (inspect verified: 42,798 (worm, neuron) rows, resample dt 0.333 s → `download` → `ingest` to canonical ladder) and `data/ingest_c_elegans.py` (salt pilot + gKDR metadata name filtering for cross-worm alignment). Next: execute the HF download/ingest, re-run salt ingest with `--filter-known`, then multi-worm union-aligned batches; ZAPBench/Allen adapters stay on `data/readers.py` |
-| HIGH | Cluster bring-up | Multi-node smoke (`torchrun --nnodes=2 --nproc_per_node=4`, DeepSpeed ZeRO-2): forward/backward, checkpoint save/load, elastic resume; re-measure end-to-end params and V100 16GB memory against the §4.4 plan |
-| MED | Phase -1 Magi v2 pretraining | Requires the ECoG dataset downloads (e.g. AJILE12); Magi's own masked/MoCo/PSD losses are not yet wired into the trainer (documented in `NEGATIVE_ONE_PHASE`) |
+| HIGH | Dynamics -> fMRI (BOLD) | Implemented as a learnable emission (`core/hrf.py`): Friston 2003 Balloon-Windkessel response as the initialisation, zero-init smooth correction + learnable vasodilatory lag, gains and compressive output; causal, TR-aware, and reporting the measured effective-HRF peak/FWHM/undershoot plus the deviation from the reference. Wired for `human`/`mouse` (`data.sensors.fmri`). Next: fit it on a real BOLD corpus (Kondo mouse widefield fMRI / HCP-style human runs) and compare the fitted peak latency against the measured HRF |
+| HIGH | Targeted intervention corpora | Randi C. elegans PumpProbe, DANDI:001569, and OpenNeuro ds001541 are the first controlled-stimulation sources; download/inspect event timing and target scope, register fixed vocabularies, and run pulse-preserving and held-out-target validation |
+| HIGH | Zebrafish (ZAPBench) | Adapter implemented and verified offline against the release constants (`data/zapbench.py`: condition sessions, 26-d stimulus control, region/cell reduction, mandatory `--rate-hz`, provenance columns; `configs/species/zebrafish.json` + `configs/data/zebrafish_zapbench.json`). Next: point `--source` at `gs://zapbench-release/volumes/20240930/traces` (zarr + gcsfs) and ingest a region-reduced subset |
+| HIGH | Real corpora ingestion | **Salt pilot ingested and verified** (2026-09): per-sample frame rates + salt-stimulus timing from `stimulation_timing.xlsx`, reference `autocorr(lag=20) > 0.3` channel QC, animal/anaesthesia provenance, control-role `stimulus` track; 1,625 canonical channels, 24 samples / 21 animals. `data/hf_celegans.py` verified live against the remote parquet (42,798 rows; unlabeled-slot rows now dropped by default). Next: run `hf_celegans download/ingest`, then multi-worm union-aligned batches (the shipped `configs/data/c_elegans_salt.json` already sets `align_channels`); ZAPBench/Allen adapters stay on `data/readers.py` |
+| HIGH | Cluster bring-up | Multi-node smoke (`torchrun --nnodes=2 --nproc_per_node=4`, DeepSpeed ZeRO-2/3): forward/backward, checkpoint save/load, elastic resume; profile 16/24/32/48–80 GiB tiers and re-measure target-topology VRAM and throughput before any full-scale run |
+| MED | Phase -1 Magi v2 pretraining | `configs/data/eegdenoisenet.json` now provides an EEG-only clean/artifact loader; materialize the public arrays, then run topology-specific checkpoint/resume, masked-leakage, causal-NTP, and EMA validation |
 | MED | Time constants | `latent_dt` single-source done (species sample rate → model; OU integrator synced, default-preserving). Remaining: wire-or-drop `SlowGateTransition` (zero callers today); document seconds conventions for monitors/free-run cadence |
 | MED | Marginal recalibration | Recalibrate OU projection and per-component gains on held-out rollouts before claiming output-marginal preservation |
 | MED | Subject adaptation | Re-review the low-rank test-time adaptation design and wire into Stage 3 |
 | LOW | Housekeeping | Move `__main__` demos to `examples/` (`tests/conftest.py` already bootstraps imports for pytest) |
-| MED | Unwired config keys | `replay_species` (species JSONs + `ladder.json`) is validated for known species but never used to build replay data; `human.json` lists `behavior` with no declared role. Both are declared-but-inert — wire or drop |
+| MED | Unwired config keys | `replay_species` and the implicit cross-species mixing contract were removed (2026-09): each ladder stage trains its own model against its own ladder, so the flag had no consumer. Remaining inert key: `human.json` lists `behavior` with no declared role |
 | MED | MoE structure scope | With `use_generic_moe=False` (default) experts add an unconstrained velocity, so the *composite* field is not GENERIC (measured: `moe_velocity_share` ≈ 0.76, `moe_energy_alignment` ≈ 0.16 at init). Ablations in §6 therefore test the backbone. Structured mode is affordable now (96M vs 26M, was 379M) but needs a training comparison before becoming the default |
 | MED | Trajectory discriminator supervision | The CFTS `TrajectoryDiscriminator` that selects paths is shaped only indirectly (soft weights → endpoint EFE → `ActionLoss`, weight 0.05 in Stage 3). "Best trajectory" is closer to a learned preference direction than a supervised selector |
 | MED | MT-KDA scope | The multi-time-scale filter is applied inside `VelocityBrain`, so it smooths the backbone but **not** the MoE velocity added afterwards in `_latent_step`. Its states are also detached (no BPTT through the filter) and reset per forward |
 | LOW | Perception correction | Now a free-energy gradient step (`active_inference_step`, default 0.1) instead of a detached pull toward the rollout endpoint. Needs a step-size sweep on real runs |
-| LOW | Perturbation validation | Control input is now wired from stimulus-role data (roles → perturbation reduction → conditioned gates, `--noise_mode` policy). Remaining: C. elegans optogenetic-style validation protocol on ingested corpora |
+| LOW | Perturbation validation | Control input is wired from stimulus-role data (roles → perturbation reduction → conditioned gates, `--noise_mode` policy); optogenetic target-gated encoding and pulse-preserving reduction are now implemented. Remaining: acquire Randi/zebrafish/mouse intervention corpora, register neuron versus population target scopes and fixed vocabularies, use `peak` for sparse pulses, and run held-out-target validation |
 | MED | Conditioned diffusion (P2.2) | Diffusion gain `σ(u)` conditioned on control (zero-init bounded gain, default identity) — deferred until control metrics are reviewed on salt/HF ingests |
 | RESOLVED | torch_xla rebinds `nn.GRU` globally | **Cause confirmed**: importing torch_xla rebinds the class itself (`nn.GRU -> torch_xla.experimental.gru.GRU`) via `torch_xla/_patched_functions.py:69`, `nn.GRU = _pathch_module(nn.GRU, ScanGRU)` - a *global* rebind with no env guard, so CPU/CUDA input raises `RuntimeError: Expected all tensors in the given list to be XLA tensors`. Minimal repro: the same call works with torch_xla unimportable and fails the moment it is imported. `runtime.device_utils.device_aware_gru()` subclasses the installed class and routes **per call from the input tensor**: XLA input keeps the scan path, anything else uses the native class that `_pathch_module` stores as `_orig`. Hosts without torch_xla get plain `nn.GRU` untouched, so CUDA/CPU code paths are unchanged, and parameter names stay identical (checkpoint-compatible) |
 | MED | Multi-worker DataLoaders | `build_data_loaders` defaults to `num_workers: 4`, so any profile omitting the key forks workers. Two independent hazards: (1) fork-after-threads deadlocks on runtimes that start threads (torch_musa does) - observed hanging the suite on the MTT S4000, waiting forever in `_try_get_data`; (2) on that same MUSA stack multi-worker loading cannot work at all, because torch_musa's patched `torch/multiprocessing/reductions.py` tests `storage.is_musa`, which the installed torch build does not define, so **any** tensor crossing a worker boundary raises `AttributeError` and the parent hangs. Reproduced with a trivial dataset, so it is not this repo's code. `spawn` was tried as a fix and reverted: it imposes an `__main__` guard on every caller and does not help where (2) applies. Test profiles pin `num_workers: 0`; use in-process loading on MUSA until the torch/torch_musa versions match |

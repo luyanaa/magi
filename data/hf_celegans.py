@@ -132,18 +132,36 @@ def download(out: Path, url: str = HF_URL) -> Path:
     return out
 
 
-def ingest(parquet: Path, out_root: Path, limit: Optional[int] = None) -> None:
-    """Convert the long-format parquet into the canonical ladder layout."""
+def ingest(parquet: Path, out_root: Path, limit: Optional[int] = None,
+           keep_unlabeled: bool = False) -> None:
+    """Convert the long-format parquet into the canonical ladder layout.
+
+    Rows with ``is_labeled_neuron == False`` carry a *recording-local slot*
+    index as their ``neuron`` name, not a cell identity: across the corpus 103
+    such tokens recur in more than one worm (one in 268 worms), so keeping them
+    would make union-alignment merge unrelated cells. They are dropped by
+    default (~23% of rows, 9,919/42,798); pass ``keep_unlabeled=True`` only for
+    single-worm analysis.
+    """
     import pyarrow.parquet as pq
     out_root = Path(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
     table = pq.read_table(
         parquet,
-        columns=["source_dataset", "raw_data_file", "worm", "neuron",
+        columns=["source_dataset", "raw_data_file", "worm", "neuron", "slot",
                  "calcium_data", "time_in_seconds", "max_timesteps",
                  "is_labeled_neuron"])
     rows = table.to_pylist()
     print(f"[hf] {len(rows)} (worm, neuron) rows")
+
+    if not keep_unlabeled:
+        labeled = [r for r in rows if r["is_labeled_neuron"]]
+        dropped = len(rows) - len(labeled)
+        if dropped:
+            print(f"[hf] dropped {dropped} unlabeled-slot rows "
+                  f"({100.0 * dropped / max(1, len(rows)):.1f}%); their "
+                  f"'neuron' field is a per-worm slot index, not an identity")
+        rows = labeled
 
     by_worm: Dict[Tuple[str, str], List[dict]] = {}
     for row in rows:
@@ -160,9 +178,18 @@ def ingest(parquet: Path, out_root: Path, limit: Optional[int] = None) -> None:
     if limit is not None:
         order = order[:max(1, int(limit))]
 
+    # Provenance: which raw release file each (dataset, worm) came from.
+    source_series: Dict[Tuple[str, str], str] = {}
+    for key, entries in by_worm.items():
+        series = {r.get("raw_data_file") or "" for r in entries}
+        source_series[key] = ";".join(sorted(s for s in series if s))
+
     def emit(key, entries):
         worm, origin = key
-        neuron_rows = sorted(entries, key=lambda r: r["neuron"])
+        # Channel order is the recording's own slot order, so the ladder keeps
+        # the array layout of the release (ties broken by name for stability).
+        neuron_rows = sorted(entries, key=lambda r: (r.get("slot") or 0,
+                                                     r["neuron"]))
         names = [r["neuron"] for r in neuron_rows]
         t_max = max((r["max_timesteps"] or 0) for r in neuron_rows)
         if t_max < 1:
@@ -195,12 +222,15 @@ def ingest(parquet: Path, out_root: Path, limit: Optional[int] = None) -> None:
         sample_id, worm, origin = emit(key, by_worm[key])
         manifest_rows.append({
             "sample_id": sample_id,
-            "subject": worm,
+            "subject": f"{origin}::{worm}" if worm in duplicate else worm,
             "session": "1",
             "origin": origin,
             "condition": "",
             "rate_hz": str(round(1.0 / RESAMPLE_DT_S, 4)),
             "dt_s": str(RESAMPLE_DT_S),
+            "channels": str(len(by_worm[key])),
+            "labeled_only": "0" if keep_unlabeled else "1",
+            "source_series": source_series.get(key, ""),
         })
     _write_rows(out_root / "manifest.csv", manifest_rows)
     print(f"[hf] ingested {len(order)} worms -> {out_root}")
@@ -219,13 +249,17 @@ def main() -> None:
     ing.add_argument("--out", required=True)
     ing.add_argument("--limit", type=int, default=None,
                      help="ingest at most N worms (smoke runs)")
+    ing.add_argument("--keep-unlabeled", action="store_true",
+                     help="keep unlabeled-slot rows (per-worm placeholders "
+                          "with no cross-worm identity; off by default)")
     args = parser.parse_args()
     if args.command == "inspect":
         inspect()
     elif args.command == "download":
         download(Path(args.out))
     else:
-        ingest(Path(args.parquet), Path(args.out), limit=args.limit)
+        ingest(Path(args.parquet), Path(args.out), limit=args.limit,
+               keep_unlabeled=args.keep_unlabeled)
 
 
 if __name__ == "__main__":

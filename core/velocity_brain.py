@@ -114,7 +114,8 @@ class OUStructuredNoise(nn.Module):
     def is_per_dim(self) -> bool:
         return self.D.numel() > 1
 
-    def forward(self, x: torch.Tensor, noise_state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, noise_state: Optional[torch.Tensor] = None,
+                dt=None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Apply OU-structured noise to a velocity input.
 
@@ -139,6 +140,10 @@ class OUStructuredNoise(nn.Module):
         Args:
             x: (B, d) velocity input
             noise_state: Optional (B, d) previous unit-variance OU state
+            dt: Optional step duration in seconds (scalar or per-sample);
+                defaults to the constructor value. Pass the *physical*
+                duration of the latent step, so ``tau``/``D`` keep their
+                seconds/units meaning regardless of the sampling rate.
         Returns:
             x_noisy: (B, d) with OU noise added in velocity units
             noise_state: (B, d) new OU state for the next step
@@ -146,12 +151,40 @@ class OUStructuredNoise(nn.Module):
         if noise_state is None:
             noise_state = torch.zeros_like(x)
 
-        decay = math.exp(-self.dt / self.tau)
-        innovation = math.sqrt(max(1.0 - decay * decay, 0.0))
+        step = (torch.as_tensor(self.dt, dtype=x.dtype, device=x.device)
+                if dt is None else as_step_dt(dt, x.shape[0], x.device, x.dtype))
+        decay = torch.exp(-step / self.tau)
+        innovation = torch.sqrt((1.0 - decay * decay).clamp_min(0.0))
         noise_state = decay * noise_state + innovation * torch.randn_like(x)
 
-        noise = torch.sqrt(2.0 * self.D / self.dt) * noise_state
+        noise = torch.sqrt(2.0 * self.D / step) * noise_state
         return x + noise, noise_state
+
+
+def as_step_dt(dt, batch_size: int, device, dtype) -> torch.Tensor:
+    """Normalize a latent step duration to a broadcastable tensor.
+
+    ``dt`` may be a python number, a 0-dim tensor (one duration for the whole
+    batch) or a ``(B,)``/``(B, 1)`` tensor (one duration per sample, as
+    required when a batch mixes recordings with different sampling rates).
+    Returned shape is ``()`` or ``(B, 1)`` so it broadcasts against ``(B, d)``
+    latent tensors.
+    """
+    if isinstance(dt, torch.Tensor):
+        value = dt.detach().to(device=device, dtype=dtype)
+    else:
+        value = torch.as_tensor(float(dt), device=device, dtype=dtype)
+    if value.dim() == 0:
+        if float(value) <= 0:
+            raise ValueError("dt must be positive")
+        return value
+    if value.numel() != int(batch_size):
+        raise ValueError(
+            f"dt must be a scalar or carry one value per sample "
+            f"({batch_size}); got {value.numel()}")
+    if bool((value <= 0).any()):
+        raise ValueError("dt must be positive")
+    return value.reshape(-1, 1)
 
 
 class GenericPoissonOperator(nn.Module):
@@ -583,6 +616,7 @@ class VelocityBrain(nn.Module):
         noise_state: Optional[torch.Tensor] = None,
         perturbation: Optional[torch.Tensor] = None,
         apply_noise: bool = False,
+        dt=None,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute velocity field delta_z from current state z.
@@ -592,6 +626,11 @@ class VelocityBrain(nn.Module):
             salience: (B, d) optional salience activation for mobility
             perturbation: (B, u) optional exogenous intervention/control input
             apply_noise: whether to apply OU noise
+            dt: Optional physical duration of this latent step (seconds;
+                scalar or one value per sample). Defaults to the module's
+                ``integration_dt``. The MT-KDA time constants and the OU
+                transition are evaluated with this duration, so their
+                seconds semantics hold for any sampling rate.
             dict with:
                 - delta_z: (B, d) predicted velocity
                 - new_noise_state: (B, d) updated noise state
@@ -664,11 +703,12 @@ class VelocityBrain(nn.Module):
         delta_z = poisson_term + mobility_term + arousal_term + control_term
 
         # Apply multi-time-scale KDA decay
-        delta_z = self.mt_kda(delta_z, dt=self.integration_dt)
+        delta_z = self.mt_kda(delta_z, dt=self.integration_dt if dt is None else dt)
 
         new_noise_state = None
         if apply_noise:
-            delta_z, new_noise_state = self.ou_noise(delta_z, noise_state)
+            delta_z, new_noise_state = self.ou_noise(
+                delta_z, noise_state, dt=dt)
 
         # Degeneracy residuals.  With the projectors active both conditions
         # hold by construction (P_S grad_S == 0 and P_E grad_E == 0), so the
@@ -829,16 +869,20 @@ class MultiTimeScaleKDA(nn.Module):
         state_b = self._state_for_batch(self.state_b, batch_size)
         state_c = self._state_for_batch(self.state_c, batch_size)
 
-        decays = self.alphas
         if self.time_constants is not None and dt is not None:
-            if dt <= 0:
-                raise ValueError("dt must be positive")
-            decays = tuple(
-                math.exp(-float(dt) / tau)
-                for tau in self.time_constants)
-        state_a = decays[0] * state_a + (1 - decays[0]) * delta_z
-        state_b = decays[1] * state_b + (1 - decays[1]) * delta_z
-        state_c = decays[2] * state_c + (1 - decays[2]) * delta_z
+            step = as_step_dt(dt, batch_size, delta_z.device, delta_z.dtype)
+            taus = torch.as_tensor(
+                self.time_constants, device=delta_z.device,
+                dtype=delta_z.dtype).reshape(-1, 1, 1)
+            decays = torch.exp(-step.reshape(1, *step.shape) / taus)
+        else:
+            decays = torch.as_tensor(
+                self.alphas, device=delta_z.device,
+                dtype=delta_z.dtype).reshape(-1, 1, 1)
+
+        state_a = decays[0] * state_a + (1.0 - decays[0]) * delta_z
+        state_b = decays[1] * state_b + (1.0 - decays[1]) * delta_z
+        state_c = decays[2] * state_c + (1.0 - decays[2]) * delta_z
 
         combined = torch.cat([state_a, state_b, state_c], dim=-1)
         weights = self.mix_weights(combined)

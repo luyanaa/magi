@@ -28,6 +28,12 @@ class MomentumEncoder(nn.Module):
     def momentum_encoder(self) -> nn.Module:
         """Return the frozen EMA copy using the v2-compatible name."""
         return self.encoder
+    def train(self, mode: bool = True):
+        """Keep the frozen EMA encoder in evaluation mode."""
+        super().train(mode)
+        self.encoder.eval()
+        return self
+
 
     @torch.no_grad()
     def update(self) -> None:

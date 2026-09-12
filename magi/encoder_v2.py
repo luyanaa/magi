@@ -12,16 +12,17 @@ Key upgrades from v1:
 - Amplitude normalization for ECoG (~20× scalp EEG)
 """
 
+import copy
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict, Any
-
-from .patch_embedding import EEGMasking
 from .magi_v2 import (
     MagiV2EEGEncoder,
     create_magi_v2_from_v1,
 )
 from .momentum import MomentumEncoder
+from .patch_embedding import EEGMasking
 
 
 
@@ -141,6 +142,9 @@ class EEGFoundationModelV2(nn.Module):
             nn.Linear(hidden_dim, projection_dim),
             nn.LayerNorm(projection_dim),
         )
+        self.momentum_proj_head = copy.deepcopy(self.proj_head)
+        for parameter in self.momentum_proj_head.parameters():
+            parameter.requires_grad = False
         
         # Adversarial subject classifier (GRL-based regularizer)
         self.subject_classifier = nn.Sequential(
@@ -180,81 +184,91 @@ class EEGFoundationModelV2(nn.Module):
         )
         
         return last_hidden, pooler_output
-    
     def forward_masked_prediction(
         self,
         eeg: torch.Tensor,
         channel_names: Optional[List[List[str]]] = None,
         channel_types: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Forward pass for masked prediction task.
-        
-        Args:
-            eeg: (B, C, T) raw EEG signals
-            channel_names: List of channel names
-            channel_types: Channel type tensor
-        
-        Returns:
-            masked_tokens: (B, num_tokens, D) token embeddings after masking
-            mask: (B, num_tokens) boolean mask (1 for masked, 0 for visible)
-            pred_patches: (B, num_tokens, patch_size_time) predicted patches
-        """
-        # Get token embeddings
-        tokens, _ = self.forward_embeddings(eeg, channel_names, channel_types)
-        
-        # Apply masking
-        masked_tokens, mask, _ = self.masking(tokens)
-        
-        # Get encoder output on masked tokens
-        B, N, D = masked_tokens.shape
-        C = eeg.shape[1]
-        num_times = N // C
-        
-        # Pass through encoder (need to reshape for factorized attention)
-        last_hidden, _ = self.base_encoder.encoder(
-            masked_tokens,
-            num_channels=C,
-            num_times=num_times,
-        )
-        
-        # Predict masked patches
+        return_targets: bool = False,
+    ):
+        # Metadata normalization is independent of signal values. The
+        # amplitude statistics are computed from the masked support below, so
+        # changing a masked patch cannot perturb visible tokens.
+        prepared_eeg, prepared_names, prepared_types = (
+            self.base_encoder._prepare_inputs(
+                eeg, channel_names, channel_types,
+                normalize_amplitude=False))
+        with torch.no_grad():
+            shape_tokens, channels, num_times = (
+                self.base_encoder.embed_tokens(
+                    prepared_eeg, channel_names=prepared_names,
+                    channel_types=prepared_types,
+                    normalize_amplitude=False))
+            _, sampled_mask, _ = self.masking(
+                shape_tokens, num_channels=channels)
+        mask = self.base_encoder.expand_patch_mask(
+            sampled_mask, channels, num_times)
+        masked_raw = self.base_encoder.mask_raw_patches(
+            prepared_eeg, sampled_mask, channels, num_times)
+        if (prepared_types is not None
+                and self.base_encoder.use_channel_type_embed):
+            stats = self.base_encoder._normalization_stats(
+                masked_raw, prepared_types)
+            masked_eeg = self.base_encoder._normalize_amplitude(
+                masked_raw, prepared_types, stats=stats)
+            target_eeg = self.base_encoder._normalize_amplitude(
+                prepared_eeg, prepared_types, stats=stats)
+        else:
+            masked_eeg = masked_raw
+            target_eeg = prepared_eeg
+        masked_inputs, _, _ = self.base_encoder.embed_tokens(
+            masked_eeg, channel_names=prepared_names,
+            channel_types=prepared_types, normalize_amplitude=False)
+        mask_token = self.masking.mask_token.expand_as(masked_inputs)
+        masked_tokens = masked_inputs.clone()
+        masked_tokens[mask] = mask_token[mask]
+        last_hidden, _ = self.base_encoder.encode_tokens(
+            masked_tokens, channels, num_times, causal=False)
         pred_patches = self.mask_head(last_hidden)
-        
+        targets = self.base_encoder.extract_patches(
+            target_eeg, channel_types=prepared_types,
+            normalize=False).reshape(
+                eeg.shape[0], channels * num_times, self.patch_size_time)
+        if return_targets:
+            return masked_tokens, mask, pred_patches, targets
         return masked_tokens, mask, pred_patches
     
     def forward_contrastive(
         self,
-        eeg: torch.Tensor,
-        channel_names: Optional[List[List[str]]] = None,
-        channel_types: Optional[torch.Tensor] = None,
+        eeg1: torch.Tensor,
+        eeg2: Optional[torch.Tensor] = None,
+        channel_names1: Optional[List[List[str]]] = None,
+        channel_types1: Optional[torch.Tensor] = None,
+        channel_names2: Optional[List[List[str]]] = None,
+        channel_types2: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass for contrastive learning.
+        """Encode distinct query/key views with the EMA key encoder."""
+        if eeg2 is None:
+            raise ValueError(
+                "forward_contrastive requires two augmented EEG views")
+        if eeg1.shape != eeg2.shape:
+            raise ValueError("contrastive views must have identical shapes")
+        if torch.equal(eeg1.detach(), eeg2.detach()):
+            raise ValueError("contrastive views must be distinct augmentations")
 
-        TODO: This currently passes the SAME view to both query and key encoders.
-        V1's forward_contrastive takes two augmented views (eeg1, eeg2).
-        For proper contrastive learning, this should accept two differently
-        augmented views of the same input.
-
-        Returns:
-            query: (B, projection_dim) query projection
-            key: (B, projection_dim) key projection from momentum encoder
-        """
-        # Query encoder (base encoder)
-        _, query_pooler = self.forward_embeddings(eeg, channel_names, channel_types)
-        query = self.proj_head(query_pooler)
-        
-        # Key encoder (momentum encoder)
+        _, query_pooler = self.forward_embeddings(
+            eeg1, channel_names1, channel_types1)
+        query = F.normalize(self.proj_head(query_pooler), dim=-1)
         with torch.no_grad():
             self.momentum_encoder.eval()
             _, key_pooler = self.momentum_encoder(
-                eeg=eeg,
-                channel_names=channel_names,
-                channel_types=channel_types,
+                eeg=eeg2,
+                channel_names=channel_names2 or channel_names1,
+                channel_types=(
+                    channel_types2
+                    if channel_types2 is not None else channel_types1),
             )
-            key = self.proj_head(key_pooler)
-        
+            key = F.normalize(self.momentum_proj_head(key_pooler), dim=-1)
         return query, key
     
     def forward_adversarial_subject(
@@ -280,9 +294,15 @@ class EEGFoundationModelV2(nn.Module):
         
         return subject_logits
     
+    @torch.no_grad()
     def update_momentum_encoder(self):
-        """Update momentum encoder with EMA."""
+        """Update the EMA encoder and its key projection after an optimizer step."""
         self.momentum_encoder.update()
+        for online, key in zip(
+                self.proj_head.parameters(),
+                self.momentum_proj_head.parameters()):
+            key.mul_(self.momentum).add_(
+                online.detach(), alpha=1.0 - self.momentum)
     
     @classmethod
     def from_v1_model(
@@ -400,8 +420,12 @@ def test_magi_v2_architecture():
     print(f"  Mask shape: {mask.shape}")
     print(f"  Pred patches shape: {pred_patches.shape}")
     
-    # Test contrastive
-    query, key = model.forward_contrastive(eeg, channel_names, channel_types)
+    # Contrastive views must be distinct augmentations; metadata is keyworded
+    # to avoid binding it to the second EEG tensor.
+    query, key = model.forward_contrastive(
+        eeg, eeg2=eeg + 0.01 * torch.randn_like(eeg),
+        channel_names1=channel_names, channel_types1=channel_types,
+        channel_names2=channel_names, channel_types2=channel_types)
     print(f"  Query shape: {query.shape}")
     print(f"  Key shape: {key.shape}")
     

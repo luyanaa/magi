@@ -265,6 +265,7 @@ class LatentHRFBridge(nn.Module):
         z_eeg_slow: torch.Tensor,
         z_fmri_slow: Optional[torch.Tensor] = None,
         subject_features: Optional[torch.Tensor] = None,
+        pair_labels: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Apply HRF convolution in latent slow manifold.
@@ -273,6 +274,8 @@ class LatentHRFBridge(nn.Module):
             z_eeg_slow: (B, T_eeg, slow_dim) EEG slow manifold trajectory
             z_fmri_slow: (B, T_fmri, slow_dim) optional, for alignment loss
             subject_features: (B, 3) optional subject features
+            pair_labels: optional binary (B,) synchronization labels. When
+                supplied, only rows labelled 1 contribute to alignment.
 
         Returns:
             z_predicted_fmri: (B, T_out, slow_dim)
@@ -282,7 +285,7 @@ class LatentHRFBridge(nn.Module):
         device = z_eeg_slow.device
 
         # Build HRF kernel
-        hrf = self._build_hrf_kernel(dt=2.0, subject_features=subject_features)  # TR=2s
+        hrf = self._build_hrf_kernel(dt=2.0, subject_features=subject_features)
         hrf = hrf.to(device).unsqueeze(0).unsqueeze(0)  # (1, 1, K)
 
         # Downsample EEG slow manifold to fMRI TR rate
@@ -291,7 +294,6 @@ class LatentHRFBridge(nn.Module):
         ).transpose(1, 2)  # (B, T_fmri, D)
 
         # Apply HRF convolution per dimension (depthwise: groups=D)
-        # Weight shape for F.conv1d(groups=D): (D, 1, K)
         eeg_ds = eeg_ds.transpose(1, 2)  # (B, D, T)
         hrf_weight = hrf.expand(D, -1, -1)  # (D, 1, K)
         z_pred = F.conv1d(eeg_ds, hrf_weight, padding=hrf.shape[2], groups=D)
@@ -303,7 +305,22 @@ class LatentHRFBridge(nn.Module):
             T_pred = z_pred.shape[1]
             T_fmri = z_fmri_slow.shape[1]
             min_T = min(T_pred, T_fmri)
-            alignment_loss = F.mse_loss(z_pred[:, :min_T, :], z_fmri_slow[:, :min_T, :])
+            errors = (z_pred[:, :min_T, :] - z_fmri_slow[:, :min_T, :]).square()
+            per_row = errors.mean(dim=(1, 2))
+            if pair_labels is None:
+                alignment_loss = per_row.mean()
+            else:
+                labels = pair_labels.to(device=device).flatten()
+                if labels.numel() != B:
+                    raise ValueError(
+                        "pair_labels must have one value per batch row")
+                if (not torch.isfinite(labels).all()
+                        or not bool(((labels == 0) | (labels == 1)).all())):
+                    raise ValueError("pair_labels must contain only 0 or 1")
+                aligned = labels == 1
+                alignment_loss = (
+                    per_row[aligned].mean()
+                    if bool(aligned.any()) else per_row.sum() * 0.0)
 
         return z_pred, alignment_loss
 

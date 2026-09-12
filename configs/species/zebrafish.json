@@ -10,27 +10,57 @@
     "use_mamba2": false,
     "use_deep_experts": false,
     "use_generic_moe": false,
-    "use_species_conditioning": true,
+    "use_moe": false,
+    "poisson_rank": 64,
     "use_stochastic_noise": false,
     "use_meg": false,
-    "perturbation_dim": 3
+    "perturbation_dim": 26,
+    "use_sensor_emission": true
   },
   "data": {
-    "modalities": ["calcium", "voltage", "behavior"],
-    "sample_rate_hz": 10.0,
+    "modalities": [
+      "calcium",
+      "stimulus",
+      "voltage",
+      "behavior"
+    ],
+    "roles": {
+      "stimulus": "control"
+    },
+    "control_specs": {
+      "opto": {
+        "kind": "optogenetic",
+        "target_scope": "neuron",
+        "target_encoding": "gated_one_hot",
+        "no_op_when_off": true
+      }
+    },
+    "sample_rate_hz": 1.0938,
+    "sample_rate_hz_source": "manifest",
     "time_unit": "seconds",
-    "sequence_seconds": 60.0,
+    "sequence_seconds": 117.0,
     "channel_count": 1024,
-    "max_channels": 10000,
+    "max_channels": 2048,
     "region_count": null,
     "atlas": "zebrafish_brain_regions",
-    "paired_next_step_targets": true
+    "paired_next_step_targets": true,
+    "sensors": {
+      "calcium": {
+        "imaging": "lsfm_spim",
+        "reporter": "h2b_gcamp7f",
+        "readout": "dff"
+      },
+      "voltage": {
+        "imaging": "lsfm_spim",
+        "reporter": "positron2_kv",
+        "readout": "voltage"
+      }
+    }
   },
   "training": {
     "ladder_stage": "zebrafish",
     "freeze_shared_dynamics": false,
     "freeze_observation_adapters": false,
-    "replay_species": ["c_elegans"],
     "leave_subject_out": true,
     "batch_size": 4
   }

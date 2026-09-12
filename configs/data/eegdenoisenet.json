@@ -1,0 +1,12 @@
+{
+  "kind": "eegdenoisenet",
+  "root": "../../../eegdenoisenet",
+  "artifact": "EOG",
+  "batch_size": 32,
+  "num_workers": 0,
+  "train_fraction": 0.8,
+  "val_fraction": 0.1,
+  "snr_db_range": [-7.0, 2.0],
+  "seed": 0,
+  "drop_last": false
+}

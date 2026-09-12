@@ -7,7 +7,8 @@ from .training_phases import (
 from .losses import (
     ReconstructionLoss, VelocitySmoothnessLoss, GenerickeConstraintLoss,
     MoELoadBalancingLoss, GrassmannianRegularization, JacobiRegularization,
-    HebbianRegularization, NSPLoss, CrossModalAlignmentLoss, WeakSIGRegLoss,
+    HebbianRegularization, NSPLoss, CrossModalAlignmentLoss,
+    CrossSoftContrastiveLoss, InterventionResponseLoss, WeakSIGRegLoss,
     TotalLoss,
 )
 
@@ -18,5 +19,6 @@ __all__ = [
     "GenerickeConstraintLoss", "MoELoadBalancingLoss",
     "GrassmannianRegularization", "JacobiRegularization",
     "HebbianRegularization", "NSPLoss", "CrossModalAlignmentLoss",
+    "CrossSoftContrastiveLoss", "InterventionResponseLoss",
     "WeakSIGRegLoss", "TotalLoss",
 ]

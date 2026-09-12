@@ -1,8 +1,9 @@
 """
 Brain MoE-PINN Data Preprocessing Pipeline.
 
-GPU-accelerated preprocessing for EEG and fMRI signals:
+GPU-accelerated preprocessing for EEG, MEG, and fMRI signals:
 - EEG: 6-stage pipeline (I/O → conditioning → quality → artifact → normalize → montage)
+- MEG: filter, notch, bad-channel handling, resampling, and normalization
 - fMRI: 4-stage pipeline (I/O → spatial → temporal → parcellation)
 - Paired: Cross-modal alignment for simultaneous EEG-fMRI
 
@@ -25,6 +26,11 @@ from .fmri_pipeline import (
     fMRIPreprocessingPipeline,
     fMRIPreprocessingConfig,
     fMRIPreprocessedOutput,
+)
+from .meg_pipeline import (
+    MEGPreprocessingPipeline,
+    MEGPreprocessingConfig,
+    MEGPreprocessedOutput,
 )
 
 from .paired_pipeline import (

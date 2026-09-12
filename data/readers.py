@@ -22,16 +22,33 @@ from .species_dataset import read_manifest
 
 
 def _write_rows(manifest_path: Path, rows: Iterable[Dict[str, str]]) -> None:
+    """Merge rows into a manifest keyed by ``sample_id``.
+
+    Incoming rows enrich existing rows instead of replacing them, and the
+    written header is the union of every column seen, so a later ingest that
+    adds metadata (per-sample rate, animal, condition flags, ...) cannot crash
+    on an existing manifest or silently drop columns of other rows.
+    """
     rows = list(rows)
     existing = read_manifest(manifest_path)
-    merged = {r.get("sample_id", ""): r for r in existing}
+    merged: Dict[str, Dict[str, str]] = {
+        r.get("sample_id", ""): dict(r) for r in existing}
     for row in rows:
-        merged[row.get("sample_id", "")] = row
+        key = row.get("sample_id", "")
+        if key in merged:
+            merged[key].update(row)
+        else:
+            merged[key] = dict(row)
     ordered = [merged[k] for k in sorted(merged) if k]
+    fieldnames: List[str] = []
+    for row in ordered:
+        for column in row:
+            if column not in fieldnames:
+                fieldnames.append(column)
     with open(manifest_path, "w", newline="") as f:
         if not ordered:
             return
-        writer = csv.DictWriter(f, fieldnames=list(ordered[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(ordered)
 
@@ -52,8 +69,14 @@ def emit_sample(
     trials: Optional[Dict[str, Sequence[Tuple[int, int]]]] = None,
     graph: Optional[np.ndarray] = None,
     overwrite: bool = False,
+    extra: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
-    """Write one sample into the canonical layout and update the manifest."""
+    """Write one sample into the canonical layout and update the manifest.
+
+    ``extra`` adds provenance columns (per-sample rate, animal id, anaesthesia
+    flag, stimulus timing, ...) to the manifest row. Canonical column names are
+    protected so callers cannot accidentally overwrite the contract.
+    """
     out_root = Path(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
     for modality, array in signals.items():
@@ -95,6 +118,12 @@ def emit_sample(
         "rate_hz": "" if rate_hz is None else str(rate_hz),
         "dt_s": "" if dt_s is None else str(dt_s),
     }
+    for key, value in (extra or {}).items():
+        if key in row:
+            raise ValueError(
+                f"extra manifest column {key!r} would overwrite the canonical "
+                f"contract column; pass it through the dedicated argument")
+        row[key] = "" if value is None else str(value)
     _write_rows(out_root / "manifest.csv", [row])
     return row
 

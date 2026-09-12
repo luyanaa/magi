@@ -1,25 +1,18 @@
-"""
-Training Phases and Stage Definitions for Brain MoE-PINN (Revised 2026-05-16).
+"""Executable training phases for Brain MoE-PINN.
 
-Defines the multi-stage training schedule:
-- Phase -1: Magi EEG encoder standalone pretraining (8L×512d BERT-medium)
-- Stage 1: Full model training with Shared+Routed MoE (P1-P6)
-  - P1: Alignment + routing differentiation (tau=2.0)
-  - P2: Dissipation constraint + L_spectrum activation
-  - P3: L_TV weight decay (0.1→0.02), dissipative-proxy regularization
-  - P4: Routing tightening (tau→0.7), EMA startup, lr bump
-  - P5: Full physics-inspired constraints + trajectory-diagnostic audit
-  - P6: Long context (seq=4096)
-- Stage 2: Cross-modal latent HRF bridge (L_cross + L_cross_soft)
-- Stage 3: Online adaptation with Hebbian memory + active inference
+The schedule is concrete rather than a list of aspirations:
 
-Each stage has specific learning rates, freeze strategies, and loss weights.
+- Phase -1: Magi EEG masked/causal/contrastive pretraining.
+- Stage 1: full-model P1-P6 curriculum, including explicit multi-horizon
+  forecasts where the loader supplies future targets.
+- Stage 2: labelled cross-modal latent/HRF bridging.
+- Stage 3: online adaptation; policy and intervention losses stay disabled
+  until their executed-action/replay/effect contracts are supplied.
 """
 
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable, List, Dict, Mapping, Optional, Tuple
 from enum import Enum
-
 
 class TrainingStage(Enum):
     PHASE_NEG_1 = "phase_-1"
@@ -33,37 +26,46 @@ class TrainingStage(Enum):
     STAGE_3 = "stage_3"
 
 
+class TrainingTask(str, Enum):
+    """Executable task selected by a normalized phase."""
+
+    MODEL_TRAINING = "model_training"
+    MAGI_EEG_PRETRAINING = "magi_eeg_pretraining"
+
+
+def evaluate_transition_gate(
+    gate: Optional[Callable[[Mapping[str, Any]], bool]],
+    metrics: Mapping[str, Any],
+) -> bool:
+    """Evaluate a phase gate without allowing ambiguous truthiness."""
+    if gate is None:
+        return True
+    if not callable(gate):
+        raise TypeError("transition_gate must be callable or None")
+    result = gate(metrics)
+    if not isinstance(result, bool):
+        raise TypeError("transition_gate must return bool")
+    return result
+
+
 @dataclass
 class LossWeights:
     """Steering weights per training stage.
 
-    Philosophy (2026-09, Occam pass): weights > 0 steer the optimizer;
-    weights == 0 keep the term available as a logged monitor (or dormant).
-    No loss is deleted.  Defaults below are the canonical dense-stage
-    steering set:
-      - reconstruction: recon_eeg, recon_fmri, recon_meg (fires only when
-        the model emits ``meg_recon`` AND targets contain ``meg``) plus any
-        ``recon_extra`` modality (calcium/voltage/widefield/...) whose
-        prediction key ``{modality}_recon`` and target ``{modality}`` exist;
-        ``recon_loss_types`` picks the per-modality criterion (default mse;
-        correlation/corr_diff/huber/poisson/wasserstein1 available)
-      - structure: dissip (grad_S · delta_z proxy), moe_load_balance.
-        generic_constraint is listed with the steering set for historical
-        reasons but its default weight is 0: the degeneracy residuals are
-        identically zero because the projections enforce them, so it can only
-        steer when apply_degeneracy_projection is disabled.
-      - representation: grassmannian_reg (single authority: MoE emits the
-        RAW orthogonality; this weight is applied once), sigreg
-      - spectral: spectrum (sole 1/f constraint), bandpower (band matching)
-      - cross-modal: cross_modal, cross (HRF bridge, sync data)
-    Monitored / dormant at weight 0 (re-enable by setting a phase weight):
-    velocity_smooth (batch-axis TV — semantically wrong until rollouts
-    supply delta_z_sequence), nsp (duplicates
-    bandpower until implemented as latent->stats prediction), tsallis
-    (softmax-kurtosis anti-collapse; sigreg is the chosen one), hebbian_reg (Oja keeps
-    W^T W ~ I by construction; spectral radius handled by periodic norm),
-    jacobi_reg (diagnostic only: raises unless poisson_fn/z supplied),
-    cross_soft (hub contrastive; labels are never supplied by the trainer).
+    Positive weights are executable optimizer terms; zero-weight terms remain
+    available as diagnostics only.  Reconstruction weights cover EEG/fMRI/MEG
+    plus arbitrary generic modalities through ``recon_extra``.  The forecast
+    weight is separate: it is enabled only when the loader supplies an
+    explicit ``(B, K, C, T)`` future target and the phase rolls out K states.
+    The composite forecast combines robust signal error with first-difference
+    correlation, using optional horizon weights.
+
+    Structural terms are only steering terms when their inputs are observable:
+    ``cross_modal`` and ``cross`` need explicit synchronized/async pair labels,
+    ``action`` needs an executed-action utility target, ``replay`` needs a
+    matched replay target, and ``intervention_response`` needs treated and
+    baseline perturbations plus an explicit effect target.  The trainer
+    rejects enabled terms whose contracts are absent.
     """
     recon_eeg: float = 1.0
     recon_fmri: float = 1.0
@@ -79,6 +81,10 @@ class LossWeights:
                                     # ("mse" default; "correlation" /
                                     # "corr_diff" / "huber" / "poisson" /
                                     # "wasserstein1" for non-Gaussian signals)
+    forecast: float = 0.0              # multi-horizon signal forecast
+    forecast_huber: float = 1.0
+    forecast_corr_diff: float = 1.0
+    forecast_horizon_weights: Optional[Tuple[float, ...]] = None
     velocity_smooth: float = 0.0    # monitor: batch-axis TV; needs time axis
     generic_constraint: float = 0.0  # enforced by projection, not by penalty:
                                      # (P_S L P_S) grad_S == 0 and
@@ -92,7 +98,7 @@ class LossWeights:
     grassmannian_reg: float = 0.001 # single authority on raw orthogonality
     jacobi_reg: float = 0.0         # diagnostic; 0 default avoids crash path
     nsp: float = 0.0                # monitor: band-power clone of bandpower
-    cross_modal: float = 0.1
+    cross_modal: float = 0.0  # requires explicit sync/async pair labels
     dissip: float = 0.1
     spectrum: float = 0.01          # sole 1/f PSD term (recon EEG/MEG)
     tsallis: float = 0.0            # monitor: latent sparsity (sigreg chosen;
@@ -100,11 +106,22 @@ class LossWeights:
                                     # enable without a sign fix)
     action: float = 0.0
     replay: float = 0.0
+    intervention_response: float = 0.0
     cross: float = 0.05             # Latent HRF alignment (Stage 2, sync data)
-    cross_soft: float = 0.0         # monitor: labels never supplied
+    cross_soft: float = 0.0        # soft contrastive alignment; explicit labels
     bandpower: float = 0.01         # per-channel band-power matching
     sigreg: float = 0.02            # Weak-SIGReg covariance regularization
     sigreg_sketch_dim: int = 64     # SIGReg sketch dimension
+    def __getitem__(self, key: str) -> Any:
+        """Expose phase weights through the runtime mapping boundary."""
+        try:
+            return getattr(self, key)
+        except AttributeError as exc:
+            raise KeyError(key) from exc
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Return one weight without coupling callers to dataclass fields."""
+        return getattr(self, key, default)
 
 
 @dataclass
@@ -121,7 +138,7 @@ class FreezeConfig:
 
 @dataclass
 class TrainingPhase:
-    """Complete configuration for a training phase."""
+    """Declarative phase definition with one explicit runtime boundary."""
     name: str
     stage: TrainingStage
     total_steps: int
@@ -141,8 +158,81 @@ class TrainingPhase:
     imagination_interval: int = 0
     imagination_num_samples: int = 4
     imagination_rollout_steps: int = 3
+    rollout_steps: int = 1
+    base_context: Optional[int] = None
     context_expansion_schedule: Optional[List[Tuple[int, int]]] = None
     description: str = ""
+    task: TrainingTask = TrainingTask.MODEL_TRAINING
+    magi_objective_weights: Dict[str, float] = field(
+        default_factory=lambda: {
+            "masked": 1.0,
+            "causal_ntp": 1.0,
+            "contrastive": 0.1,
+        })
+    transition_gate: Optional[Callable[[Mapping[str, Any]], bool]] = None
+
+    def to_runtime_config(self) -> Dict[str, Any]:
+        """Convert this phase into the plain mapping consumed by the trainer."""
+        if not isinstance(self.stage, TrainingStage):
+            raise TypeError("TrainingPhase.stage must be a TrainingStage")
+        task = self.task.value if isinstance(self.task, TrainingTask) else str(self.task)
+        if task not in {TrainingTask.MODEL_TRAINING.value,
+                         TrainingTask.MAGI_EEG_PRETRAINING.value}:
+            raise ValueError(f"unsupported training task: {task!r}")
+        if self.rollout_steps < 1:
+            raise ValueError("rollout_steps must be positive")
+        schedule = self.context_expansion_schedule
+        if schedule is not None:
+            schedule = [tuple(map(int, item)) for item in schedule]
+            if any(step < 0 or length < 1 for step, length in schedule):
+                raise ValueError("context expansion entries must be non-negative")
+            steps = [step for step, _ in schedule]
+            if steps != sorted(steps):
+                raise ValueError("context expansion schedule must be ordered")
+        return {
+            "name": self.name,
+            "stage": self.stage.value,
+            "task": task,
+            "total_steps": int(self.total_steps),
+            "learning_rate": float(self.learning_rate),
+            "min_lr": float(self.min_lr),
+            "warmup_steps": int(self.warmup_steps),
+            "batch_size": int(self.batch_size),
+            "gradient_accumulation": int(self.gradient_accumulation),
+            "grad_clip": float(self.grad_clip),
+            "max_seq_len_eeg": int(self.max_seq_len_eeg),
+            "max_seq_len_fmri": int(self.max_seq_len_fmri),
+            "loss_weights": self.loss_weights,
+            "freeze_policy": asdict(self.freeze_config),
+            "lr_schedule": self.lr_schedule,
+            "optimizer": self.optimizer,
+            "router_tau": self.router_tau,
+            "imagination_interval": int(self.imagination_interval),
+            "imagination_num_samples": int(self.imagination_num_samples),
+            "imagination_rollout_steps": int(self.imagination_rollout_steps),
+            "rollout_steps": int(self.rollout_steps),
+            "rollout": {
+                "steps": int(self.rollout_steps),
+                "imagination_interval": int(self.imagination_interval),
+                "imagination_num_samples": int(self.imagination_num_samples),
+                "imagination_rollout_steps": int(self.imagination_rollout_steps),
+            },
+            "base_context": self.base_context,
+            "context_expansion_schedule": schedule,
+            "context": {
+                "base_length": self.base_context,
+                "expansion_schedule": schedule,
+            },
+            "description": self.description,
+            "weight_decay": 0.01,
+            "noise_mode": None,
+            "val_interval": 5000,
+            "curriculum_steps": int(self.warmup_steps),
+            "transition_gate": self.transition_gate,
+            "magi_objective_weights": dict(self.magi_objective_weights),
+        }
+
+    to_runtime_mapping = to_runtime_config
 
 
 def get_phase_neg_1() -> TrainingPhase:
@@ -167,7 +257,6 @@ def get_phase_neg_1() -> TrainingPhase:
             moe_load_balance=0.0,
             hebbian_reg=0.0,
             grassmannian_reg=0.0,
-            jacobi_reg=0.0,
             nsp=0.0,
             dissip=0.0,
             spectrum=0.0,
@@ -182,16 +271,18 @@ def get_phase_neg_1() -> TrainingPhase:
         freeze_config=FreezeConfig(
             eeg_encoder=False,
             fmri_encoder=True,
-            eeg_epochs_thawed=1,
             fmri_epochs_thawed=1,
         ),
-        description="Placeholder for standalone Magi pretraining (masked/MoCo/PSD losses live outside TotalLoss); EEG recon + SIGReg warm-up only",
+        task=TrainingTask.MAGI_EEG_PRETRAINING,
+        magi_objective_weights={"masked": 1.0, "causal_ntp": 1.0,
+                                "contrastive": 0.1},
+        description="Masked patch reconstruction + causal patch NTP + EMA two-view contrastive pretraining",
         router_tau=None,
     )
 
 
 def get_stage_1_p1() -> TrainingPhase:
-    """Stage 1 P1 (0-30B): Encoder alignment + routing differentiation + EEG-fMRI alignment."""
+    """Stage 1 P1: Reconstruction priming and routing differentiation."""
     return TrainingPhase(
         name="Stage 1 P1: Encoder Alignment & MoE Priming",
         stage=TrainingStage.STAGE_1_P1,
@@ -200,13 +291,13 @@ def get_stage_1_p1() -> TrainingPhase:
         min_lr=3e-5,
         warmup_steps=2000,
         batch_size=16,
-        gradient_accumulation=3,
+        gradient_accumulation=1,
         lr_schedule="cosine",
         optimizer="adamw",
         loss_weights=LossWeights(
             recon_eeg=1.0,
             recon_fmri=1.0,
-            cross_modal=0.1,
+            cross_modal=0.0,
             velocity_smooth=0.0,
             generic_constraint=0.0,
             moe_load_balance=0.01,
@@ -234,7 +325,7 @@ def get_stage_1_p1() -> TrainingPhase:
 
 
 def get_stage_1_p2() -> TrainingPhase:
-    """Stage 1 P2 (30-60B): Add dissipation constraint L_dissip + nullspace regularization."""
+    """Stage 1 P2: Add the dissipative structural proxy."""
     return TrainingPhase(
         name="Stage 1 P2: Dissipation Constraint",
         stage=TrainingStage.STAGE_1_P2,
@@ -248,7 +339,7 @@ def get_stage_1_p2() -> TrainingPhase:
         loss_weights=LossWeights(
             recon_eeg=1.0,
             recon_fmri=1.0,
-            cross_modal=0.1,
+            cross_modal=0.0,
             velocity_smooth=0.0,
             generic_constraint=0.0,
             moe_load_balance=0.01,
@@ -274,9 +365,9 @@ def get_stage_1_p2() -> TrainingPhase:
 
 
 def get_stage_1_p3() -> TrainingPhase:
-    """Stage 1 P3 (60-90B): Activate the structural dissipative proxy."""
+    """Stage 1 P3: Supervise two explicit future windows."""
     return TrainingPhase(
-        name="Stage 1 P3: Dissipative Proxy",
+        name="Stage 1 P3: Multi-Horizon Forecasting",
         stage=TrainingStage.STAGE_1_P3,
         total_steps=20000,
         learning_rate=1e-4,
@@ -288,7 +379,11 @@ def get_stage_1_p3() -> TrainingPhase:
         loss_weights=LossWeights(
             recon_eeg=1.0,
             recon_fmri=1.0,
-            cross_modal=0.15,
+            forecast=1.0,
+            forecast_huber=1.0,
+            forecast_corr_diff=1.0,
+            forecast_horizon_weights=(1.0, 0.5),
+            cross_modal=0.0,
             velocity_smooth=0.0,
             generic_constraint=0.0,
             moe_load_balance=0.02,
@@ -304,13 +399,15 @@ def get_stage_1_p3() -> TrainingPhase:
             bandpower=0.01,
             sigreg=0.05,
         ),
-        description="Structural dissipative proxy active; encoders fully thawed",
+        rollout_steps=2,
+        freeze_config=FreezeConfig(eeg_encoder=False, fmri_encoder=False),
+        description="Two-horizon forecast with dissipative proxy and thawed encoders",
         router_tau=2.0,
     )
 
 
 def get_stage_1_p4() -> TrainingPhase:
-    """Stage 1 P4 (90-120B): Expand MoE Top-1->Top-2, E=4->8, LR 1e-4->5e-4."""
+    """Stage 1 P4: Tighten routing after forecast warm-up."""
     return TrainingPhase(
         name="Stage 1 P4: MoE Expansion",
         stage=TrainingStage.STAGE_1_P4,
@@ -324,7 +421,11 @@ def get_stage_1_p4() -> TrainingPhase:
         loss_weights=LossWeights(
             recon_eeg=1.0,
             recon_fmri=1.0,
-            cross_modal=0.2,
+            forecast=1.0,
+            forecast_huber=1.0,
+            forecast_corr_diff=1.0,
+            forecast_horizon_weights=(1.0, 0.5),
+            cross_modal=0.0,
             velocity_smooth=0.0,
             generic_constraint=0.0,
             moe_load_balance=0.05,
@@ -340,13 +441,15 @@ def get_stage_1_p4() -> TrainingPhase:
             bandpower=0.02,
             sigreg=0.02,
         ),
+        rollout_steps=2,
+        freeze_config=FreezeConfig(eeg_encoder=False, fmri_encoder=False),
         description="Top-2 routing, E=8, LR 5e-4 flat",
         router_tau=0.7,
     )
 
 
 def get_stage_1_p5() -> TrainingPhase:
-    """Stage 1 P5: Physics-inspired constraints, all experts active."""
+    """Stage 1 P5: Physics-inspired constraints and forecast retention."""
     return TrainingPhase(
         name="Stage 1 P5: Physics-Inspired Constraints",
         stage=TrainingStage.STAGE_1_P5,
@@ -360,7 +463,11 @@ def get_stage_1_p5() -> TrainingPhase:
         loss_weights=LossWeights(
             recon_eeg=1.0,
             recon_fmri=1.0,
-            cross_modal=0.2,
+            forecast=1.0,
+            forecast_huber=1.0,
+            forecast_corr_diff=1.0,
+            forecast_horizon_weights=(1.0, 0.5),
+            cross_modal=0.0,
             velocity_smooth=0.0,
             generic_constraint=0.0,
             moe_load_balance=0.01,
@@ -376,13 +483,14 @@ def get_stage_1_p5() -> TrainingPhase:
             bandpower=0.02,
             sigreg=0.02,
         ),
+        rollout_steps=2,
+        freeze_config=FreezeConfig(eeg_encoder=False, fmri_encoder=False),
         description="Physics-inspired constraints (degeneracy, dissipation proxy, spectrum); EPR/Jacobi logged as monitors",
-        router_tau=0.7,
     )
 
 
 def get_stage_1_p6() -> TrainingPhase:
-    """Stage 1 P6 (200-260B): Expand seq to 4096, LR restart to 1e-4."""
+    """Stage 1 P6: Long-context forecast continuation."""
     return TrainingPhase(
         name="Stage 1 P6: Long-Context Expansion",
         stage=TrainingStage.STAGE_1_P6,
@@ -396,7 +504,11 @@ def get_stage_1_p6() -> TrainingPhase:
         loss_weights=LossWeights(
             recon_eeg=1.0,
             recon_fmri=1.0,
-            cross_modal=0.2,
+            forecast=1.0,
+            forecast_huber=1.0,
+            forecast_corr_diff=1.0,
+            forecast_horizon_weights=(1.0, 0.5),
+            cross_modal=0.0,
             velocity_smooth=0.0,
             generic_constraint=0.0,
             moe_load_balance=0.01,
@@ -412,6 +524,9 @@ def get_stage_1_p6() -> TrainingPhase:
             bandpower=0.02,
             sigreg=0.02,
         ),
+        rollout_steps=2,
+        max_seq_len_eeg=4096,
+        freeze_config=FreezeConfig(eeg_encoder=False, fmri_encoder=False),
         description="Sequence length 4096, LR restart to 1e-4",
         router_tau=0.7,
     )
@@ -476,48 +591,6 @@ STAGE_TRANSITION_RULES = [
     ),
 ]
 
-# Flat phase configs for CLI parsing
-# NOTE: Phase -1 conceptually pretrains Magi with its own losses (masked
-# reconstruction, MoCo, PSD), which are not wired into TotalLoss. Until that
-# trainer exists, this dict runs the canonical model as an EEG warm-up.
-NEGATIVE_ONE_PHASE = {
-    "name": "Phase -1: Magi EEG Pretraining",
-    "stage": "phase_neg_1",
-    "total_steps": 10000,
-    "learning_rate": 3e-4,
-    "min_lr": 3e-5,
-    "warmup_steps": 2000,
-    "batch_size": 32,
-    "gradient_accumulation": 1,
-    "grad_clip": 1.0,
-    "loss_weights": LossWeights(
-        recon_eeg=1.0, recon_fmri=0.0, recon_meg=0.0, cross_modal=0.0,
-        generic_constraint=0.0, moe_load_balance=0.0,
-        grassmannian_reg=0.0, dissip=0.0, spectrum=0.0,
-        cross=0.0, bandpower=0.0, sigreg=0.05,
-    ),
-}
-
-STAGE_ONE_PHASE = {
-    "name": "Stage 1 P1-P6: Pre-Training",
-    "stage": "stage_1",
-    "total_steps": 235000,
-    "learning_rate": 1e-4,
-    "min_lr": 1e-6,
-    "warmup_steps": 500,
-    "batch_size": 16,
-    "gradient_accumulation": 1,
-    "grad_clip": 1.0,
-    "optimizer": "adamw",
-    "loss_weights": LossWeights(
-        recon_eeg=1.0, recon_fmri=1.0, cross_modal=0.2,
-        velocity_smooth=0.0, generic_constraint=0.0, moe_load_balance=0.01,
-        hebbian_reg=0.0, grassmannian_reg=0.005, jacobi_reg=0.0,
-        nsp=0.0, dissip=0.1, spectrum=0.01,
-        tsallis=0.0, action=0.0, replay=0.0,
-        bandpower=0.01, sigreg=0.02,
-    ),
-}
 
 STAGE_TWO_PHASE = TrainingPhase(
     name="Stage 2: Cross-Modal Bridging",
@@ -560,7 +633,10 @@ STAGE_THREE_PHASE = TrainingPhase(
         velocity_smooth=0.0, generic_constraint=0.0, moe_load_balance=0.01,
         hebbian_reg=0.0, grassmannian_reg=0.01, jacobi_reg=0.0,
         nsp=0.0, dissip=0.05, spectrum=0.01,
-        tsallis=0.0, action=0.05, replay=0.02,
+        tsallis=0.0,
+        # These policies require executed-action utility and replay targets.
+        # They remain opt-in until a loader supplies those contracts.
+        action=0.0, replay=0.0, intervention_response=0.0,
         cross=0.03, cross_soft=0.0, bandpower=0.01, sigreg=0.02,
     ),
     router_tau=0.7,

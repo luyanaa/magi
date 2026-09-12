@@ -170,6 +170,15 @@ def test_reduce_control_and_partition():
     seq = reduce_control(control, "resample", rollout_steps=4)
     assert seq.shape == (2, 4, 3)
 
+    pulse = torch.zeros(1, 1, 8)
+    pulse[0, 0, 1] = 1.0
+    pulse[0, 0, 5] = 2.0
+    peak = reduce_control(pulse, "peak", rollout_steps=4)
+    assert peak.shape == (1, 4, 1)
+    assert float(peak.max()) == 2.0
+    assert float(peak[0, 0, 0]) > float(
+        reduce_control(pulse, "resample", rollout_steps=1).max())
+
     batch = {
         "calcium": torch.randn(2, 4, 16),
         "calcium_mask": torch.ones(2, 4, 16, dtype=torch.bool),
@@ -183,6 +192,19 @@ def test_reduce_control_and_partition():
     assert set(signals) == {"calcium"}          # control excluded from signals
     assert "calcium_mask" in targets
     assert perturbation.shape == (2, 3)
+
+    event_batch = {
+        "calcium": torch.randn(1, 4, 8),
+        "opto": torch.cat(
+            [torch.ones(1, 3, 4), torch.zeros(1, 3, 4)], dim=-1),
+    }
+    _, _, event_perturbation = partition_generic_batch(
+        event_batch, ("calcium", "opto"), ("calcium",), None,
+        control_modalities=("opto",), control_reduction="peak",
+        rollout_steps=2)
+    assert event_perturbation.shape == (1, 2, 3)
+    assert torch.all(event_perturbation[0, 0] == 1)
+    assert torch.all(event_perturbation[0, 1] == 0)
 
 
 def test_roles_declaration_and_loader():

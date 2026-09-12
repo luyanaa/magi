@@ -178,6 +178,7 @@ class FactorizedAttentionV2(nn.Module):
         v: torch.Tensor,
         num_channels: int,
         num_times: int,
+        causal: bool = False,
     ) -> torch.Tensor:
         """Factorized attention: spatial attention followed by temporal attention."""
         B, N, D = q.shape
@@ -231,26 +232,41 @@ class FactorizedAttentionV2(nn.Module):
         k_temporal = self._apply_rope(k_temporal, seq_dim=-2, num_heads=self.temporal_heads)
         
         # Temporal attention scores
-        attn_temporal = torch.einsum('bchtd,bchkd->bchtk', q_temporal, k_temporal) * self.scale
+        attn_temporal = torch.einsum(
+            'bchtd,bchkd->bchtk', q_temporal, k_temporal) * self.scale
+        if causal:
+            future = torch.triu(
+                torch.ones(
+                    num_times, num_times, dtype=torch.bool,
+                    device=attn_temporal.device),
+                diagonal=1,
+            )
+            attn_temporal = attn_temporal.masked_fill(
+                future.view(1, 1, 1, num_times, num_times),
+                torch.finfo(attn_temporal.dtype).min,
+            )
         attn_temporal = F.softmax(attn_temporal, dim=-1)
         attn_temporal = self.attn_dropout(attn_temporal)
-        
+
         # Temporal attention output
-        out_temporal = torch.einsum('bchtk,bchkd->bchtd', attn_temporal, v_temporal)
+        out_temporal = torch.einsum(
+            'bchtk,bchkd->bchtd', attn_temporal, v_temporal)
         out_temporal = rearrange(out_temporal, 'b c h t d -> b c t (h d)')
-        
+
         # Concatenate spatial and temporal outputs
         out = torch.cat([out_spatial, out_temporal], dim=-1)
         out = rearrange(out, 'b c t d -> b (c t) d')
-        
+
         return out
-    
+
     def _sliding_window_attention(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         num_times: int,
+        num_channels: Optional[int] = None,
+        causal: bool = False,
     ) -> torch.Tensor:
         """Sliding Window Attention with configurable window size."""
         B, N, D = q.shape
@@ -277,28 +293,47 @@ class FactorizedAttentionV2(nn.Module):
         k_windows = self._apply_rope(k_windows, seq_dim=-2, num_heads=self.num_heads)
         
         # Window attention
-        attn = torch.einsum('bwhsd,bwhkd->bwhsk', q_windows, k_windows) * self.scale
+        attn = torch.einsum(
+            'bwhsd,bwhkd->bwhsk', q_windows, k_windows) * self.scale
+        if causal:
+            positions = torch.arange(
+                num_windows * self.window_size, device=attn.device
+            ).view(num_windows, self.window_size)
+            time_index = positions % max(1, int(num_times))
+            future = time_index[:, None, :] > time_index[:, :, None]
+            invalid_keys = positions[:, None, :] >= N
+            causal_mask = future | invalid_keys
+            attn = attn.masked_fill(
+                causal_mask.view(1, num_windows, 1,
+                                 self.window_size, self.window_size),
+                torch.finfo(attn.dtype).min,
+            )
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_dropout(attn)
-        
-        out_windows = torch.einsum('bwhsk,bwhkd->bwhsd', attn, v_windows)
+
+        out_windows = torch.einsum(
+            'bwhsk,bwhkd->bwhsd', attn, v_windows)
         out_windows = rearrange(out_windows, 'b w h s d -> b w s (h d)')
-        
+
         # Reshape back
         out = out_windows.view(B, num_windows * self.window_size, D)
         if pad_len > 0:
-            out = out[:, :num_times, :]
-        
+            out = out[:, :N, :]
+
         return out
-    
+
     def _global_attention(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        num_channels: Optional[int] = None,
+        num_times: Optional[int] = None,
+        causal: bool = False,
     ) -> torch.Tensor:
         """Global full attention across entire sequence."""
         B, N, D = q.shape
+        
         
         q = rearrange(q, 'b n (h d) -> b h n d', h=self.num_heads, d=self.head_dim)
         k = rearrange(k, 'b n (h d) -> b h n d', h=self.num_heads, d=self.head_dim)
@@ -310,6 +345,15 @@ class FactorizedAttentionV2(nn.Module):
         
         # Attention
         attn = torch.einsum('bhnd,bhkd->bhnk', q, k) * self.scale
+        if causal:
+            time_index = torch.arange(N, device=attn.device)
+            if num_times is not None:
+                time_index = time_index % max(1, int(num_times))
+            future = time_index[None, :] > time_index[:, None]
+            attn = attn.masked_fill(
+                future.view(1, 1, N, N),
+                torch.finfo(attn.dtype).min,
+            )
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_dropout(attn)
         
@@ -323,21 +367,28 @@ class FactorizedAttentionV2(nn.Module):
         x: torch.Tensor,
         num_channels: Optional[int] = None,
         num_times: Optional[int] = None,
+        causal: bool = False,
     ) -> torch.Tensor:
         B, N, D = x.shape
-        
+
         # Project to QKV
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
-        
+
         # Apply appropriate attention pattern
-        if self.attention_type == "factorized" and num_channels is not None and num_times is not None:
-            out = self._factorized_attention(q, k, v, num_channels, num_times)
+        if (self.attention_type == "factorized"
+                and num_channels is not None and num_times is not None):
+            out = self._factorized_attention(
+                q, k, v, num_channels, num_times, causal=causal)
         elif self.attention_type == "swa" and num_times is not None:
-            out = self._sliding_window_attention(q, k, v, num_times)
+            out = self._sliding_window_attention(
+                q, k, v, num_times, num_channels=num_channels,
+                causal=causal)
         else:
-            out = self._global_attention(q, k, v)
+            out = self._global_attention(
+                q, k, v, num_channels=num_channels, num_times=num_times,
+                causal=causal)
         
         # Output projection
         out = self.out_proj(out)
@@ -397,11 +448,12 @@ class MagiV2TransformerLayer(nn.Module):
         x: torch.Tensor,
         num_channels: Optional[int] = None,
         num_times: Optional[int] = None,
+        causal: bool = False,
     ) -> torch.Tensor:
         # Attention with residual
         residual = x
         x = self.norm1(x)
-        x = self.attn(x, num_channels, num_times)
+        x = self.attn(x, num_channels, num_times, causal=causal)
         x = self.dropout(x)
         x = residual + x
         
@@ -470,9 +522,10 @@ class MagiV2TransformerEncoder(nn.Module):
         x: torch.Tensor,
         num_channels: Optional[int] = None,
         num_times: Optional[int] = None,
+        causal: bool = False,
     ) -> torch.Tensor:
         for layer in self.layers:
-            x = layer(x, num_channels, num_times)
+            x = layer(x, num_channels, num_times, causal=causal)
         return self.norm(x)
     
     def tile_from_12l(self, source_model: nn.Module):
@@ -610,41 +663,219 @@ class MagiV2EEGEncoder(nn.Module):
             nn.Tanh(),
         )
     
+    def _channel_amplitude_scale(
+        self,
+        eeg: torch.Tensor,
+        channel_types: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply deterministic modality scaling without data-dependent stats."""
+        if channel_types is None:
+            return eeg
+        scale_factors = torch.ones_like(
+            channel_types, dtype=eeg.dtype, device=eeg.device)
+        scale_factors[channel_types == 1] = 1.0 / self.ecog_amplitude_scale
+        scale_factors[channel_types == 2] = (
+            1.0 / (self.ecog_amplitude_scale / 2))
+        return eeg * scale_factors.unsqueeze(-1)
+
+    def _normalization_stats(
+        self,
+        eeg: torch.Tensor,
+        channel_types: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return per-sample/channel stats for a fixed waveform support."""
+        scaled = self._channel_amplitude_scale(eeg, channel_types)
+        return (
+            scaled.mean(dim=-1, keepdim=True),
+            scaled.std(dim=-1, keepdim=True) + 1e-6,
+        )
+
     def _normalize_amplitude(
         self,
         eeg: torch.Tensor,
         channel_types: torch.Tensor,
+        stats: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """
-        Normalize amplitude based on channel type.
-        ECoG signals are ~20× larger than scalp EEG.
-        """
+        """Normalize amplitude using optional support-independent statistics."""
         if channel_types is None:
             return eeg
-        
-        # Create amplitude scaling factors
-        # scalp_EEG: 1.0, ecog_grid: 1/20, seeg_depth: 1/10, unknown: 1.0
-        scale_factors = torch.ones_like(channel_types, dtype=eeg.dtype, device=eeg.device)
-        
-        # ECoG: scale down by ecog_amplitude_scale
-        ecog_mask = (channel_types == 1)
-        scale_factors[ecog_mask] = 1.0 / self.ecog_amplitude_scale
-        
-        # sEEG: scale down by half of ECoG
-        seeg_mask = (channel_types == 2)
-        scale_factors[seeg_mask] = 1.0 / (self.ecog_amplitude_scale / 2)
-        
-        # Apply scaling
-        scale_factors = scale_factors.view(1, -1, 1)  # (1, C, 1)
-        eeg = eeg * scale_factors
-        
-        # Then z-score normalize per channel
-        mean = eeg.mean(dim=-1, keepdim=True)
-        std = eeg.std(dim=-1, keepdim=True) + 1e-6
-        eeg = (eeg - mean) / std
-        
-        return eeg
+        scaled = self._channel_amplitude_scale(eeg, channel_types)
+        if stats is None:
+            stats = self._normalization_stats(eeg, channel_types)
+        mean, std = stats
+        return (scaled - mean) / std
     
+    def _prepare_inputs(
+        self,
+        eeg: torch.Tensor,
+        channel_names: Optional[List[List[str]]] = None,
+        channel_types: Optional[torch.Tensor] = None,
+        normalize_amplitude: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[List[List[str]]], Optional[torch.Tensor]]:
+        """Normalize metadata and, when requested, amplitude."""
+        if eeg.dim() != 3:
+            raise ValueError("eeg must have shape (batch, channels, time)")
+        batch_size, channels, _ = eeg.shape
+        if channel_names is not None and channel_names and isinstance(
+                channel_names[0], str):
+            channel_names = [channel_names for _ in range(batch_size)]
+        if channel_types is not None and not isinstance(
+                channel_types, torch.Tensor):
+            channel_types = torch.as_tensor(
+                channel_types, device=eeg.device)
+        if channel_types is not None:
+            channel_types = channel_types.to(device=eeg.device)
+        if channel_types is not None and channel_types.dim() == 1:
+            channel_types = channel_types.unsqueeze(0).expand(
+                batch_size, -1)
+        if channels > self.max_channels:
+            raise ValueError(
+                f"Number of channels {channels} exceeds max_channels "
+                f"{self.max_channels}")
+        if (normalize_amplitude and self.use_channel_type_embed
+                and channel_types is not None):
+            eeg = self._normalize_amplitude(eeg, channel_types)
+        return eeg, channel_names, channel_types
+
+    def embed_tokens(
+        self,
+        eeg: torch.Tensor,
+        channel_names: Optional[List[List[str]]] = None,
+        channel_types: Optional[torch.Tensor] = None,
+        causal: bool = False,
+        normalize_amplitude: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, int, int]:
+        """Create per-channel temporal patch tokens without self-attention."""
+        if normalize_amplitude is None:
+            normalize_amplitude = not causal
+        eeg, channel_names, channel_types = self._prepare_inputs(
+            eeg, channel_names, channel_types,
+            normalize_amplitude=normalize_amplitude)
+        batch_size, channels, _ = eeg.shape
+        tokens_list = []
+        for batch_index in range(batch_size):
+            batch_tokens = []
+            for channel_index in range(channels):
+                channel_signal = eeg[
+                    batch_index, channel_index:channel_index + 1, :]
+                if causal and self.stride_time != self.patch_size_time:
+                    channel_tokens = F.conv1d(
+                        channel_signal.unsqueeze(1),
+                        self.temporal_proj.weight,
+                        self.temporal_proj.bias,
+                        stride=self.patch_size_time,
+                    )
+                else:
+                    channel_tokens = self.temporal_proj(
+                        channel_signal.unsqueeze(1))
+                channel_tokens = channel_tokens.squeeze(0).transpose(0, 1)
+
+                if self.biot_embed is not None and channel_names is not None:
+                    channel_name = (
+                        channel_names[batch_index][channel_index]
+                        if channel_index < len(channel_names[batch_index])
+                        else "unknown")
+                    biot_emb = self.biot_embed.get_embedding(channel_name)
+                    if biot_emb is not None:
+                        channel_tokens = channel_tokens + biot_emb.to(
+                            channel_tokens).unsqueeze(0)
+
+                if self.channel_type_embed is not None and channel_types is not None:
+                    ctype_emb = self.channel_type_embed(
+                        channel_types[batch_index, channel_index])
+                    channel_tokens = channel_tokens + ctype_emb.to(
+                        channel_tokens).unsqueeze(0)
+                batch_tokens.append(channel_tokens)
+            tokens_list.append(torch.stack(batch_tokens, dim=0))
+
+        all_tokens = torch.stack(tokens_list, dim=0)
+        num_times = all_tokens.shape[2]
+        all_tokens = all_tokens.reshape(
+            batch_size, channels * num_times, self.hidden_dim)
+        return self.proj_norm(all_tokens), channels, num_times
+
+    def extract_patches(
+        self,
+        eeg: torch.Tensor,
+        channel_types: Optional[torch.Tensor] = None,
+        step: Optional[int] = None,
+        normalize: bool = True,
+    ) -> torch.Tensor:
+        """Return raw patches as ``(B, C, N, patch_size)``."""
+        eeg, _, _ = self._prepare_inputs(
+            eeg, None, channel_types,
+            normalize_amplitude=normalize)
+        return eeg.unfold(
+            dimension=-1,
+            size=self.patch_size_time,
+            step=self.stride_time if step is None else int(step),
+        )
+
+    def expand_patch_mask(
+        self,
+        mask: torch.Tensor,
+        num_channels: int,
+        num_times: int,
+    ) -> torch.Tensor:
+        """Mask every token whose convolution window overlaps a masked patch."""
+        if mask.shape[1] != num_channels * num_times:
+            raise ValueError("patch mask shape does not match token grid")
+        starts = torch.arange(
+            num_times, device=mask.device, dtype=torch.long
+        ) * self.stride_time
+        ends = starts + self.patch_size_time
+        overlap = (
+            starts[:, None] < ends[None, :]
+        ) & (
+            ends[:, None] > starts[None, :]
+        )
+        grid = mask.reshape(mask.shape[0], num_channels, num_times)
+        expanded = torch.matmul(
+            grid.to(dtype=torch.float32),
+            overlap.to(dtype=torch.float32).transpose(0, 1),
+        ).gt(0)
+        return expanded.reshape(mask.shape[0], num_channels * num_times)
+
+    def mask_raw_patches(
+        self,
+        eeg: torch.Tensor,
+        mask: torch.Tensor,
+        num_channels: int,
+        num_times: int,
+        fill_value: float = 0.0,
+    ) -> torch.Tensor:
+        """Replace selected raw patch supports before temporal projection."""
+        if mask.shape[1] != num_channels * num_times:
+            raise ValueError("patch mask shape does not match token grid")
+        masked = eeg.clone()
+        grid = mask.reshape(mask.shape[0], num_channels, num_times)
+        sample_mask = torch.zeros_like(masked, dtype=torch.bool)
+        time_len = eeg.shape[-1]
+        for patch_index in range(num_times):
+            start = patch_index * self.stride_time
+            end = min(time_len, start + self.patch_size_time)
+            if start >= end:
+                continue
+            sample_mask[:, :, start:end] |= grid[:, :, patch_index].unsqueeze(-1)
+        return masked.masked_fill(sample_mask, fill_value)
+
+    def encode_tokens(
+        self,
+        tokens: torch.Tensor,
+        num_channels: int,
+        num_times: int,
+        causal: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the transformer and pool token representations."""
+        last_hidden = self.encoder(
+            tokens,
+            num_channels=num_channels,
+            num_times=num_times,
+            causal=causal,
+        )
+        pooler_output = self.pooler(last_hidden.mean(dim=1))
+        return last_hidden, pooler_output
+
     def forward(
         self,
         eeg: torch.Tensor,
@@ -652,87 +883,17 @@ class MagiV2EEGEncoder(nn.Module):
         channel_types: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         output_hidden_states: bool = False,
+        causal: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            eeg: (B, C, T) raw EEG/ECoG/sEEG signals
-            channel_names: List of length B, each containing C channel names
-            channel_types: (B, C) integer tensor: 0=scalp_EEG, 1=ecog_grid, 2=seeg_depth, 3=unknown
-            attention_mask: (B, C*T) boolean mask (1 for valid, 0 for padding)
-            output_hidden_states: whether to return all hidden states
-        
-        Returns:
-            last_hidden_state: (B, C*T/P, D) where P = patch_size_time
-            pooler_output: (B, D)
-        """
-        B, C, T = eeg.shape
-        if channel_names is not None and channel_names and isinstance(channel_names[0], str):
-            channel_names = [channel_names for _ in range(B)]
-        if channel_types is not None and channel_types.dim() == 1:
-            channel_types = channel_types.unsqueeze(0).expand(B, -1)
-        
-        # Validate channel count
-        if C > self.max_channels:
-            raise ValueError(f"Number of channels {C} exceeds max_channels {self.max_channels}")
-        
-        # Amplitude normalization based on channel type
-        if self.use_channel_type_embed and channel_types is not None:
-            eeg = self._normalize_amplitude(eeg, channel_types)
-        
-        # Process each channel separately
-        tokens_list = []
-        for b in range(B):
-            batch_tokens = []
-            for c in range(C):
-                # Get single channel time series
-                channel_signal = eeg[b, c:c+1, :]  # (1, T)
-                
-                # Temporal projection
-                channel_tokens = self.temporal_proj(channel_signal.unsqueeze(1))
-                channel_tokens = channel_tokens.squeeze(0).transpose(0, 1)
-                
-                # Add BIOT embedding if available
-                if self.biot_embed is not None and channel_names is not None:
-                    channel_name = channel_names[b][c] if c < len(channel_names[b]) else "unknown"
-                    biot_emb = self.biot_embed.get_embedding(channel_name)
-                    if biot_emb is not None:
-                        channel_tokens = channel_tokens + biot_emb.unsqueeze(0)
-                
-                # Add channel type embedding
-                if self.channel_type_embed is not None and channel_types is not None:
-                    ctype = channel_types[b, c]
-                    ctype_emb = self.channel_type_embed(ctype)
-                    channel_tokens = channel_tokens + ctype_emb.unsqueeze(0)
-                
-                batch_tokens.append(channel_tokens)
-            
-            # Stack tokens for this batch: (C, T/P, D)
-            batch_tokens = torch.stack(batch_tokens, dim=0)
-            tokens_list.append(batch_tokens)
-        
-        # Combine batch: reshape to (B, C*T/P, D)
-        all_tokens = torch.stack(tokens_list, dim=0)  # (B, C, T/P, D)
-        num_tokens_per_channel = all_tokens.shape[2]
-        all_tokens = all_tokens.view(B, C * num_tokens_per_channel, self.hidden_dim)
-        
-        # Apply projection norm
-        all_tokens = self.proj_norm(all_tokens)
-        
-        # Apply encoder
-        last_hidden = self.encoder(
-            all_tokens,
-            num_channels=C,
-            num_times=num_tokens_per_channel,
-        )
-        
-        # Pooler
-        pooler_output = self.pooler(last_hidden.mean(dim=1))
-        
+        """Encode raw EEG, optionally using causal temporal attention."""
+        del attention_mask  # Padding masks are not yet part of the Magi contract.
+        tokens, channels, num_times = self.embed_tokens(
+            eeg, channel_names, channel_types, causal=causal)
+        last_hidden, pooler_output = self.encode_tokens(
+            tokens, channels, num_times, causal=causal)
         if output_hidden_states:
-            return last_hidden, pooler_output, all_tokens
-        else:
-            return last_hidden, pooler_output
-
+            return last_hidden, pooler_output, tokens
+        return last_hidden, pooler_output
 
 def create_magi_v2_from_v1(
     v1_model: nn.Module,

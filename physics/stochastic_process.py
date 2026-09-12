@@ -66,7 +66,15 @@ class ControlledSDEContract:
 
 
 class ControlledSDE:
-    """Small Euler-Maruyama wrapper around an explicit controlled SDE."""
+    """Small Euler-Maruyama wrapper around an explicit controlled SDE.
+
+    ``control`` is the per-step intervention vector delivered by the caller.
+    For single-neuron optogenetics, the data boundary encodes
+    ``u_t = [a_t, a_t * target_one_hot]``; the target code is zero whenever
+    the light drive is zero, preserving the exact no-intervention invariant.
+    Downstream propagation belongs in ``next_state``/the neural observation,
+    never in the control vector.
+    """
 
     def __init__(
         self,

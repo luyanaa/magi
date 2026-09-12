@@ -51,9 +51,11 @@ only through that reduction; the loader contract is
 | Location | `cleandata_smoothened2/` (Google Drive) — 24 worms, `<id>_ratio.csv` (T×N time-major) + `<id>_uniqNames.csv` |
 | Scale | 24 worms; observed `T=6000`, `N=146…~226` (per-worm subsets differ) |
 | Stimulus | salt (per `sample_name_list.txt`) |
-| Ingestion (2026-09 upgrade) | `data/ingest_c_elegans.py` → canonical ladder via `emit_sample`: `calcium/<id>.npy (N,T)`, `calcium_ids/<id>.txt`, `calcium_mask` (NaN cells), manifest (`subject/origin/condition/rate_hz`). Options: `--metadata gKDR-GMM/metadata` + `--filter-known` (keep only channels in the canonical name pool) or `--apply-names` (positional id mapping) |
-| ID semantics (verified) | Mixed within worms: canonical names (e.g. `ADAL`) plus recording-local numeric ids; `--filter-known` drops the latter (e.g. worm 10: −78, worm 11: −54, worm 12: −82 channels) making cross-worm **name-union alignment** valid; 299-name pool from `conneurons.csv` (159 in `globalNames.csv`), `multiconmatrix.csv` rows are 299-valued profiles |
-| Sanity | `tools/real_data_sanity.py` passed (batch-1; forward/backward, correlation criteria); loader P0-P2 features (union alignment, masks, manifest splits) covered by tests |
+| Ingestion (2026-09 fix) | `data/ingest_c_elegans.py --timing-xlsx cleandata_smoothened2/stimulation_timing.xlsx --metadata gKDR-GMM/metadata --filter-known` → canonical ladder: `calcium/<id>.npy (N,T)`, `calcium_ids/<id>.txt`, `calcium_mask` (NaN cells), `stimulus/<id>.npy` + `stimulus_trials/<id>.json` (salt drive from `generatesalt.m`, 30 s half-periods), manifest with **per-sample** `rate_hz`/`dt_s` plus `animal`/`sample_name`/`anesthesia`/stimulus provenance. Channel selection = canonical names (`--filter-known`) AND the reference autocorrelation filter `--qc-autocorr 0.3 --qc-lag 20`; `--overwrite` re-ingests in place; `--apply-names` maps positional ids *before* the name filter |
+| ID semantics (verified) | Mixed within worms: canonical names (e.g. `ADAL`) plus recording-local numeric ids; `--filter-known` drops the latter making cross-worm **name-union alignment** valid; 299-name pool from `conneurons.csv` (159 in `globalNames.csv`; `globalNames ⊆ conneurons`, so the repo pool equals the reference pool). End-to-end on the pilot: 4,621 channels → 3,021 named → **1,625** after the reference autocorr QC (worst worm 95 → 10) |
+| Rates (verified) | `frames/sec` differs **per sample** (3.69-5.72, median 4.08) and the metadata's `total duration` confirms it (`6000/4.1215 = 1455.8 s` for sample 1); a single 10 Hz assumption is wrong by 1.75-2.71x. The manifest carries the per-sample value and the model integrates with each batch's own `dt` |
+| Animal identity | 3 animals were imaged twice (15, 17, 23; different anaesthesia state) and 9/24 samples are anaesthetised: `subject` is the **animal** id (not the CSV index) so subject-grouped splits cannot place the same animal in train and val, and `anesthesia` is a manifest column |
+| Sanity | `tools/real_data_sanity.py --config configs/species/c_elegans.json --root <ladder>` runs on the real ladder: 60 s windows (244 frames at 4.08 Hz), per-sample `dt`, forward/backward with finite gradients, recon scores reported next to persistence/channel-mean baselines. Estimators: `diagnostics/species_parameters.py` (per-neuron tau median 1.50 s, IQR [1.05, 2.79]; AR(2) gain 2.6% ⇒ first-order observation model adequate; coupling split symmetric 0.60 / directed 0.40; zero-lag network R² 0.51) |
 
 ---
 
@@ -67,13 +69,28 @@ only through that reduction; the loader contract is
 | DANDI dandisets (Haesemeyer thermoregulation [000697–699, 707–708](https://dandiarchive.org/); forebrain/midbrain [000235/000236](https://dandiarchive.org/); Ahrens glia/behavior [000350](https://dandiarchive.org/); mesoscale pipelines [000244](https://dandiarchive.org/)) | [dandiarchive.org](https://dandiarchive.org/) | varies; whole-brain or regional, cellular | NWB (DANDI standard) | Needs NWB → `(C,T)` importer; per-dandiset check |
 | Z-Brain atlas / [ZebraFishExplorer](https://zebrafishexplorer.zib.de/about) + [mapZebrain](https://mapzebrain.org/) | ZIB / Portugues lab | atlas: 294 regions, 4,000+ traced neurons | `.mat`/`.h5`/SWC + registration tools (ANTs) | Parcellation/registration substrate, not a bulk trace dump |
 | Free-swimming whole-brain (Kim/Kim 2017 Nature Methods) | via journals/DANDI | n≈4–7 larvae per study (technical) | — | Reference for naturalistic behavior; low n |
-| **ZAPBench** (Zebrafish Activity Prediction Benchmark) | [github.com/google-research/zapbench](https://github.com/google-research/zapbench) / [arXiv:2503.02618](https://arxiv.org/pdf/2503.02618) (ICLR 2025) | 4D light-sheet recordings of **>70,000 neurons** in larval zebrafish; motion-stabilized, voxel + cell segmentations | Apache 2.0; segmentation/trace data + baselines | Whole-brain cellular forecasting benchmark — best-in-class target for dynamics evaluation; cell-level C is beyond raw-channel ladder → use segmentation subset/region reduction |
+| **ZAPBench** (Zebrafish Activity Prediction Benchmark) | [github.com/google-research/zapbench](https://github.com/google-research/zapbench) / [arXiv:2503.02618](https://arxiv.org/abs/2503.02618) (ICLR 2025) | 4D light-sheet recordings of **>70,000 neurons** in larval zebrafish (2048×1328×72 volumes × 7,879 at 914 ms); motion-stabilized, voxel + cell segmentations; 9 stimulus conditions | CC-BY 4.0 data / Apache 2.0 code; `gs://zapbench-release/volumes/20240930/{traces,stimuli_features,segmentation}` | Whole-brain cellular forecasting benchmark. **Adapter implemented** (`data/zapbench.py`): one session per condition (subject = animal, session = condition), 26-d stimulus bank as a control-role modality, `--region-bins`/`--max-cells` reduction, mandatory `--rate-hz`; the condition `taxis` is the benchmark holdout → `split_by="condition"` |
 | Whole-brain under oriented grating stimuli | [Zenodo 19486022](https://zenodo.org/records/19486022) | larval zebrafish whole-brain + stimuli | Zenodo | Visual-stimulus analysis track |
 | Whole-brain connectomic resource (intact 7 dpf larva) | [bioRxiv 2025.06.10.658982](https://www.biorxiv.org/content/10.1101/2025.06.10.658982v1.full-text) | >40,000 neurons annotated; 30M synapses, molecular labels | vEM + confocal | Future structure-conditioned dynamics (zebrafish connectome) |
 | Community dataset co-registration | [Sprague et al. 2025](https://www.sciencedirect.com/science/article/pii/S2667237524003540) | unifies community whole-brain imaging datasets | repository + trained cell-ID models | Standardization path across labs |
 | Larval behavior videos | [Zenodo 7807968](https://zenodo.org/records/7807968) | 376.8 GB behavior video | Zenodo | Behavior-modality pool (Mullen et al. 2023) |
 | Whole-brain **voltage** imaging | [Nature Methods 2026 (s41592-026-03179-7)](https://www.nature.com/articles/s41592-026-03179-7) / [bioRxiv 2023.12.15.571964](https://www.biorxiv.org/content/10.1101/2023.12.15.571964v1.full-text) | whole-brain voltage, ~35 s trials (200 s continuous shown) | per-paper | The ladder's "voltage" modality for zebrafish — emerging, few specimens |
 | Gene-expression + activity co-mapping (WARP) | [bioRxiv 2026.02.07.704095](https://www.biorxiv.org/content/10.64898/2026.02.07.704095v1.full-text) | whole-brain, behaving larva, neuron-type identification | per-paper | Future heterogeneity/metadata axis |
+| DANDI [000235](https://dandiarchive.org/dandiset/000235/0.230316.1600) / [000236](https://dandiarchive.org/dandiset/000236/0.230316.2031) / [000237](https://dandiarchive.org/dandiset/000237/0.230316.1655) / [000238](https://dandiarchive.org/dandiset/000238/0.230316.1519) thermoregulation family | [DANDI](https://dandiarchive.org/) | 000235/236/237/238: 8/9/8/6 assets; 30.6/39.3/30.1/25.9 GB | NWB; `TwoPhotonSeries` plus `BehavioralTimeSeries` | Forebrain, midbrain, hindbrain, and reticulospinal calcium dynamics under random-wave temperature stimuli |
+| DANDI [001337](https://dandiarchive.org/dandiset/001337/0.250814.1917) / [001339](https://dandiarchive.org/dandiset/001339/0.250814.1916) fixed thermal stimulation | [DANDI](https://dandiarchive.org/) | 223/82 assets; 28.8/4.55 GB | NWB; two-photon population imaging | Medulla and trigeminal-ganglion hot/cold stimulus-response dynamics |
+| DANDI [001453](https://dandiarchive.org/dandiset/001453/0.250518.1950) visuomotor strategies | [DANDI](https://dandiarchive.org/) | 37 assets; 3.82 GB; 25 subjects | NWB; current summary lists `BehavioralTimeSeries` only | Useful behavior/control candidate, but do not assume neural traces from the title |
+| DANDI [001569 draft](https://dandiarchive.org/dandiset/001569/draft) visual/photo stimulation | [DANDI](https://dandiarchive.org/) | Draft; 13 assets reported by the version endpoint | Draft NWB candidate | Calcium fluorescence during visual and photo stimulation; not a released version |
+| Dryad — [Inhibition drives habituation of a larval zebrafish visual response](https://datadryad.org/stash/dataset/doi:10.5061/dryad.jdfn2z3fc) | [Data Dryad](https://datadryad.org/) | 31.12 GB; larval zebrafish | ZIP; calcium imaging plus behavioral data | Repeated dark-flash Ca2+ imaging; adaptation and habituation dynamics; strongest Dryad zebrafish learning track |
+| Dryad — [Zebrafish retinal ganglion cells asymmetrically encode spectral and temporal information](https://datadryad.org/stash/dataset/doi:10.5061/dryad.7sqv9s4pm) | [Data Dryad](https://datadryad.org/) | 590.62 MB; larval zebrafish | CSV/IBW plus MATLAB | Two-photon hyperspectral visual stimulation; spectral/temporal response dynamics; processed rather than NWB |
+| Figshare — [Calcium imaging of spontaneous activity in larval zebrafish tectum](https://figshare.com/articles/dataset/Calcium_imaging_of_spontaneous_activity_in_larval_zebrafish_tectum/6943265) | [Figshare](https://figshare.com/) | 9.90 MB; 2 larvae | ZIP; GCaMP6s dF/F | Optic-tectum spontaneous activity; smallest zebrafish pilot; CC BY 4.0 |
+| PLOS Figshare — [Neurotransmitter-mediated activity spatially controls neuronal migration](https://plos.figshare.com/articles/dataset/Neurotransmitter-mediated_activity_spatially_controls_neuronal_migration_in_the_zebrafish_cerebellum/5756700) | [PLOS Figshare](https://plos.figshare.com/) | Supplementary files | TIFF/XLSX/AVI | Calcium-transient and migration assays; auxiliary developmental dynamics, not a canonical continuous trace corpus |
+
+### Cross-repository dynamics shortlist
+
+The current search found strong zebrafish dynamics records in DANDI, Dryad, and Figshare. The exact `zebrafish` keyword query on OpenNeuro returned no confirmed dataset, so OpenNeuro is not currently a zebrafish source in this registry.
+
+Use [000237 Hindbrain](https://dandiarchive.org/dandiset/000237/0.230316.1655) or the compact Figshare tectum dataset for initial zebrafish loader tests; use Dryad habituation when adaptation across repeated stimuli is the target.
+
 
 ### 3.2 Plan
 1. Pick 1–2 Portugues-lab head-fixed datasets (optomotor/decision tasks) with open deposits; register cells to Z-Brain regions → region traces `(C≈294, T)`.
@@ -103,6 +120,33 @@ only through that reduction; the loader contract is
 | fMRI (awake, longitudinal) | [Longitudinal rs-fMRI habituation (PMC12956629)](https://pmc.ncbi.nlm.nih.gov/articles/PMC12956629) | awake mice, longitudinal sessions | per-paper | Habituation dynamics; check cohort n |
 | fMRI (awake) | Gutierrez-Barragan et al. (Curr Biol 2022) | [Mendeley 10.17632/np2fx99hn6.2](https://doi.org/10.17632/np2fx99hn6.2) (CC BY 4.0) | n=10 awake (n=19 anesthetized: [354f8dc8xh.2](https://doi.org/10.17632/354f8dc8xh.2)) | NIfTI etc. | Drop first ~120 scans (thermal equilibration); parcellate to CCF regions |
 | fMRI (large cohorts) | IIT Gozzi lab — e.g. Autism Mouse Brain Connectome collection (600+ mice, 20 etiologies) | [fnimg.iit.it/datasets-code](https://fnimg.iit.it/datasets-code) | >600 mice (multi-center); aging n≈82 | per-collection | Multi-etiologies add confounds; use healthy controls subset for ladder base |
+| DANDI [000206](https://dandiarchive.org/dandiset/000206/0.220103.2119) visual cortical activity | [DANDI](https://dandiarchive.org/) | 1 asset, 118 MB, 1 mouse | NWB; imaging plus `SpatialSeries`/position | Smallest complete calcium/behavior pilot |
+| DANDI [000039](https://dandiarchive.org/dandiset/000039/0.230223.1216) contrast tuning | [DANDI](https://dandiarchive.org/) | 100 assets, 22.6 GB | NWB; `TwoPhotonSeries`, `Units`, behavior | Visual-stimulus calcium dynamics with electrophysiology metadata |
+| DANDI [000017](https://dandiarchive.org/dandiset/000017/0.240329.1926) distributed coding | [DANDI](https://dandiarchive.org/) | 39 assets, 14.7 GB | NWB; units, pupil, behavioral events/epochs | Choice, action, and engagement dynamics |
+| DANDI [001695](https://dandiarchive.org/dandiset/001695/0.260319.2023) hippocampal-cortical dynamics | [DANDI](https://dandiarchive.org/) | 22 assets, 3.09 GB, 6 mice | NWB; Neuropixels/SiNAPS, LFP, units, spatial position | Best medium-size ephys/spatial-behavior pilot |
+| DANDI [001425](https://dandiarchive.org/dandiset/001425/0.250705.0947) BraiDyn-BC | [DANDI](https://dandiarchive.org/) | 1,838 assets, 8.06 TB, 25 mice | NWB plus video; widefield/one-photon imaging and behavior | Longitudinal motor learning; high-value but too large for first download |
+| DANDI [000021](https://dandiarchive.org/dandiset/000021/0.251116.2246) Allen Visual Coding Neuropixels | [DANDI](https://dandiarchive.org/) | 214 assets, 477.6 GB, 32 mice | NWB; LFP and sorted units | Large visual-ephys benchmark |
+| DANDI [000409](https://dandiarchive.org/dandiset/000409/0.260309.1324) IBL Brain Wide Map | [DANDI](https://dandiarchive.org/) | 2,048 assets, 49.7 TB, 139 mice | NWB; units, position, behavior | Whole-brain scale-up after the loader is stable |
+| DANDI [000003](https://dandiarchive.org/dandiset/000003/0.260218.2052) hippocampal granule/mossy cells | [DANDI](https://dandiarchive.org/) | 101 assets, 2.56 TB | NWB; LFP, units, position, maze behavior | Rich hippocampal dynamics; heavy acquisition |
+| DANDI [000048 draft](https://dandiarchive.org/dandiset/000048/draft) 2P calcium/ephys calibration | [DANDI](https://dandiarchive.org/) | Draft; 1 asset, 590 MB | Draft NWB; simultaneous fluorescence and spiking | Useful calcium-to-spike calibration candidate; not a released version |
+| fMRI + high-resolution behavior | OpenNeuro [ds004402](https://openneuro.org/datasets/ds004402) | 10 mice, 8 sessions, 1,515 files, 17.23 GB | BIDS MRI; odor-discrimination task | Strong mouse fMRI/behavior pairing for dynamic-state modeling |
+| Resting-state fMRI | OpenNeuro [ds007100](https://openneuro.org/datasets/ds007100/versions/1.0.3) | 82 mice, 330 sessions, 6,865 files, 472.90 GB | BIDS MRI; awake resting state | Largest directly verified OpenNeuro mouse dynamics pool in this search; parcellate to regions |
+| Longitudinal BOLD rs-fMRI | OpenNeuro [ds006663](https://openneuro.org/datasets/ds006663/versions/1.0.3) | 69 mice, PND30/PND90 sessions, 4,310 files, 18.03 GB | BIDS MRI; BOLD rs-fMRI plus structural/DWI | Longitudinal developmental axis; separate age/session effects from neural state |
+| Optogenetic fMRI | OpenNeuro [ds001541](https://openneuro.org/datasets/ds001541/versions/1.1.3) | 16 mice, 9 sessions, 323 files, 1.17 GB | BIDS MRI; DRN optogenetic task | Stimulus-locked perturbation track; compact fMRI pilot |
+| Whisker-stimulation fMRI | OpenNeuro [ds005496](https://openneuro.org/datasets/ds005496/versions/1.0.1) | 6 mice, 12 sessions, 191 files, 11.90 GB | BIDS MRI; whisker-stimulation task | Sensory-evoked fMRI dynamics with repeated sessions |
+| Simultaneous 2P voltage/calcium + LFP | Dryad [Cecchetto et al.](https://datadryad.org/stash/dataset/doi:10.5061/dryad.dbrv15f23) | 160.94 MB | ZIP; awake/anesthetized barrel cortex | Best compact cross-modal mouse candidate; spontaneous and whisker-evoked signals |
+| Longitudinal 2P calcium | Dryad [Long-term stability of cortical ensembles](https://datadryad.org/stash/dataset/doi:10.5061/dryad.cfxpnvx5m) | 4.07 GB; six mouse identifiers in file names | `.mat` | Same layer-2/3 visual-cortex cells tracked over weeks; longitudinal ensemble dynamics |
+| Voltage imaging during learning | Dryad [Emerging experience-dependent dynamics](https://datadryad.org/stash/dataset/doi:10.5061/dryad.h18931zmm) | 266.06 GB | ZIP; S1 voltage imaging plus behavior | Direct adaptation/learning dynamics; too large for the first pilot |
+| Calcium imaging + behavior | Dryad [Amplitude modulations of cortical sensory responses](https://datadryad.org/stash/dataset/doi:10.5061/dryad.tb2rbnzxv) | 1.61 GB | `.mat`; calcium traces and synchronized task data | Visual-cortex/retrosplenial evidence-accumulation track; condensed data |
+| Widefield calcium + ephys + optogenetics | Dryad [Separable gain control of ongoing and evoked activity](https://datadryad.org/stash/dataset/doi:10.5061/dryad.931zcrjgk) | 2.52 MB | `.mat`; condensed derived data | Very small pilot for ongoing-versus-evoked gain; not a raw recording corpus |
+| Simultaneous calcium imaging + electrophysiology | Figshare [A comparison of neuronal population dynamics](https://figshare.com/articles/dataset/Raw_data_for_A_comparison_of_neuronal_population_dynamics_measured_with_calcium_imaging_and_electrophysiology_/12792587) | 2.37 GB; 2 ZIP files | Raw ZIP; V1 calcium/ephys plus ALM task calcium | Strongest Figshare mouse neural-dynamics candidate; CC BY 4.0 |
+
+### Cross-repository dynamics shortlist
+
+OpenNeuro contributes standardized BIDS fMRI time series and behavior, while Dryad and Figshare contribute smaller but more heterogeneous `.mat`, ZIP, CSV/IBW, and derived-data records. These sources should remain separate ingestion adapters rather than being forced into one raw-file format.
+
+Use Dryad [Cecchetto et al.](https://datadryad.org/stash/dataset/doi:10.5061/dryad.dbrv15f23) or Figshare [12792587](https://figshare.com/articles/dataset/Raw_data_for_A_comparison_of_neuronal_population_dynamics_measured_with_calcium_imaging_and_electrophysiology_/12792587) for calcium/electrophysiology alignment; use OpenNeuro [ds004402](https://openneuro.org/datasets/ds004402) or [ds007100](https://openneuro.org/datasets/ds007100/versions/1.0.3) for BOLD dynamics.
+
 
 ### 4.2 Plan
 1. Primary: Allen 2P Visual Coding → CCF region-parcellated ROI traces (per-session `(C_CCF, T)`) as the calcium channel with strong subject count (~200+).
@@ -199,9 +243,313 @@ and data-profile options (seq_seconds, split_by, region_map, align_channels,
 ...). Corpus scripts are run-ready: `data/hf_celegans.py`
 (inspect/download/ingest for the homogenized HF corpus, footer-only schema
 check verified) and the upgraded `data/ingest_c_elegans.py` (gKDR metadata
-name filtering, masks, canonical manifest). Remaining work is executing the
-downloads/ingestions and building the ZAPBench/Allen/Zebrafish adapters on
-top of `data/readers.py`. Stimulus control is wired end-to-end (roles → perturbation reduction → conditioned gates; `noise_mode` policy `off|rollout|train|always`); conditioned diffusion (P2.2) remains deferred.
+name filtering, masks, canonical manifest). Zebrafish and mouse source
+adapters now live in `data/corpus_pipeline.py`, `data/ingest_zebrafish.py`,
+and `data/ingest_mouse.py`; remaining work is executing downloads/ingestions
+against the selected records. Stimulus control is wired end-to-end (roles →
+perturbation reduction → conditioned gates; `noise_mode` policy
+`off|rollout|train|always`); conditioned diffusion (P2.2) remains deferred.
+
+### 6.3 Implemented zebrafish and mouse pipeline
+
+The two new species pipelines use one canonical ladder while keeping source
+adapters separate. DANDI NWB, Dryad/Figshare extracted arrays, and OpenNeuro
+BIDS files are converted before training; `SpeciesSignalDataset` never reads
+repository-specific formats.
+
+```mermaid
+flowchart LR
+    accTitle: Cross Species Data Pipeline
+    accDescr: Source-specific zebrafish and mouse records are acquired explicitly, converted to the canonical ladder, validated, windowed in seconds, split by subject, and routed by modality role into training loaders.
+
+    source_manifest([📋 Source manifest]) --> acquire[📥 Acquire and extract]
+    acquire --> source_adapter[🔌 Run source adapter]
+    source_adapter --> canonical_ladder[(💾 Canonical ladder)]
+    canonical_ladder --> validate_ladder[🧪 Validate arrays and masks]
+    validate_ladder --> seconds_windows[⚙️ Window in seconds]
+    seconds_windows --> subject_split[👥 Split by subject]
+    subject_split --> role_routing[🎯 Route signal and control]
+    role_routing --> train_loaders([✅ Train and validation loaders])
+
+    classDef input fill:#ede9fe,stroke:#7c3aed,stroke-width:2px,color:#3b0764
+    classDef process fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a5f
+    classDef success fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+
+    class source_manifest input
+    class acquire,source_adapter,validate_ladder,seconds_windows,subject_split,role_routing process
+    class canonical_ladder,train_loaders success
+```
+
+#### Zebrafish
+
+| Source family | Adapter | Canonical roles | Required metadata |
+|---|---|---|---|
+| DANDI NWB thermoregulation and thermal stimulation | `format: nwb` | `calcium` signal; optional `stimulus` control; optional `behavior` aux | NWB `series`, per-session rate or timestamps, subject/session/condition |
+| Dryad/Figshare MAT/NPZ/CSV/TSV exports | `format: array` | `calcium` or `voltage` signal; optional control/aux arrays | `key`, explicit `orientation`, rate or `dt`, optional channel IDs |
+| ZAPBench light-sheet release | Existing `data/zapbench.py` adapter | `calcium` signal; `stimulus` control | release clock, condition split, cell/region reduction |
+
+Use `configs/data/zebrafish_crossrepo.json` for the federated ladder. The
+profile treats behavior as `aux`, stimulus as `control`, uses 30-second
+physical windows, and keeps the manifest clock authoritative because the
+collected records do not share one sampling rate.
+
+```bash
+python -m brain_moe_pinn.data.ingest_zebrafish ingest \
+  --source-manifest /data/zebrafish_sources.json \
+  --out /data/data_ladder/zebrafish_crossrepo
+python -m brain_moe_pinn.data.ingest_zebrafish validate \
+  --root /data/data_ladder/zebrafish_crossrepo
+```
+
+#### Mouse
+
+| Source family | Adapter | Canonical roles | Spatial policy |
+|---|---|---|---|
+| DANDI NWB calcium/ephys/widefield | `format: nwb` | optical/electrical modalities as signals; behavior as aux | preserve ROI/channel IDs when supplied |
+| Dryad/Figshare MAT/NPZ/CSV/ZIP exports | extract first, then `format: array` | calcium, voltage, widefield, behavior | explicit orientation; no silent channel identity |
+| OpenNeuro BIDS fMRI | `format: nifti` or `bids-fmri` convenience command | `fmri` signal | atlas labels produce parcels; without an atlas use deterministic variance top-k and record that provenance |
+
+Use `configs/data/mouse_crossrepo.json` for federated calcium, voltage,
+widefield, fMRI, and behavior. The mouse species profile now uses
+`sample_rate_hz_source: "manifest"`; 30 Hz is only the nominal optical clock,
+while OpenNeuro TR and per-recording electrical/optical rates remain in each
+manifest row.
+
+```bash
+python -m brain_moe_pinn.data.ingest_mouse bids-fmri \
+  --bids-root /data/openneuro/ds004402 \
+  --subject 01 --task odor --atlas /data/atlas.nii.gz \
+  --out /data/data_ladder/mouse_crossrepo
+python -m brain_moe_pinn.data.ingest_mouse ingest \
+  --source-manifest /data/mouse_sources.json \
+  --out /data/data_ladder/mouse_crossrepo
+python -m brain_moe_pinn.data.ingest_mouse validate \
+  --root /data/data_ladder/mouse_crossrepo
+```
+
+#### Source manifest contract
+
+Each source manifest has one row per subject/session source. Relative paths
+are resolved against the manifest file; modality arrays are converted to
+`(C,T)` `float32`, finite-value masks are persisted, and optional channel IDs
+are written beside the array.
+
+```json
+{
+  "species": "mouse",
+  "samples": [{
+    "sample_id": "ds004402__sub-01__ses-01",
+    "subject": "sub-01",
+    "session": "ses-01",
+    "origin": "OpenNeuro:ds004402",
+    "condition": "odor_discrimination",
+    "modalities": {
+      "fmri": {
+        "format": "nifti",
+        "path": "sub-01/ses-01/func/sub-01_task-odor_bold.nii.gz",
+        "tr_s": 1.0,
+        "atlas": "atlas.nii.gz"
+      },
+      "calcium": {
+        "format": "nwb",
+        "path": "session.nwb",
+        "series": "RoiResponseSeries",
+        "orientation": "tc"
+      }
+    }
+  }]
+}
+```
+
+The implementation is in `data/corpus_pipeline.py`, with species commands in
+`data/ingest_zebrafish.py` and `data/ingest_mouse.py`. Square arrays require an
+explicit orientation; NWB volumes with more than two dimensions require an
+explicit reduction mode; no adapter downloads data implicitly.
+
+The previous integration status is updated accordingly: source adapters now
+cover NWB, NIfTI/BIDS, and extracted array records; remaining work is
+acquisition, source-manifest authoring for each selected record, and running
+the ingestion against the downloaded corpora.
+
+### 6.3.1 Human EEG/MEG/fMRI ingestion
+
+The human catalog in `EEG-Datasets.md` spans open BIDS/OpenNeuro records,
+clinical EDF/BrainVision exports, FIF-based MEG, and restricted repositories.
+The project therefore uses one local, source-manifest boundary rather than
+dataset-specific download code:
+
+| Source | Adapter | Canonical output | Required provenance |
+|---|---|---|---|
+| Scalp EEG (HBN, ABCD, TUH, LEMON, MOABB, sleep/BCI records) | `format: mne` via MNE; EDF/BDF/FIF/BrainVision/EEGLAB | `eeg/<sample>.npy` `(C,T)` plus `eeg_ids/` and optional `eeg_mask/` | subject/session/task, source path, channel names, measured/resampled rate |
+| Whole-head MEG (Cam-CAN, HCP MEP, ds000117, OMEGA) | `format: mne` via MNE; FIF/CTF | `meg/<sample>.npy` `(C,T)` plus `meg_ids/` and optional `meg_mask/` | subject/session/task, selected MEG types, source path, measured/resampled rate |
+| BOLD fMRI (UKB/HCP/ABCD/ABIDE/Narratives and clinical or naturalistic sets) | `format: nifti` via nibabel; optional atlas NIfTI | `fmri/<sample>.npy` `(R,T)` plus `fmri_ids/` and optional `fmri_mask/` | subject/session/task, TR, atlas or deterministic voxel policy |
+
+`data/ingest_human.py` exposes `ingest`, `bids-session`, and `validate`.
+`bids-session` writes one row shared by selected modalities, but preserves
+`eeg_rate_hz`, `meg_rate_hz`, and `fmri_rate_hz` independently.  It never
+infers synchronization from matching BIDS entities: pass
+`cross_modal_label=1` only for a verified simultaneous recording and `0` for
+an intentionally asynchronous pair.  `format: mne` accepts explicit channel
+types or channel picks; it does not silently drop channels when
+`max_channels` is exceeded.  EEG/MEG filters and resampling are opt-in source
+spec fields.  fMRI atlas extraction is preferred; the no-atlas
+`max_channels` path is deterministic variance top-k voxel selection and is
+recorded as provenance, not a cross-study region space.
+
+For a non-BIDS or multi-source session, the same contract is expressed
+directly in JSON.  Relative paths are resolved against the manifest directory:
+
+```json
+{
+  "species": "human",
+  "samples": [{
+    "sample_id": "ds006040__sub-01__task-rest",
+    "subject": "sub-01",
+    "session": "ses-01",
+    "origin": "OpenNeuro:ds006040",
+    "condition": "rest",
+    "cross_modal_label": 1,
+    "modalities": {
+      "eeg": {
+        "format": "mne",
+        "path": "sub-01_task-rest_eeg.edf",
+        "modality": "eeg",
+        "target_rate_hz": 256,
+        "channel_types": ["eeg"],
+        "l_freq": 0.1,
+        "h_freq": 100,
+        "notch_freqs": [50, 60]
+      },
+      "meg": {
+        "format": "mne",
+        "path": "sub-01_task-rest_meg.fif",
+        "modality": "meg",
+        "target_rate_hz": 256,
+        "channel_types": ["meg"]
+      },
+      "fmri": {
+        "format": "nifti",
+        "path": "sub-01_task-rest_bold.nii.gz",
+        "atlas": "schaefer400.nii.gz",
+        "tr_s": 2.0
+      }
+    }
+  }]
+}
+```
+
+
+```bash
+python -m brain_moe_pinn.data.ingest_human bids-session \
+  --bids-root /data/openneuro/ds006040 --subject 01 \
+  --task rest --modalities eeg fmri --eeg-rate 256 \
+  --atlas /data/atlas.nii.gz --origin OpenNeuro:ds006040 \
+  --out /data/data_ladder/human_bids
+python -m brain_moe_pinn.data.ingest_human validate \
+  --root /data/data_ladder/human_bids --modalities eeg meg fmri
+```
+
+Acquisition, NDA/DUA approval, and archive-specific extraction remain
+operator responsibilities.  MNE and nibabel are optional runtime
+dependencies; fMRIPrep/SPM-produced NIfTI derivatives can be consumed after
+their spatial and confound decisions have been documented.  The canonical
+training profile is `configs/data/human_bids.json`, which uses subject-grouped
+splits and seconds-based windows.
+
+### 6.4 Optogenetic intervention control
+
+The Randi et al. *Neural signal propagation atlas of C. elegans* corpus is
+not another stationary stimulus track. It is an intervention dataset:
+the experimenter selects a target neuron, applies a time-localized light
+drive, and measures the downstream propagation in the neural signals. The
+target identity and the light waveform must therefore enter the control SDE
+as separate causal factors.
+
+At the data boundary, the optogenetic control vector is encoded as
+
+$$
+u_t = [a_t,\; a_t e_i],
+$$
+
+where $a_t$ is the light waveform/intensity and $e_i$ is a one-hot target code
+from a fixed within-species vocabulary. Multiplying the target code by
+$a_t$ preserves the invariant $u_t=0$ when the light is off. Protocol
+features such as wavelength or pulse state may be appended as additional
+declared control channels, but the current adapter's canonical representation
+is the waveform plus target-gated code. The controlled SDE then receives the
+intervention per latent step:
+
+$$
+dz_t = [f_\theta(z_t) + B_\theta(z_t)u_t]\,dt
+       + \Sigma_\theta(z_t)\,dW_t.
+$$
+
+The measured propagation response is never copied into `u_t`; it remains in
+the future calcium/voltage observation and in the next-window target. This
+prevents post-stimulation activity from leaking into the intervention.
+
+The source manifest declares the target vocabulary explicitly:
+
+```json
+{
+  "opto": {
+    "format": "array",
+    "path": "randi/opto_waveform.npy",
+    "orientation": "ct",
+    "control_kind": "optogenetic",
+    "target_id": "AVAL",
+    "target_vocab": "wormbase_neuron_order.txt",
+    "target_scope": "neuron",
+    "gate_channel": 0,
+    "active_threshold": 0.0,
+    "rate_hz": 4.0
+  }
+}
+```
+
+`data/corpus_pipeline.py::encode_optogenetic_control` appends the
+drive-gated target code to the waveform. `ingest_source_manifest` writes the
+result as one `opto` control modality and records target scope, target IDs,
+and vocabulary size in the manifest. A missing or unknown target is an error;
+the adapter does not silently replace a target with a generic stimulus.
+
+Use `control_reduction="peak"` for sparse pulses so a short light event is not
+diluted by a long-window mean. Set `rollout_steps` so each SDE segment resolves
+the pulse onset/offset; use `resample` for long, continuously varying light
+drives. The `opto` contribution to `perturbation_dim` must equal the waveform
+feature count plus the target-vocabulary width (plus any protocol features);
+the total model width must also include every other active control modality.
+An active experiment profile must list `opto` in `data.modalities`, assign
+`roles.opto = "control"`, and set `features.perturbation_dim` after the
+source vocabulary is fixed. The species JSONs declare the optogenetic
+contract as metadata only; they do not guess a target vocabulary or resize
+model weights.
+
+The same contract applies to zebrafish and mouse, but target vocabularies are
+species-specific. A registered zebrafish neuron, mouse cell, or atlas region
+is a conditioning identity, not a cross-species homology claim. If cellular
+registration is unavailable, parcellate the target to the declared atlas
+before encoding. Optogenetic fMRI records use the same intervention vector,
+while the measured BOLD response remains downstream of the existing
+TR-aware HRF/emission path.
+
+The first validation path is causal and intervention-specific:
+
+1. held-out target neuron/region: predict propagation for a target identity
+   not used in training;
+2. sham/off windows: verify the encoded control is exactly zero and the
+   zero-control SDE is unchanged;
+3. target permutation: swap target codes while keeping the waveform fixed
+   and measure the downstream propagation change;
+4. temporal ablation: compare `peak` against `mean` to quantify pulse
+   dilution and verify onset/offset resolution;
+5. protocol holdout: hold out wavelength/intensity/pulse protocol separately
+   from the target holdout.
+
+The repository now contains the encoding and reduction primitives. The Randi
+source files, fixed neuron vocabulary, and species-specific optogenetic data
+profiles still need to be registered in source manifests after acquisition;
+no external download is implicit.
 
 ---
 
@@ -216,6 +564,16 @@ Key additions from this round are integrated above: **ZAPBench** (>70k neurons, 
 Keywords: `mouse EEG dataset large number of mice open animal electroencephalogram cohort`, `largest mouse Neuropixels electrophysiology dataset number of mice open 2024 2025`, `largest zebrafish whole-brain imaging dataset number of larvae recording hours`, `mouse fMRI dataset large cohort number of mice resting state 2025 open`, `DANDI mouse calcium imaging total sessions dataset aggregate number`, `mouse widefield imaging number of mice sessions open dataset 2025`, `zebrafish larvae whole brain calcium dataset 100 fish aggregated`, `animal brain recording consortium aggregated open datasets sessions mice hours`.
 
 Key additions (integrated in §5 and the corpus tables): Allen Neuropixels Visual Behavior (~300k neurons; [DANDI 000713](https://dandiarchive.org/dandiset/000713)); Tseng/Harvey 2P 8 mice × 286 sessions / 273,770 neurons; Kondo widefield n=25/364 sessions; awake-mouse fMRI OpenNeuro [ds007100](https://openneuro.org/datasets/ds007100/versions/1.0.3) (cohort to verify) + 14T awake study (38 mice); Nature 2025 widefield+ephys decision study (2,289 region-sessions); whole-brain voltage imaging in larval zebrafish (Nature Methods 2026); WARP gene-expression co-mapping (bioRxiv 2026); curated SWR Neuropixels corpus (Sci Data 2025); ZAPBench same-specimen connectome note. Mouse scalp-EEG remains tiny (n≈9-20/study) — no large-n EEG-class exists for rodents.
+
+### Round 4 (agent-reach Exa + Tavily + official repository APIs, 2026-09-11; zebrafish/mouse dynamics)
+Queries: `site:openneuro.org/datasets zebrafish Danio rerio calcium imaging neural dynamics`, `site:openneuro.org/datasets mouse neural dynamics calcium electrophysiology fMRI`, `site:datadryad.org/stash/dataset zebrafish Danio rerio neural calcium imaging time series`, `site:datadryad.org/stash/dataset mouse neural dynamics calcium imaging electrophysiology`, and equivalent Figshare searches. Exa reached its free MCP rate limit during this round; Tavily and official public APIs/pages were used for the verified records.
+
+Findings:
+- OpenNeuro's public GraphQL exact-keyword query returned **0 confirmed `zebrafish` datasets**. The mouse + fMRI query returned 35 matches; the registry records the strongest verified candidates: `ds004402`, `ds007100`, `ds006663`, `ds001541`, and `ds005496`.
+- Dryad added larval-zebrafish habituation and retinal visual-response records, plus mouse multimodal, longitudinal calcium, voltage-imaging, and calcium/behavior records. File formats are heterogeneous and include ZIP, `.mat`, CSV, and IBW.
+- Figshare added a 9.90 MB zebrafish tectum dF/F pilot and a 2.37 GB mouse calcium/electrophysiology dataset. Both records are public and list CC BY 4.0 metadata.
+- No downloads or acquisitions were performed in this round; status remains **candidate / not acquired**.
+
 
 Verify counts/formats/licenses at download; unauthenticated Tavily results may miss gated deposits (e.g., contact-only Portugues-lab raw data).
 
