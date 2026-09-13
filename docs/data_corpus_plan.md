@@ -42,7 +42,7 @@ only through that reduction; the loader contract is
 | Connectivity | 9 connectome annotations (3 EM studies + propagation study) as graphs |
 | Why it fits | Solves the per-worm channel-subset problem (see §2.2); common ordering → dense `(250, T)` batches; graph data → future structure-conditioned dynamics |
 | Caveats | Calcium low-pass filtering/temporal lags; heterogeneous protocols — stimulus metadata is essential; check HF license before use |
-| Status | **Scripts ready (2026-09), corpus not yet downloaded.** `python -m brain_moe_pinn.data.hf_celegans inspect` (footer-only schema check: verified 42,798 (worm, neuron) rows, single row group, long-format `calcium_data`/`time_in_seconds` with resample dt = 0.333 s) → `download --out worm_data_short.parquet` (669.5 MB) → `ingest --parquet ... --out ...` (canonical ladder: per-worm (N, T), neuron ids, masks for NaN gaps, manifest with origin/rate) |
+| Status | **Downloaded and ingested (2026-09).** `../worm_data_short.parquet` is 669.5 MB; `data/hf_celegans.py ingest` emitted 919 worms (42,798 `(worm, neuron)` rows, 9,919 unlabeled-slot rows dropped) into `../data_ladder/c_elegans_hf` with per-worm calcium, masks, neuron ids, manifest rate `~3.003 Hz` (`dt=0.333 s`). |
 
 ### 2.2 Local pilot (acquired): salt-stimulus recordings
 
@@ -56,6 +56,34 @@ only through that reduction; the loader contract is
 | Rates (verified) | `frames/sec` differs **per sample** (3.69-5.72, median 4.08) and the metadata's `total duration` confirms it (`6000/4.1215 = 1455.8 s` for sample 1); a single 10 Hz assumption is wrong by 1.75-2.71x. The manifest carries the per-sample value and the model integrates with each batch's own `dt` |
 | Animal identity | 3 animals were imaged twice (15, 17, 23; different anaesthesia state) and 9/24 samples are anaesthetised: `subject` is the **animal** id (not the CSV index) so subject-grouped splits cannot place the same animal in train and val, and `anesthesia` is a manifest column |
 | Sanity | `tools/real_data_sanity.py --config configs/species/c_elegans.json --root <ladder>` runs on the real ladder: 60 s windows (244 frames at 4.08 Hz), per-sample `dt`, forward/backward with finite gradients, recon scores reported next to persistence/channel-mean baselines. Estimators: `diagnostics/species_parameters.py` (per-neuron tau median 1.50 s, IQR [1.05, 2.79]; AR(2) gain 2.6% ⇒ first-order observation model adequate; coupling split symmetric 0.60 / directed 0.40; zero-lag network R² 0.51) |
+
+### 2.3 Unified C. elegans training root (acquired; local)
+
+The three source adapters remain separate, then join through
+`data/merge_c_elegans.py` into
+`../data_ladder/c_elegans_unified/manifest.csv`:
+
+| Source | Rows | Clock | Control |
+|---|---:|---:|---|
+| Toyoshima/gKDR-GMM salt | 24 worms | 3.69–5.72 Hz per recording | scalar salt waveform |
+| Randi PumpProbe | 113 recordings | 2 Hz (`dt=0.5 s`) | recording-local, target-gated opto |
+| HuggingFace activity | 919 worms | `dt=0.333 s` (`~3.003 Hz`) | absent; no intervention |
+
+The unified manifest has **1,056 calcium rows** and 137 control-bearing rows.
+The model-facing `stimulus` contract is width 282: feature 0 is the source
+drive, while features 1–281 are Randi recording-local target gates. Toyoshima
+controls are stored as scalar source references and padded by the training
+partition; HuggingFace rows omit the control field. Source-qualified subjects,
+recording-local channel identities, `align_channels=false`, and batch size 1
+are intentional—no cross-recording neuron identity is asserted. The profile
+uses 15-second physical windows and `resample` over three 5-second rollout
+segments, preserving the supplied Randi pulse widths.
+
+The default unified root is manifest-federated rather than a second large
+copy. Stage all three canonical roots with the manifest on a remote host, or
+run the merge command with `--materialize` when a self-contained bundle is
+required. Remote training has not been launched; only local loader and
+forward/backward smoke checks are complete.
 
 ---
 
@@ -546,10 +574,16 @@ The first validation path is causal and intervention-specific:
 5. protocol holdout: hold out wavelength/intensity/pulse protocol separately
    from the target holdout.
 
-The repository now contains the encoding and reduction primitives. The Randi
-source files, fixed neuron vocabulary, and species-specific optogenetic data
-profiles still need to be registered in source manifests after acquisition;
-no external download is implicit.
+The downloaded Randi text export is now handled by
+`data/ingest_randi.py`. It validates the 0.5 s source clock, emits a
+15-second three-level pulse from the notebook's event files, masks
+out-of-range fluorescence frame-by-frame, preserves source labels and event
+JSON, and writes a 281-position target vocabulary. The supplied labels are
+partially populated and contain duplicates, so this adapter declares targets
+as `recording_local_cell` rather than making an unsupported cross-recording
+neuron-identity claim. Use `configs/species/c_elegans_randi.json` with
+`configs/data/c_elegans_randi.json`; `opto` has width 282 (waveform plus 281
+target-gated features) and sparse controls use `peak` reduction.
 
 ---
 

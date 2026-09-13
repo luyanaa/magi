@@ -1,0 +1,42 @@
+{
+  "kind": "species",
+  "root": "../../data_ladder/c_elegans_unified",
+  "modalities": [
+    "calcium",
+    "stimulus"
+  ],
+  "roles": {
+    "calcium": "signal",
+    "stimulus": "control"
+  },
+  "control_modalities": [
+    "stimulus"
+  ],
+  "seq_seconds": 15.0,
+  "batch_size": 1,
+  "num_workers": 2,
+  "pin_memory": true,
+  "persistent_workers": true,
+  "prefetch_factor": 4,
+  "split_by": "subject",
+  "val_frac": 0.1,
+  "align_channels": false,
+  "max_union_channels": 302,
+  "return_masks": true,
+  "return_next_step_targets": true,
+  "future_steps": 3,
+  "seed": 0,
+  "control_reduction": "resample",
+  "rollout_steps": 3,
+  "normalization": "none",
+  "recon_loss_mix": {
+    "calcium": {
+      "correlation": 0.55,
+      "corr_diff": 0.20,
+      "wasserstein1": 0.25
+    }
+  },
+  "use_trials": false,
+  "control_width": 282,
+  "control_note": "Unified source-harmonized control: 15-second physical windows at each manifest rate and three 5-second rollout segments. Feature 0 is the scalar Toyoshima salt or Randi waveform; features 1..281 are Randi recording-local target gates. HuggingFace rows omit the control modality. Calcium IDs remain source-local and are not union-aligned."
+}

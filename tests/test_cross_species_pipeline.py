@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import torch
 import pytest
 
 from brain_moe_pinn.config import ExperimentConfig, SUPPORTED_MODALITIES
@@ -15,8 +16,11 @@ from brain_moe_pinn.data.corpus_pipeline import (
     ingest_source_manifest,
     validate_ladder,
 )
-from brain_moe_pinn.data.species_dataset import SpeciesSignalDataset, build_species_dataloaders
-
+from brain_moe_pinn.data.ingest_randi import convert_randi_directory
+from brain_moe_pinn.data.merge_c_elegans import merge_c_elegans_ladders
+from brain_moe_pinn.data.species_dataset import (
+    SpeciesSignalDataset, build_species_dataloaders)
+from brain_moe_pinn.data.readers import emit_sample
 
 def test_zebrafish_source_manifest_emits_multirate_ladder(tmp_path):
     source = tmp_path / "sources"
@@ -428,3 +432,146 @@ def test_species_configs_declare_federated_rates_and_roles():
         assert profile["kind"] == "species"
         assert profile["split_by"] == "subject"
         assert profile["return_next_step_targets"] is True
+
+
+def test_randi_export_emits_masked_calcium_and_target_gated_opto(tmp_path):
+    source = tmp_path / "exported_data"
+    source.mkdir()
+    frames, channels = 40, 5
+    gcamp = np.linspace(1.0, 20.0, frames * channels).reshape(frames, channels)
+    gcamp[2, 0] = np.nan
+    gcamp[3, 1] = 250.0
+    gcamp[4, 2] = -1.0
+    np.savetxt(source / "0_gcamp.txt", gcamp)
+    np.savetxt(source / "0_t.txt", np.arange(frames) * 0.5)
+    np.savetxt(source / "0_stim_neurons.txt", [0, 2, -3, 4], fmt="%d")
+    np.savetxt(source / "0_stim_volume_i.txt", [2, 12, 22, 32], fmt="%d")
+    (source / "0_labels.txt").write_text("A\n\nB\nB\nC\n")
+    (source / "0_ds_name.txt").write_text("/source/recording-0/\n")
+
+    out = tmp_path / "ladder"
+    convert_randi_directory(
+        source,
+        out,
+        pulse_levels=(3.0, 1.5, 0.75),
+        pulse_widths=(2, 2, 2),
+    )
+
+    report = validate_ladder(out, modalities=("calcium", "opto"))
+    assert report["samples"] == 1
+    calcium = np.load(out / "calcium" / "0.npy")
+    calcium_mask = np.load(out / "calcium_mask" / "0.npy")
+    opto = np.load(out / "opto" / "0.npy")
+    assert calcium.shape == (channels, frames)
+    assert opto.shape == (6, frames)
+    assert not calcium_mask[0, 2]
+    assert not calcium_mask[1, 3]
+    assert not calcium_mask[2, 4]
+    assert np.array_equal(opto[0, 2:8], [3, 3, 1.5, 1.5, 0.75, 0.75])
+    assert np.array_equal(opto[1, 2:8], opto[0, 2:8])
+    assert np.array_equal(opto[3, 12:18], opto[0, 12:18])
+    assert np.count_nonzero(opto[0, 22:28]) == 0
+    assert np.array_equal(opto[5, 32:38], opto[0, 32:38])
+    events = json.loads((out / "opto_events" / "0.json").read_text())
+    assert events["events"][2]["valid"] is False
+    assert (out / "randi_labels" / "0.txt").read_text() == "A\n\nB\nB\nC\n"
+    with (out / "manifest.csv").open(newline="") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["rate_hz"] == "2.0"
+    assert row["target_index_base"] == "0"
+    assert row["target_vocab_size"] == "5"
+    assert row["stim_invalid_event_count"] == "1"
+
+
+def test_randi_profile_matches_recording_local_control_contract():
+    root = Path(__file__).resolve().parents[1]
+    experiment = ExperimentConfig.from_file(
+        root / "configs/species/c_elegans_randi.json")
+    with (root / "configs/data/c_elegans_randi.json").open() as handle:
+        profile = json.load(handle)
+    assert experiment.data.modalities == ("calcium", "opto")
+    assert experiment.data.roles["opto"] == "control"
+    assert experiment.features.perturbation_dim == 282
+    assert experiment.data.sample_rate_hz == 2.0
+    assert profile["control_reduction"] == "peak"
+    assert profile["rollout_steps"] == profile["future_steps"] == 3
+
+
+def test_celegans_federated_merge_preserves_source_controls_and_paths(tmp_path):
+    toyoshima = tmp_path / "toyoshima"
+    randi = tmp_path / "randi"
+    huggingface = tmp_path / "huggingface"
+    frames = 8
+    emit_sample(
+        toyoshima, "salt", {"calcium": np.arange(16).reshape(2, frames),
+                            "stimulus": np.arange(frames).reshape(1, frames)},
+        subject="worm-salt", rate_hz=4.0,
+        masks={"calcium": np.ones((2, frames), dtype=bool)},
+        ids={"calcium": ["salt_a", "salt_b"]},
+    )
+    emit_sample(
+        randi, "pump", {"calcium": np.ones((3, frames)),
+                        "opto": np.arange(4 * frames).reshape(4, frames)},
+        subject="worm-pump", rate_hz=2.0,
+        masks={"calcium": np.ones((3, frames), dtype=bool)},
+        ids={"calcium": ["p_a", "p_b", "p_c"]},
+    )
+    emit_sample(
+        huggingface, "activity", {"calcium": np.full((1, frames), 2.0)},
+        subject="worm-hf", rate_hz=3.0,
+    )
+
+    merged = tmp_path / "merged"
+    merge_c_elegans_ladders(
+        merged,
+        {"toyoshima": toyoshima, "randi": randi,
+         "huggingface": huggingface},
+        control_width=4,
+    )
+    report = validate_ladder(merged, modalities=("calcium", "stimulus"))
+    assert report["samples"] == 3
+    assert report["modalities"]["calcium"]["samples"] == 3
+    assert sorted(report["modalities"]["stimulus"]["channels"]) == [1, 4]
+
+    with (merged / "manifest.csv").open(newline="") as handle:
+        rows = {row["source_dataset"]: row for row in csv.DictReader(handle)}
+    assert rows["toyoshima"]["sample_id"] == "toyoshima_salt__salt"
+    assert rows["randi"]["sample_id"] == "randi_pumpprobe__pump"
+    assert rows["huggingface"]["control_present"] == "0"
+    assert rows["randi"]["stimulus_file"].endswith(
+        "../randi/opto/pump.npy")
+    assert rows["toyoshima"]["calcium_mask_file"].endswith(
+        "../toyoshima/calcium_mask/salt.npy")
+
+    dataset = SpeciesSignalDataset(
+        merged, ["calcium", "stimulus"], seq_len=frames,
+        roles={"calcium": "signal", "stimulus": "control"},
+        random_windows=False,
+    )
+    indices = {
+        row["sample_id"]: index for index, row in enumerate(dataset.rows)}
+    salt = dataset[indices["toyoshima_salt__salt"]]
+    pump = dataset[indices["randi_pumpprobe__pump"]]
+    activity = dataset[indices["hf_activity__activity"]]
+    assert salt["stimulus"].shape == (1, frames)
+    assert pump["stimulus"].shape == (4, frames)
+    assert "stimulus" not in activity
+    assert not salt["calcium_mask"].logical_not().any()
+    assert torch.equal(
+        pump["stimulus"], torch.from_numpy(
+            np.arange(4 * frames, dtype="float32").reshape(4, frames)))
+    materialized = tmp_path / "materialized"
+    merge_c_elegans_ladders(
+        materialized,
+        {"toyoshima": toyoshima, "randi": randi,
+         "huggingface": huggingface},
+        control_width=4,
+        materialize=True,
+    )
+    assert np.load(
+        materialized / "stimulus" / "toyoshima_salt__salt.npy").shape == (
+            4, frames)
+    assert np.load(
+        materialized / "stimulus" / "randi_pumpprobe__pump.npy").shape == (
+            4, frames)
+    validate_ladder(materialized, modalities=("calcium", "stimulus"))

@@ -238,3 +238,188 @@ def intrinsic_rollout_stats(states: np.ndarray) -> Dict[str, float]:
         "step_norm_last": float(steps[:, -1].mean()),
         "tail_std_ratio": tail / max(head, 1e-12),
     }
+
+def pareto_dominates(candidate: Dict[str, float], incumbent: Dict[str, float],
+                     directions: Dict[str, str]) -> bool:
+    """Return whether candidate is no worse on every metric and better on one."""
+    keys = tuple(directions)
+    if any(key not in candidate or key not in incumbent
+           or not np.isfinite(candidate[key]) or not np.isfinite(incumbent[key])
+           for key in keys):
+        return False
+    no_worse = True
+    strictly_better = False
+    for key, direction in directions.items():
+        c, i = float(candidate[key]), float(incumbent[key])
+        if direction == "min":
+            no_worse &= c <= i
+            strictly_better |= c < i
+        elif direction == "max":
+            no_worse &= c >= i
+            strictly_better |= c > i
+        else:
+            raise ValueError("directions must be 'min' or 'max'")
+    return bool(no_worse and strictly_better)
+
+
+def pareto_front(reports: Sequence[Dict[str, object]],
+                 directions: Dict[str, str]) -> List[int]:
+    """Return indices of non-dominated metric reports."""
+    front = []
+    for index, report in enumerate(reports):
+        metrics = report.get("metrics", report)
+        dominated = any(
+            pareto_dominates(other.get("metrics", other), metrics, directions)
+            for other in reports if other is not report)
+        if not dominated:
+            front.append(index)
+    return front
+
+
+def threshold_status(metrics: Dict[str, float], thresholds: Dict[str, Dict[str, float]]) -> Dict[str, bool]:
+    """Evaluate explicit min/max thresholds without combining units."""
+    status = {}
+    for key, bounds in thresholds.items():
+        value = metrics.get(key)
+        ok = value is not None and np.isfinite(value)
+        if "min" in bounds:
+            ok = ok and value >= float(bounds["min"])
+        if "max" in bounds:
+            ok = ok and value <= float(bounds["max"])
+        status[key] = bool(ok)
+    return status
+
+def free_run_metric_vector(report: Dict[str, object]) -> Dict[str, float]:
+    """Extract comparable minimization metrics from evaluator JSON.
+
+    The vector intentionally contains unit-preserving errors: raw standard
+    deviation error is distance from one, and occurrence is the absolute gap
+    between real and generated lag-1 occurrence. TDE-RICA distribution and
+    transition metrics must come from the same fixed basis before comparison.
+    """
+    aggregate = report.get("aggregate", {})
+
+    def finite_mean(value: object) -> Optional[float]:
+        if isinstance(value, dict):
+            return None
+        try:
+            values = np.asarray(value, dtype=float)
+        except (TypeError, ValueError):
+            return None
+        finite = values[np.isfinite(values)]
+        return float(np.mean(finite)) if finite.size else None
+
+    def aggregate_mean(name: str) -> Optional[float]:
+        value = aggregate.get(name) if isinstance(aggregate, dict) else None
+        if isinstance(value, dict):
+            value = value.get("mean")
+        return finite_mean(value)
+
+    def nested(*keys: str) -> Optional[float]:
+        value: object = report
+        for key in keys:
+            if not isinstance(value, dict):
+                return None
+            value = value.get(key)
+        return finite_mean(value)
+
+    raw_std = aggregate_mean("raw_std_ratio")
+    if raw_std is None:
+        raw_std = nested("raw_std_ratio")
+    w1 = aggregate_mean("tderica_w1")
+    if w1 is None:
+        w1 = aggregate_mean("tderica_wasserstein_global")
+    if w1 is None:
+        w1 = nested("tderica", "distribution", "wasserstein_global")
+    kl = aggregate_mean("tderica_kl_mean")
+    if kl is None:
+        kl = nested("tderica", "distribution", "kl_divergence")
+    kernel = aggregate_mean("tderica_kernel_transition")
+    if kernel is None:
+        kernel = nested("tderica", "dynamics", "kernel_transition")
+    real_occ = aggregate_mean("real_occurrence_lag1")
+    gen_occ = aggregate_mean("generated_occurrence_lag1")
+    if real_occ is None:
+        real_occ = nested("real_occurrence_lag1")
+    if gen_occ is None:
+        gen_occ = nested("generated_occurrence_lag1")
+    corr = aggregate_mean("native_corr_matrix_mse")
+    acf = aggregate_mean("native_autocorr_mse")
+    vector = {}
+    if raw_std is not None:
+        vector["raw_std_error"] = abs(raw_std - 1.0)
+    if w1 is not None:
+        vector["w1"] = w1
+    if kl is not None:
+        vector["kl_mean"] = kl
+    if kernel is not None:
+        vector["kernel_transition"] = kernel
+    if real_occ is not None and gen_occ is not None:
+        vector["occurrence_lag1_gap"] = abs(real_occ - gen_occ)
+    if corr is not None:
+        vector["native_corr_matrix_mse"] = corr
+    if acf is not None:
+        vector["native_autocorr_mse"] = acf
+    return vector
+
+
+def tderica_biological_report(
+    real: np.ndarray,
+    generated: np.ndarray,
+    *,
+    dt_s: float,
+    max_lag: Optional[int] = None,
+    include_d3: bool = True,
+    d3_fast: bool = True,
+    tderica_path: Optional[str] = None,
+) -> Dict[str, object]:
+    """Compare real and generated trajectories using the TDE-RICA toolbox.
+
+    Inputs are ``(T, N)`` arrays. The report uses TDE-RICA's independent
+    component-space similarity suite when the neighboring toolbox is
+    available, while retaining this module's correlation, scale, and
+    autocorrelation metrics as an always-on audit. No fitting or motif
+    leakage is performed here: callers must provide a pre-fit projection or
+    use the separate TDE-RICA fit workflow.
+
+    ``dt_s`` is required because TDE-RICA's biological dwell and transition
+    interpretation is clock-dependent. D3 metrics are optional because they
+    are expensive and high-dimensional estimators need conservative use.
+    """
+    real_2d = _as_2d(real, "real")
+    generated_2d = _as_2d(generated, "generated")
+    if real_2d.shape != generated_2d.shape:
+        raise ValueError(
+            f"real and generated must share shape; got {real_2d.shape} and "
+            f"{generated_2d.shape}")
+    if not np.isfinite(dt_s) or dt_s <= 0:
+        raise ValueError("dt_s must be finite and positive")
+
+    report: Dict[str, object] = {
+        "native": run_free_run_suite(
+            real_2d, generated_2d, max_lag=max_lag, dt=float(dt_s)),
+        "dt_s": float(dt_s),
+        "tderica": None,
+    }
+    try:
+        import sys
+        if tderica_path:
+            path = str(tderica_path)
+            if path not in sys.path:
+                sys.path.insert(0, path)
+        from tderica import similarity_report
+    except ImportError as exc:
+        report["tderica_import_error"] = str(exc)
+        return report
+
+    previous_limit = sys.getrecursionlimit()
+    required_limit = 4 * real_2d.shape[0] + 1000
+    if required_limit > previous_limit:
+        sys.setrecursionlimit(required_limit)
+    try:
+        report["tderica"] = similarity_report(
+            real_2d, generated_2d, include_d3=include_d3, d3_fast=d3_fast)
+    finally:
+        if sys.getrecursionlimit() != previous_limit:
+            sys.setrecursionlimit(previous_limit)
+    return report

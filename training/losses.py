@@ -90,7 +90,6 @@ class ReconstructionLoss(nn.Module):
         loss_type = loss_type or self.loss_type
         if loss_type not in self.LOSS_TYPES:
             raise ValueError(f"loss_type must be one of {self.LOSS_TYPES}")
-
         if loss_type in self.ELEMENTWISE_TYPES:
             return self._elementwise_loss(
                 pred, target, loss_type, channel_weights, mask)
@@ -99,6 +98,39 @@ class ReconstructionLoss(nn.Module):
                 pred, target, on_difference=(loss_type == "corr_diff"),
                 channel_weights=channel_weights, mask=mask)
         return self._wasserstein_loss(pred, target, channel_weights, mask)
+
+    def mixed_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        criteria: Dict[str, float],
+        channel_weights: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return a normalized non-negative mixture of reconstruction criteria.
+
+        The criteria are normalized by their supplied total weight. This lets
+        a species recipe retain correlation/increment structure while adding a
+        direct marginal-distribution term such as Wasserstein-1.
+        """
+        if not criteria:
+            return self.forward(pred, target, channel_weights=channel_weights,
+                                mask=mask)
+        if any(float(weight) < 0 for weight in criteria.values()):
+            raise ValueError("mixed reconstruction weights must be non-negative")
+        total_weight = sum(float(weight) for weight in criteria.values())
+        if total_weight <= 0:
+            raise ValueError("mixed reconstruction weights need positive mass")
+        total = pred.sum() * 0.0
+        for criterion, weight in criteria.items():
+            if criterion not in self.LOSS_TYPES:
+                raise ValueError(f"loss_type must be one of {self.LOSS_TYPES}")
+            if float(weight) == 0:
+                continue
+            total = total + (float(weight) / total_weight) * self.forward(
+                pred, target, loss_type=criterion,
+                channel_weights=channel_weights, mask=mask)
+        return total
 
     def _elementwise_loss(
         self,
@@ -150,30 +182,32 @@ class ReconstructionLoss(nn.Module):
         channels with zero variance on either side).
         """
         def center(x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-            mean = x.masked_fill(~valid, 0.0).sum(dim=-1, keepdim=True) / (
+            values = x.masked_fill(~valid, 0.0)
+            mean = values.sum(dim=-1, keepdim=True) / (
                 valid.sum(dim=-1, keepdim=True).clamp_min(1.0))
-            return x - mean
+            return (values - mean).masked_fill(~valid, 0.0)
 
         B, C, T = pred.shape
         if mask is None:
             valid = torch.ones_like(pred, dtype=torch.bool)
         else:
-            valid = mask.bool()
-            valid = valid.reshape(B, C, T)
+            valid = mask.bool().reshape(B, C, T)
         pred = pred.reshape(B, C, T)
         target = target.reshape(B, C, T)
-        if T < 2 or (mask is not None and valid.sum(dim=-1).min() < 2):
-            return torch.zeros(B, C, device=pred.device, dtype=pred.dtype)
-
+        # Remove invalid source values before masked arithmetic. A single
+        # degenerate channel must not poison valid channels in the batch.
+        valid = valid & torch.isfinite(pred) & torch.isfinite(target)
         pc = center(pred, valid)
         tc = center(target, valid)
         num = (pc * tc * valid).sum(dim=-1)
-        den = ((pc * pc * valid).sum(dim=-1)
-               * (tc * tc * valid).sum(dim=-1)).clamp_min(1e-6).sqrt()
+        pred_var = (pc * pc * valid).sum(dim=-1)
+        target_var = (tc * tc * valid).sum(dim=-1)
+        den = (pred_var * target_var).clamp_min(1e-6).sqrt()
         rho = num / den
-        # Guard against division artifacts when a channel is constant.
-        valid_var = valid.sum(dim=-1) >= 2
-        return torch.where(valid_var, rho, torch.zeros_like(rho))
+        valid_var = ((valid.sum(dim=-1) >= 2)
+                     & (pred_var > 0) & (target_var > 0))
+        return torch.where(torch.isfinite(rho) & valid_var, rho,
+                           torch.zeros_like(rho))
 
     def _correlation_loss(
         self,
@@ -750,11 +784,14 @@ class DissipationLoss(nn.Module):
         dS_dt = (grad_S * delta_z).sum(dim=-1)
         entropy_change_violation = F.relu(-dS_dt).mean()
 
-        # Scale-free coupling between the raw diagonal mobility and grad_E:
-        # 1.0 means M acts entirely along grad_E, 0.0 means M is orthogonal to
-        # it.  Reported only; see the class docstring for why it is not a loss.
-        coupling = (M_diag * grad_E).norm(dim=-1) / (
-            M_diag.norm(dim=-1) * grad_E.norm(dim=-1)).clamp_min(1e-12)
+        # A zero energy gradient is a valid degenerate point, not NaN data.
+        numerator = (M_diag * grad_E).norm(dim=-1)
+        denominator = M_diag.norm(dim=-1) * grad_E.norm(dim=-1)
+        coupling = torch.where(
+            denominator > 1e-12,
+            numerator / denominator.clamp_min(1e-12),
+            torch.zeros_like(numerator),
+        )
 
         metrics = {
             "entropy_change_violation": entropy_change_violation.item(),
@@ -1266,12 +1303,15 @@ class LossNormalizer:
         self.step_count: Dict[str, int] = {}
         self._frozen: Dict[str, bool] = {}
         self._frozen_scale: Dict[str, float] = {}
-
     def normalize(
         self, loss_name: str, loss_value: torch.Tensor, update: bool = True
     ) -> torch.Tensor:
         """Normalize by the EMA magnitude, optionally without mutating it."""
-        val = loss_value.detach().item()
+        value = loss_value.detach()
+        if value.numel() != 1 or not bool(torch.isfinite(value)):
+            raise FloatingPointError(
+                f"non-finite scalar loss term {loss_name!r} cannot be normalized")
+        val = float(value.item())
 
         if loss_name not in self.ema_abs:
             if not update:
@@ -1484,15 +1524,17 @@ class WeakSIGRegLoss(nn.Module):
             loss: scalar SIGReg loss
         """
         if z.dim() == 3:
-            # If z is (B, L, C), pool to (B, C) via mean
             z = z.mean(dim=1)
 
         N, C = z.shape
+        # Covariance regularization is not identifiable from one sample.
+        # Return a connected zero rather than dividing by N-1 and generating
+        # NaNs that can corrupt the optimizer state.
+        if N < 2:
+            return z.sum() * 0.0
         K = min(self.sketch_dim, C)
 
         if C > K:
-            # Deterministic cosine sketch. A random projection here would make
-            # validation metrics depend on the global RNG state.
             row = torch.arange(
                 1, K + 1, device=z.device, dtype=z.dtype).unsqueeze(1)
             col = torch.arange(
@@ -1500,9 +1542,8 @@ class WeakSIGRegLoss(nn.Module):
             S = torch.cos(torch.pi * row * col / C) * (2.0 / C) ** 0.5
             z = z @ S.T
         z = z - z.mean(dim=0, keepdim=True)
-        cov = (z.T @ z) / (N - 1 + 1e-6)  # (K, K)
+        cov = (z.T @ z) / (N - 1)
         target = torch.eye(K, device=z.device, dtype=z.dtype)
-
         return torch.norm(cov - target, p='fro')
 
 
@@ -1614,7 +1655,6 @@ class TotalLoss(nn.Module):
         cannot change training-time loss scales.
         """
         self._update_normalizer = bool(update_normalizer)
-
         def first_tensor(value):
             if isinstance(value, torch.Tensor):
                 return value
@@ -1663,9 +1703,15 @@ class TotalLoss(nn.Module):
                 mask = mask[:, -1]
             criteria = (getattr(self.loss_weights, "recon_loss_types", None)
                         or {}).get(modality)
-            recon_value = self.recon_loss(
-                predictions[pred_key], target_value,
-                loss_type=criteria, mask=mask)
+            mix = (getattr(self.loss_weights, "recon_loss_mix", None)
+                   or {}).get(modality)
+            if mix:
+                recon_value = self.recon_loss.mixed_loss(
+                    predictions[pred_key], target_value, mix, mask=mask)
+            else:
+                recon_value = self.recon_loss(
+                    predictions[pred_key], target_value,
+                    loss_type=criteria, mask=mask)
             total_loss = self._add_loss(
                 total_loss, recon_value, weight, f"recon_{modality}", metrics)
             metrics[f"recon_{modality}"] = recon_value.item()

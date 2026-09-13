@@ -117,3 +117,90 @@ def test_suite_with_states_and_dt():
 def test_short_input_raises():
     with pytest.raises(ValueError):
         frm.corr_matrix_mse(np.zeros((2, 4)), np.zeros((2, 4)))
+
+
+def test_tderica_biological_report_uses_neighbor_toolbox(tmp_path):
+    real = _ar1(80, 0.8, n_comp=3)
+    generated = real.copy()
+    report = frm.tderica_biological_report(
+        real, generated, dt_s=0.25,
+        tderica_path=str(ROOT.parent / "TDE-RICA"),
+        include_d3=False,
+    )
+    assert report["dt_s"] == pytest.approx(0.25)
+    assert report["native"]["corr_matrix_mse"] < 1e-10
+    assert report["tderica"] is not None
+    assert report["tderica"]["distribution"]["wasserstein_global"] < 1e-10
+
+def test_tderica_biological_report_handles_long_trajectory():
+    real = _ar1(1100, 0.8, n_comp=2)
+    report = frm.tderica_biological_report(
+        real, real.copy(), dt_s=0.25,
+        tderica_path=str(ROOT.parent / "TDE-RICA"),
+        include_d3=False,
+    )
+    assert report["tderica"]["time_alignment"]["frechet_distance"] < 1e-10
+
+
+def test_tderica_biological_report_requires_physical_clock():
+    real = _ar1(20, 0.8, n_comp=2)
+    with pytest.raises(ValueError, match="dt_s"):
+        frm.tderica_biological_report(real, real, dt_s=0.0)
+
+def test_pareto_front_and_threshold_status():
+    reports = [
+        {"metrics": {"w1": 0.2, "kl": 4.0, "corr": 0.2}},
+        {"metrics": {"w1": 0.1, "kl": 3.0, "corr": 0.2}},
+        {"metrics": {"w1": 0.3, "kl": 3.0, "corr": 0.3}},
+    ]
+    directions = {"w1": "min", "kl": "min", "corr": "max"}
+    assert frm.pareto_front(reports, directions) == [1, 2]
+    assert frm.pareto_dominates(
+        reports[1]["metrics"], reports[0]["metrics"], directions)
+    status = frm.threshold_status(
+        {"w1": 0.04, "kl": 4.9, "kernel": 0.8, "std": 0.95},
+        {"w1": {"max": 0.05}, "kl": {"max": 5.0},
+         "kernel": {"max": 1.0}, "std": {"min": 0.8, "max": 1.2}},
+    )
+    assert all(status.values())
+
+def test_free_run_metric_vector_uses_aggregate_and_nested_values():
+    report = {
+        "aggregate": {
+            "raw_std_ratio": {"mean": 0.94},
+            "native_corr_matrix_mse": {"mean": 0.04},
+        },
+        "tderica": {
+            "distribution": {"wasserstein_global": 0.029,
+                              "kl_divergence": [3.5]},
+            "dynamics": {"kernel_transition": 0.09},
+        },
+        "real_occurrence_lag1": 0.95,
+        "generated_occurrence_lag1": 0.90,
+    }
+    metrics = frm.free_run_metric_vector(report)
+    assert metrics["raw_std_error"] == pytest.approx(0.06)
+    assert metrics["w1"] == pytest.approx(0.029)
+    assert metrics["kl_mean"] == pytest.approx(3.5)
+    assert metrics["kernel_transition"] == pytest.approx(0.09)
+    assert metrics["occurrence_lag1_gap"] == pytest.approx(0.05)
+
+def test_pareto_selection_returns_non_dominated_compromise():
+    from tools.tderica_free_run import select_pareto_checkpoint
+    reports = [
+        {"checkpoint": "a", "metrics": {"raw_std_error": 0.1, "w1": 0.2,
+                                            "kl_mean": 2.0, "kernel_transition": 0.2,
+                                            "occurrence_lag1_gap": 0.1,
+                                            "native_corr_matrix_mse": 0.1}},
+        {"checkpoint": "b", "metrics": {"raw_std_error": 0.2, "w1": 0.1,
+                                            "kl_mean": 1.0, "kernel_transition": 0.3,
+                                            "occurrence_lag1_gap": 0.2,
+                                            "native_corr_matrix_mse": 0.2}},
+        {"checkpoint": "c", "metrics": {"raw_std_error": 0.3, "w1": 0.3,
+                                            "kl_mean": 3.0, "kernel_transition": 0.4,
+                                            "occurrence_lag1_gap": 0.3,
+                                            "native_corr_matrix_mse": 0.3}},
+    ]
+    selected = select_pareto_checkpoint(reports)
+    assert selected["pareto_checkpoints"] == ["a", "b"]
+    assert selected["compromise_checkpoint"] in {"a", "b"}

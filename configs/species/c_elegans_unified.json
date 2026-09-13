@@ -1,0 +1,57 @@
+{
+  "species": "c_elegans",
+  "latent_dim": 192,
+  "features": {
+    "eeg_backend": "v1",
+    "use_kda_decoder": false,
+    "use_active_inference": false,
+    "use_species_conditioning": true,
+    "use_generic_observation_adapter": true,
+    "use_mamba2": false,
+    "use_deep_experts": false,
+    "use_generic_moe": false,
+    "use_moe": false,
+    "poisson_rank": 32,
+    "use_stochastic_noise": false,
+    "use_meg": false,
+    "perturbation_dim": 282,
+    "use_sensor_emission": false,
+    "latent_velocity_scale": 0.02
+  },
+  "data": {
+    "modalities": [
+      "calcium",
+      "stimulus"
+    ],
+    "roles": {
+      "calcium": "signal",
+      "stimulus": "control"
+    },
+    "control_specs": {
+      "stimulus": {
+        "kind": "source_harmonized_exogenous",
+        "feature_width": 282,
+        "feature_0": "scalar drive: Toyoshima salt or Randi opto waveform",
+        "features_1_to_281": "Randi recording-local target-gated drive",
+        "missing_control": "absent row means no intervention",
+        "no_op_when_off": true
+      }
+    },
+    "sample_rate_hz": 4.0,
+    "sample_rate_hz_source": "manifest",
+    "time_unit": "seconds",
+    "sequence_seconds": 15.0,
+    "channel_count": 302,
+    "max_channels": 302,
+    "region_count": null,
+    "atlas": "source_local_neuron_ids",
+    "paired_next_step_targets": true
+  },
+  "training": {
+    "ladder_stage": "c_elegans",
+    "freeze_shared_dynamics": false,
+    "freeze_observation_adapters": false,
+    "leave_subject_out": true,
+    "batch_size": 1
+  }
+}

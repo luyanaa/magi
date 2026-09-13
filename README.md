@@ -335,14 +335,43 @@ The first intervention ladder uses processed traces and explicit event metadata 
 | Corpus | Current measured source size | Intervention scope | Status |
 |---|---:|---|---|
 | Local C. elegans salt pilot | 0.197 GiB | Salt stimulus; not optogenetic | Ingested and verified |
-| Randi C. elegans PumpProbe, [OSF e2syt](https://api.osf.io/v2/nodes/e2syt/files/osfstorage/) | 0.858 GiB extracted data, 678 files | Neuron-targeted optogenetic stimulation; target IDs and stimulus files are present | First acquisition target |
+| Randi C. elegans PumpProbe, [OSF e2syt](https://api.osf.io/v2/nodes/e2syt/files/osfstorage/) | 1.2 GiB local export, 113 recordings | Recording-local neuron-targeted optogenetic stimulation; source target IDs, labels, and event files are preserved | Canonical ladder ingested and model-smoke verified |
+| HuggingFace `celegans_neural_data` | 669.5 MB parquet; 919 emitted worms | Calcium-only activity; source has no unified intervention track | Downloaded and ingested into the canonical ladder |
+| Unified C. elegans manifest root | Small manifest; references the three canonical roots | One `stimulus` control contract, source-local calcium identities | 1,056 rows assembled; remote training pending |
 | [DANDI:001569](https://dandiarchive.org/dandiset/001569/draft) | 2.833 GiB, 13 NWB assets | Targeted two-photon photostimulation of rsChRmine-expressing neurons | Inspect one asset before full download |
 | [OpenNeuro ds001541](https://openneuro.org/datasets/ds001541/versions/1.1.3) | 6.947 GiB, 597 snapshot files | DRN population optogenetic fMRI | Use population/region scope, not neuron one-hot |
 | Velez-Angel et al. zebrafish lateral-line study | No public archive identified | Single-neuromast stimulation plus whole-brain calcium imaging | Contact-gated; not included in the storage budget |
 
+The checked-in Randi adapter consumes the local text export without a hidden
+download:
+
+```bash
+python -m brain_moe_pinn.data.ingest_randi \
+  --input ../exported_data \
+  --output ../data_ladder/c_elegans_randi
+```
+
+Use `configs/species/c_elegans_randi.json` with
+`configs/data/c_elegans_randi.json` for the 2 Hz, 15-second-window,
+recording-local target-position experiment. The adapter follows the supplied
+TSMixer-Ext pulse levels, uses the measured 0.5-second clock rather than the
+gist's 0.05-second plotting value, masks invalid fluorescence frames instead
+of deleting target channels, and preserves the original labels under
+`randi_labels/`. It does **not** import gKDR-GMM metadata; that metadata remains
+owned by the separate Toyoshima salt adapter.
+
+The unified C. elegans profile is
+`configs/species/c_elegans_unified.json` plus
+`configs/data/c_elegans_unified.json`. It keeps source-qualified subjects and
+recording-local channel ids, uses batch size 1 with 15-second physical windows,
+and presents `stimulus` at perturbation width 282: feature 0 is the salt or
+opto drive, features 1–281 are Randi recording-local target gates, and
+HuggingFace rows omit control. The manifest-federated root avoids another
+multi-hundred-MB copy; package the three source roots together or run the
+merge command with `--materialize` for a self-contained remote bundle.
+
 The four locally measurable sources above total approximately **10.835 GiB raw**. A conservative `raw + conversion + canonical cache` factor of 3 gives approximately **32.5 GiB** for a sequential working set; use **at least 100 GiB of cluster scratch** for the three-species pilot, including logs and checkpoints. A 25 GiB local volume is not sufficient to stage all sources safely. Collections above 100 GiB should be streamed or staged on **at least 500 GiB** of scratch/object storage.
 
-Optogenetic records must register a fixed target vocabulary and target scope before training. Sparse pulses use `control_reduction="peak"` or an equivalent pulse-preserving reduction; population fMRI controls must not be encoded as single-neuron identities. Human-scale training remains blocked until the intervention data contract, window lengths, and cluster calibration are all measured.
 
 ### 4.6 VRAM feasibility and execution gates
 
@@ -363,6 +392,58 @@ $$
 $$
 
 No VRAM tier currently carries an unconditional 65,536-context guarantee.
+
+### 4.6.1 Unified C. elegans capacity checkpoint
+
+The unified profile was measured with
+`configs/species/c_elegans_unified.json` (latent dimension 192,
+perturbation width 282, generic observation adapter, no MoE):
+
+| Measurement | Result |
+|---|---:|
+| Total model parameters | 2,860,753 |
+| Dynamics parameters | 1,661,258 |
+| FP32 parameter storage | 10.913 MiB |
+| Largest tested calcium window | 281 channels × 30 frames (Randi, 15 s) |
+| Peak incremental CPU RSS after model construction | 39.469 MiB |
+
+The CPU benchmark completed finite forward/backward passes for the largest
+Toyoshima, Randi, and HuggingFace channel-count rows. The current host
+inventory reports an 8 GiB unified CPU/GPU memory limit and one Apple A18 Pro
+integrated Metal candidate; PyTorch reports MPS available, but no dedicated
+VRAM amount exists and the full benchmark below was run on CPU. The
+parameter/activation measurement supports a **4 GiB dedicated-GPU planning
+floor** for this exact batch-1 profile, with **8 GiB recommended** for
+allocator, checkpoint, and runtime headroom; 12–16 GiB is the comfortable tier
+if windows, workers, or future model features grow. These are planning tiers,
+not a claim about a remote provider's SKU. A remote run still needs a short
+calibration for peak allocated/reserved VRAM and throughput before scaling.
+
+Remote training is **pending and intentionally not launched**. The current
+For biological free-run evaluation, use the neighboring `../TDE-RICA` toolbox
+as an independent reference rather than treating reconstruction loss as a
+generator score. The local adapter is `tools/tderica_free_run.py`; it reports
+the native correlation/variance/autocorrelation suite plus TDE-RICA time
+alignment, distribution, and optional D3 continuous-dynamics metrics. The
+physical clock is mandatory:
+
+```bash
+python tools/tderica_free_run.py \
+  --real real_window.npy \
+  --generated generated_window.npy \
+  --dt-s 0.333 \
+  --tderica ../TDE-RICA \
+  --no-d3 \
+  --output tderica_report.json
+```
+
+For the remote GPU run, first generate deterministic, unforced model output
+from the best checkpoint, save `(T,N)` real/generated windows, and run the
+same evaluator in a clean process. Use `--full-d3` only after the fast report
+is finite; TDE-RICA's transfer-entropy and local-Jacobian estimators are
+high-dimensional diagnostics, not training objectives.
+manifest-federated root must be transferred with all three canonical source
+roots, or materialized with `data/merge_c_elegans.py --materialize`.
 
 The cross-modal inventory is organized around:
 
@@ -1134,14 +1215,154 @@ removed design documents live in git history.*
 |---|---|---|
 | HIGH | Pretrained checkpoints | Download NeuroSTORM/BrainLM/Magi weights; CLI and loaders are ready |
 | HIGH | Dynamics -> fMRI (BOLD) | Implemented as a learnable emission (`core/hrf.py`): Friston 2003 Balloon-Windkessel response as the initialisation, zero-init smooth correction + learnable vasodilatory lag, gains and compressive output; causal, TR-aware, and reporting the measured effective-HRF peak/FWHM/undershoot plus the deviation from the reference. Wired for `human`/`mouse` (`data.sensors.fmri`). Next: fit it on a real BOLD corpus (Kondo mouse widefield fMRI / HCP-style human runs) and compare the fitted peak latency against the measured HRF |
-| HIGH | Targeted intervention corpora | Randi C. elegans PumpProbe, DANDI:001569, and OpenNeuro ds001541 are the first controlled-stimulation sources; download/inspect event timing and target scope, register fixed vocabularies, and run pulse-preserving and held-out-target validation |
+| HIGH | Targeted intervention corpora | Randi PumpProbe text adapter is implemented and verified on 113 local recordings with 2 Hz timing, target-gated controls, and pulse-preserving reduction; targets remain recording-local positions because source labels are incomplete/duplicated. DANDI:001569 and OpenNeuro ds001541 still need scope-specific adapters and held-out-target validation |
 | HIGH | Zebrafish (ZAPBench) | Adapter implemented and verified offline against the release constants (`data/zapbench.py`: condition sessions, 26-d stimulus control, region/cell reduction, mandatory `--rate-hz`, provenance columns; `configs/species/zebrafish.json` + `configs/data/zebrafish_zapbench.json`). Next: point `--source` at `gs://zapbench-release/volumes/20240930/traces` (zarr + gcsfs) and ingest a region-reduced subset |
-| HIGH | Real corpora ingestion | **Salt pilot ingested and verified** (2026-09): per-sample frame rates + salt-stimulus timing from `stimulation_timing.xlsx`, reference `autocorr(lag=20) > 0.3` channel QC, animal/anaesthesia provenance, control-role `stimulus` track; 1,625 canonical channels, 24 samples / 21 animals. `data/hf_celegans.py` verified live against the remote parquet (42,798 rows; unlabeled-slot rows now dropped by default). Next: run `hf_celegans download/ingest`, then multi-worm union-aligned batches (the shipped `configs/data/c_elegans_salt.json` already sets `align_channels`); ZAPBench/Allen adapters stay on `data/readers.py` |
+| HIGH | Real corpora ingestion | **Salt pilot, Randi PumpProbe, and HuggingFace C. elegans ladders are ingested and verified**: salt uses per-sample timing and animal provenance; Randi uses 113 recordings, measured 0.5 s timing, masked fluorescence QC, preserved source labels/events, and recording-local optogenetic controls; HF emits 919 worms from 42,798 rows with unlabeled slots dropped. The unified manifest root and profiles are staged; its control path pads source-width controls to 282. Next: remote calibration/training, then ZAPBench/Allen adapters |
 | HIGH | Cluster bring-up | Multi-node smoke (`torchrun --nnodes=2 --nproc_per_node=4`, DeepSpeed ZeRO-2/3): forward/backward, checkpoint save/load, elastic resume; profile 16/24/32/48–80 GiB tiers and re-measure target-topology VRAM and throughput before any full-scale run |
 | MED | Phase -1 Magi v2 pretraining | `configs/data/eegdenoisenet.json` now provides an EEG-only clean/artifact loader; materialize the public arrays, then run topology-specific checkpoint/resume, masked-leakage, causal-NTP, and EMA validation |
 | MED | Time constants | `latent_dt` single-source done (species sample rate → model; OU integrator synced, default-preserving). Remaining: wire-or-drop `SlowGateTransition` (zero callers today); document seconds conventions for monitors/free-run cadence |
 | MED | Marginal recalibration | Recalibrate OU projection and per-component gains on held-out rollouts before claiming output-marginal preservation |
 | MED | Subject adaptation | Re-review the low-rank test-time adaptation design and wire into Stage 3 |
+
+### C. elegans optimization checkpoint (2026-09)
+
+The first balanced remote optimization run used the unified C. elegans
+profile with `latent_velocity_scale=0.02` and a normalized calcium
+reconstruction mixture:
+
+```json
+{"correlation": 0.55, "corr_diff": 0.20, "wasserstein1": 0.25}
+```
+
+This follows the gKDR-GMM reference priorities: preserve variance/marginal
+scale, retain temporal transitions, and reduce distributional discrepancy
+without discarding correlation structure. The evaluated checkpoint was:
+
+```text
+Stage 1 P1, step 5000
+```
+
+Remote validation used eight subject-held-out samples, three autonomous rollout
+windows, and the neighboring `../TDE-RICA` implementation. Results:
+
+| Metric | Mean |
+|---|---:|
+| Native correlation-matrix MSE | 0.3423 |
+| Native autocorrelation MSE | 0.2629 |
+| Native variance log-RMSE | 1.6432 |
+| TDE-RICA W1 | 0.7366 |
+| TDE-RICA KL mean | 13.3837 |
+| TDE-RICA kernel transition distance | 2.4715 |
+| Real occurrence lag-1 | 0.9853 |
+| Generated occurrence lag-1 | 0.9048 |
+
+The checkpoint improves dramatically over the prior step-5000 artifact, whose
+variance log-RMSE was 12.5475 and TDE-RICA W1 was 49.2513. The user-specified
+reference gates are W1 <= 0.05, mean KL < 5, kernel-transition distance < 1,
+and raw standard-deviation maintenance near 1. The optimized checkpoint's
+measured values are:
+
+| Gate | Target | Optimized mean | Status |
+|---|---:|---:|---|
+| Raw std ratio | near 1 | 0.8231 | improved, not near enough |
+| Native variance log-RMSE | lower | 1.6855 | improved, still high |
+| TDE-RICA W1 | <= 0.05 | 0.7366 | fail |
+| TDE-RICA KL mean | < 5 | 13.3837 | fail |
+| Kernel transition distance | < 1 | 2.4715 | fail |
+| Generated occurrence lag-1 | near real 0.9853 | 0.9074 | fail |
+
+The W1-heavy interrupted experiment at step 3323 improved statistical
+correlation (`0.2039`) and tail-variance stationarity (`0.9808`) but worsened
+mean raw standard-deviation maintenance (`0.6251`), W1 (`0.8398`), KL
+(`17.6089`), and occurrence (`0.8214`). It was not selected.
+
+The current artifact is therefore a valid optimization checkpoint and a
+material improvement, but it does **not** meet the requested gKDR-GMM-like
+thresholds. More training with the present objective should not be claimed to
+solve the gap; the next needed experiment is a calibrated distributional
+objective in the same TDE-RICA component space, with a fixed reference basis
+and scale calibration rather than raw calcium reconstruction alone.
+
+Post-training verification passed in the remote environment: the checkpoint
+loaded with no missing or unexpected keys, `forward_modalities()` emitted
+finite `(B,3,C,T)` reconstructions and `(B,3,192)` latent rollouts, the mixed
+loss returned a finite scalar, the threshold-aware evaluator ran successfully,
+and `tools/real_data_sanity.py` compiled/imported. The local workstation
+environment does not provide NumPy, so numerical tests were run remotely.
+
+### Toyoshima fixed-basis evaluation
+
+The gKDR-GMM comparison must use the Toyoshima cohort and its fixed basis,
+not the unified HF-first federated validation path. Octave inventory of
+`test20220308_tderica_expansion_visualize_results_2_captured_comp_and_coeff.mat`
+confirmed:
+
+```text
+coeffEmbed2       14 × 300 × 177
+compEmbed2      5701 × 24 × 14
+tcrsN3          6000 × 177 × 24
+strNamesOrdered  177 × 1
+```
+
+Export or pass this MAT file to `tools/tderica_free_run.py` with
+`--basis`. The tool projects both signals through the same `coeffEmbed2`
+basis and records `fit_on_evaluation_window=false`. This matches the
+Toyoshima/gKDR settings: 24 samples, 177 ordered neurons, 300-frame delay
+embedding, `time_step=5`, `embed_step=10`, and the canonical-name plus
+lag-20 autocorrelation QC.
+
+```bash
+python tools/tderica_free_run.py \
+  --real toyoshima_real.npy \
+  --generated toyoshima_generated.npy \
+  --basis test20220308_tderica_expansion_visualize_results_2_captured_comp_and_coeff.mat \
+  --dt-s 0.2426317083 \
+  --tderica ../TDE-RICA \
+  --output toyoshima_fixed_basis_report.json
+```
+
+The Pareto utilities in `diagnostics/free_run_metrics.py` treat raw standard
+deviation error, W1, KL, kernel-transition distance, occurrence gap, and native
+correlation error as separate minimization axes. They must not be collapsed
+into a biologically interpretable scalar without a declared normalization.
+
+### Toyoshima fixed-basis versus unified evaluation
+
+The unified C. elegans root is a federated training corpus. It is useful for
+training but is **not** the reference space for the published gKDR-GMM
+numbers. TDE-RICA/gKDR components are defined by the Toyoshima cohort and its
+177-neuron ordering. Use the fixed-basis tool against Toyoshima signals when
+comparing W1, KL, kernel transition, or occurrence values to that reference.
+Do not fit a basis on the evaluation window.
+
+The captured reference MAT file was inventoried with Octave and contains
+`coeffEmbed2 (14,300,177)`, `compEmbed2 (5701,24,14)`, `tcrsN3
+(6000,177,24)`, and `strNamesOrdered (177,1)`. The reviewed manifest is
+`configs/data/c_elegans_toyoshima_fixed_basis.json`.
+
+`diagnostics.free_run_metrics.pareto_front()` and
+`tools.tderica_free_run.select_pareto_checkpoint()` keep variance, W1, KL,
+kernel transition, occurrence, and native statistical errors as separate
+axes. A checkpoint is a candidate only when its report was produced in the
+same fixed basis and all required metrics are finite. The compromise selector
+is a convenience for an explicit archive, not a substitute for declaring
+metric normalization and biological acceptance gates.
+
+Reproducibility command (remote paths must be adapted). The full 6000-frame
+Toyoshima Fréchet calculation is computationally expensive; use a bounded
+evaluation window for routine smoke tests, and reserve the full trace for
+the final evidence run:
+
+```bash
+PYTHONPATH=/path/to/repo:/path/to/TDE-RICA/TDE-RICA \
+python tools/remote_free_run_eval.py \
+  --config configs/species/c_elegans_unified.json \
+  --data /path/to/c_elegans_opt_profile.json \
+  --checkpoint "/path/to/checkpoint_Stage 1 P1_step5000.pt" \
+  --output /path/to/eval/full_5000.json \
+  --split val --max-samples 8 --rollout 3 --device cuda \
+  --tderica /path/to/TDE-RICA/TDE-RICA
+```
 | LOW | Housekeeping | Move `__main__` demos to `examples/` (`tests/conftest.py` already bootstraps imports for pytest) |
 | MED | Unwired config keys | `replay_species` and the implicit cross-species mixing contract were removed (2026-09): each ladder stage trains its own model against its own ladder, so the flag had no consumer. Remaining inert key: `human.json` lists `behavior` with no declared role |
 | MED | MoE structure scope | With `use_generic_moe=False` (default) experts add an unconstrained velocity, so the *composite* field is not GENERIC (measured: `moe_velocity_share` ≈ 0.76, `moe_energy_alignment` ≈ 0.16 at init). Ablations in §6 therefore test the backbone. Structured mode is affordable now (96M vs 26M, was 379M) but needs a training comparison before becoming the default |

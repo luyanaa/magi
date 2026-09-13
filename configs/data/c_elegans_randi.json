@@ -1,0 +1,30 @@
+{
+  "kind": "species",
+  "root": "../../data_ladder/c_elegans_randi",
+  "modalities": [
+    "calcium",
+    "opto"
+  ],
+  "roles": {
+    "calcium": "signal",
+    "opto": "control"
+  },
+  "control_modalities": [
+    "opto"
+  ],
+  "batch_size": 1,
+  "seq_seconds": 15.0,
+  "num_workers": 0,
+  "split_by": "subject",
+  "val_frac": 0.1,
+  "align_channels": false,
+  "max_union_channels": 281,
+  "return_masks": true,
+  "return_next_step_targets": true,
+  "future_steps": 3,
+  "seed": 0,
+  "control_reduction": "peak",
+  "rollout_steps": 3,
+  "normalization": "none",
+  "control_note": "Randi pulses are three 5-second levels at 2 Hz; peak reduction preserves sparse target-gated drive across three 5-second latent segments. Calcium channel IDs and opto targets are recording-local positions, not cross-recording neuron identities."
+}

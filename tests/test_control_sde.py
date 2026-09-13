@@ -205,7 +205,17 @@ def test_reduce_control_and_partition():
     assert event_perturbation.shape == (1, 2, 3)
     assert torch.all(event_perturbation[0, 0] == 1)
     assert torch.all(event_perturbation[0, 1] == 0)
-
+    narrow_batch = {
+        "calcium": torch.randn(1, 2, 8),
+        "stimulus": torch.arange(8, dtype=torch.float32).reshape(1, 1, 8),
+    }
+    _, _, padded = partition_generic_batch(
+        narrow_batch, ("calcium", "stimulus"), ("calcium",), None,
+        control_modalities=("stimulus",), control_reduction="resample",
+        rollout_steps=2, control_dim=4)
+    assert padded.shape == (1, 2, 4)
+    assert torch.equal(padded[0, :, 0], torch.tensor([1.5, 5.5]))
+    assert torch.count_nonzero(padded[..., 1:]) == 0
 
 def test_roles_declaration_and_loader():
     import tempfile
@@ -225,7 +235,9 @@ def test_roles_declaration_and_loader():
         tensor_batch, _ = build_species_dataloaders(
             root, ["calcium", "stimulus"], batch_size=1, seq_len=16,
             split_by="none", val_frac=0.0, shuffle=False,
-            roles={"calcium": "signal", "stimulus": "control"})
+            roles={"calcium": "signal", "stimulus": "control"},
+            pin_memory=True, persistent_workers=True, prefetch_factor=3,
+            num_workers=1)
         batch = next(iter(tensor_batch))
         _, _, perturbation = partition_generic_batch(
             batch, ("calcium", "stimulus"), ("calcium",), None,

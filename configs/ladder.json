@@ -9,7 +9,8 @@
   "stages": [
     {
       "species": "c_elegans",
-      "profile": "configs/species/c_elegans.json"
+      "profile": "configs/species/c_elegans_unified.json",
+      "data": "configs/data/c_elegans_unified.json"
     },
     {
       "species": "zebrafish",

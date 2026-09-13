@@ -283,6 +283,14 @@ class SpeciesSignalDataset(Dataset):
                 raise ValueError(
                     f"unknown companion directory {suffix_dir!r}; expected one "
                     f"of {sorted(_COMPANION_DIRS)}")
+            companion_keys = [f"{modality}_{suffix_dir}_file"]
+            if suffix_dir == "graphs":
+                companion_keys.append("graphs_file")
+            for companion_key in companion_keys:
+                override = row.get(companion_key)
+                if override:
+                    p = Path(override)
+                    return p if p.is_absolute() else (self.root / p)
             base = self.root / _COMPANION_DIRS[suffix_dir].format(
                 modality=modality)
             candidate = base / f"{row.get('sample_id', '')}{ext}"
@@ -884,6 +892,9 @@ def build_species_dataloaders(
     strict_rate: bool = True,
     expected_rate_hz: Optional[float] = None,
     normalization: Optional[str] = None,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
+    prefetch_factor: int = 2,
 ) -> Union[Tuple[DataLoader, DataLoader],
            Tuple[DataLoader, DataLoader, DataLoader]]:
     """Train/val(/test) loaders with group-preserving splits.
@@ -947,10 +958,14 @@ def build_species_dataloaders(
             **{**base, "rows": rowset, "rng_seed": seed,
                "random_windows": bool(do_shuffle)})
         drop = do_shuffle and len(rowset) >= batch_size
-        return DataLoader(
-            ds, batch_size=batch_size, shuffle=do_shuffle,
+        loader_kwargs = dict(
+            batch_size=batch_size, shuffle=do_shuffle,
             num_workers=num_workers, drop_last=drop,
-            collate_fn=species_collate)
+            collate_fn=species_collate, pin_memory=pin_memory)
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
+            loader_kwargs["persistent_workers"] = bool(persistent_workers)
+        return DataLoader(ds, **loader_kwargs)
 
     train_loader = loader(train_rows, shuffle)
     val_loader = loader(val_rows, False)

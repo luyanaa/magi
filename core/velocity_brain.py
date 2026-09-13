@@ -528,12 +528,16 @@ class VelocityBrain(nn.Module):
         perturbation_dim: Optional[int] = None,
         control_gating: bool = True,
         latent_dt: Optional[float] = None,
+        velocity_scale: float = 0.1,
     ):
         super().__init__()
+        if velocity_scale <= 0:
+            raise ValueError("velocity_scale must be positive")
         if latent_dt is not None and latent_dt <= 0:
             raise ValueError("latent_dt must be positive")
         self.hidden_dim = hidden_dim
         self.integration_dt = float(latent_dt) if latent_dt is not None else 1.0
+        self.velocity_scale = float(velocity_scale)
         self.apply_degeneracy_projection = apply_degeneracy_projection
         self.degeneracy_check_interval = degeneracy_check_interval
         # The Poisson operator is applied implicitly (action on a vector) by
@@ -701,6 +705,10 @@ class VelocityBrain(nn.Module):
             arousal_term = arousal_term * gates[:, 1:2]
 
         delta_z = poisson_term + mobility_term + arousal_term + control_term
+        # Keep the learned velocity in a controllable latent scale. The
+        # physical integration duration is applied by the caller; this factor
+        # only bounds the field amplitude and preserves direction.
+        delta_z = self.velocity_scale * delta_z
 
         # Apply multi-time-scale KDA decay
         delta_z = self.mt_kda(delta_z, dt=self.integration_dt if dt is None else dt)

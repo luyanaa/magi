@@ -230,9 +230,9 @@ def test_validation_runs_physics_autograd_and_diagnostics():
     trainer = object.__new__(BrainMoETrainer)
     trainer.val_dataloader = [{
         "calcium": torch.randn(1, 4, 16),
-        "calcium_next": torch.randn(1, 4, 16),
+        "calcium_future": torch.randn(1, 3, 4, 16),
         "calcium_mask": torch.ones(1, 4, 16, dtype=torch.bool),
-        "calcium_next_mask": torch.ones(1, 4, 16, dtype=torch.bool),
+        "calcium_future_mask": torch.ones(1, 3, 4, 16, dtype=torch.bool),
     }]
     trainer.generic_model = True
     trainer.device = torch.device("cpu")
@@ -256,8 +256,9 @@ def test_validation_runs_physics_autograd_and_diagnostics():
         grassmannian_reg=0.0,
     ))
     trainer.logger = None
-    first = trainer.validate(model, {"rollout_steps": 2}, 0, 2)
-    second = trainer.validate(model, {"rollout_steps": 2}, 0, 2)
+    trainer._rollout_steps_override = 3
+    first = trainer.validate(model, {"rollout_steps": 1}, 0, 2)
+    second = trainer.validate(model, {"rollout_steps": 1}, 0, 2)
     assert {
         "val_loss",
         "val_causal_forward_reverse_gap",
@@ -392,6 +393,81 @@ def test_trainer_accepts_non_neural_control_role(tmp_path):
     )
     assert trainer.signal_modalities == ("calcium",)
     assert trainer.control_modalities == ("stimulus",)
+
+def test_sigreg_is_finite_for_batch_one():
+    """Covariance regularization must be a connected zero for one sample."""
+    from brain_moe_pinn.training.losses import WeakSIGRegLoss
+    embedding = torch.randn(1, 8, requires_grad=True)
+    loss = WeakSIGRegLoss()(embedding)
+    loss.backward()
+    assert float(loss.detach()) == 0.0
+    assert torch.isfinite(embedding.grad).all()
+
+
+def test_correlation_loss_ignores_one_degenerate_channel_without_batch_poisoning():
+    from brain_moe_pinn.training.losses import ReconstructionLoss
+    pred = torch.tensor([[[1., 2., 3., 4.], [0., 0., 0., 0.]],
+                         [[1., 2., 3., 4.], [1., 2., 3., 4.]]])
+    target = pred.clone()
+    mask = torch.ones_like(pred, dtype=torch.bool)
+    rho = ReconstructionLoss._pearson_per_channel(pred, target, mask)
+    assert rho[0, 0].item() == pytest.approx(1.0)
+    assert rho[1, 0].item() == pytest.approx(1.0)
+    assert rho[0, 1].item() == pytest.approx(0.0)
+
+
+def test_loss_normalizer_rejects_nonfinite_terms():
+    from brain_moe_pinn.training.losses import LossNormalizer
+    normalizer = LossNormalizer()
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        normalizer.normalize("probe", torch.tensor(float("nan")))
+
+
+def test_dissipation_coupling_is_finite_at_zero_energy_gradient():
+    from brain_moe_pinn.training.losses import DissipationLoss
+    value, metrics = DissipationLoss()(torch.ones(2, 4), torch.ones(2, 4),
+                                       torch.ones(2, 4), torch.zeros(2, 4))
+    assert torch.isfinite(value)
+    assert metrics["mobility_energy_coupling"] == 0.0
+
+
+def test_generic_trainer_fetches_real_loader_batch(tmp_path):
+    """A generic trainer step must consume loader signals, not dummy inputs."""
+    root = tmp_path / "species"
+    _write_array(root, "calcium", "sample", np.arange(32, dtype=np.float32).reshape(2, 16))
+    model = BrainMoEPINN(
+        latent_dim=8,
+        use_neurostorm=False,
+        use_kda_decoder=False,
+        use_active_inference=False,
+        species="c_elegans",
+        species_vocab=["c_elegans"],
+        moe_num_shared=1,
+        moe_num_routed=1,
+        moe_top_k=1,
+        generic_observation_only=True,
+    )
+    loader = torch.utils.data.DataLoader(
+        SpeciesSignalDataset(root, ["calcium"], seq_len=8,
+                             random_windows=False), batch_size=1,
+        collate_fn=lambda batch: {
+            key: torch.stack([item[key] for item in batch])
+            for key in batch[0] if isinstance(batch[0][key], torch.Tensor)
+        })
+    trainer = BrainMoETrainer(
+        model=model,
+        config={"model_config": {"species": "c_elegans"},
+                "experiment_data": {"modalities": ["calcium"]},
+                "use_mixer": False},
+        log_dir=tmp_path / "logs", checkpoint_dir=tmp_path / "checkpoints",
+        train_dataloader=loader)
+    trainer._dataloader_iter = iter(loader)
+    signals = trainer._next_generic_signals(1)
+    assert set(signals) == {"calcium"}
+    expected = torch.tensor(
+        [[[0., 1., 2., 3., 4., 5., 6., 7.],
+          [16., 17., 18., 19., 20., 21., 22., 23.]]])
+    assert torch.equal(signals["calcium"].cpu(), expected)
 
 
 def test_active_inference_controller_exposes_value_function():

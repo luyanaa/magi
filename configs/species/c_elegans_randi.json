@@ -1,0 +1,56 @@
+{
+  "species": "c_elegans",
+  "latent_dim": 192,
+  "features": {
+    "eeg_backend": "v1",
+    "use_kda_decoder": false,
+    "use_active_inference": false,
+    "use_species_conditioning": true,
+    "use_generic_observation_adapter": true,
+    "use_mamba2": false,
+    "use_deep_experts": false,
+    "use_generic_moe": false,
+    "use_moe": false,
+    "poisson_rank": 32,
+    "use_stochastic_noise": false,
+    "use_meg": false,
+    "perturbation_dim": 282,
+    "use_sensor_emission": false
+  },
+  "data": {
+    "modalities": [
+      "calcium",
+      "opto"
+    ],
+    "roles": {
+      "calcium": "signal",
+      "opto": "control"
+    },
+    "control_specs": {
+      "opto": {
+        "kind": "optogenetic",
+        "target_scope": "recording_local_cell",
+        "target_encoding": "gated_one_hot",
+        "target_index_base": 0,
+        "target_vocab_size": 281,
+        "no_op_when_off": true
+      }
+    },
+    "sample_rate_hz": 2.0,
+    "sample_rate_hz_source": "profile",
+    "time_unit": "seconds",
+    "sequence_seconds": 15.0,
+    "channel_count": 281,
+    "max_channels": 281,
+    "region_count": null,
+    "atlas": "recording_local_cell_index",
+    "paired_next_step_targets": true
+  },
+  "training": {
+    "ladder_stage": "c_elegans",
+    "freeze_shared_dynamics": false,
+    "freeze_observation_adapters": false,
+    "leave_subject_out": true,
+    "batch_size": 1
+  }
+}

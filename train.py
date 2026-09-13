@@ -278,6 +278,9 @@ def build_data_loaders(profile_path: Path, leave_subject_out=None, *,
         future_steps=max(1, int(profile.get("future_steps", 1))),
         roles=profile.get("roles"),
         normalization=profile.get("normalization"),
+        pin_memory=bool(profile.get("pin_memory", False)),
+        persistent_workers=bool(profile.get("persistent_workers", False)),
+        prefetch_factor=max(1, int(profile.get("prefetch_factor", 2))),
     )
     if loader_kwargs["future_steps"] > 1 and not loader_kwargs[
             "return_next_step_targets"]:
@@ -534,6 +537,16 @@ def main():
                 data_profile["control_reduction"])
         if data_profile.get("rollout_steps"):
             trainer_config["rollout_steps"] = int(data_profile["rollout_steps"])
+        if data_profile.get("recon_loss_mix"):
+            trainer_config["recon_loss_mix"] = dict(
+                data_profile["recon_loss_mix"])
+            trainer_config.setdefault("experiment_data", {})[
+                "recon_loss_mix"] = dict(data_profile["recon_loss_mix"])
+        if data_profile.get("recon_loss_types"):
+            trainer_config["recon_loss_types"] = dict(
+                data_profile["recon_loss_types"])
+            trainer_config.setdefault("experiment_data", {})[
+                "recon_loss_types"] = dict(data_profile["recon_loss_types"])
         summary = (f"{len(train_loader.dataset)} train / "
                    f"{len(val_loader.dataset)} val")
         if test_loader is not None:

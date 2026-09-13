@@ -52,15 +52,16 @@ def compute_trajectory_diagnostics(
 
     def _red(x):
         x = x.detach().float().cpu()
-        return float(x.mean()), float(x.std())
+        return float(x.mean()), float(x.std(unbiased=False))
 
     velocity_mean, velocity_std = _red(velocity_proxy)
     work_mean, work_std = _red(signed_work_proxy)
     corr = 1.0
     if velocity_std > 1e-6 and work_std > 1e-6:
-        vp = velocity_proxy.detach().float().cpu().numpy()
-        wp = signed_work_proxy.detach().float().cpu().numpy()
-        corr = float(np.corrcoef(vp, wp)[0, 1])
+        vp = velocity_proxy.detach().float().cpu().numpy().reshape(-1)
+        wp = signed_work_proxy.detach().float().cpu().numpy().reshape(-1)
+        if vp.size >= 2 and wp.size >= 2:
+            corr = float(np.corrcoef(vp, wp)[0, 1])
 
     out = {
         "velocity_proxy_mean": velocity_mean,

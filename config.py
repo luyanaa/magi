@@ -62,15 +62,13 @@ class SpeciesProfile:
     sensors: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     """Default observation channel per modality (see ``core/sensors.py``)."""
     recon_loss_types: Dict[str, str] = field(default_factory=dict)
-    """Default ReconstructionLoss criterion per modality.
+    """Default reconstruction criterion per modality."""
+    recon_loss_mix: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    """Optional normalized mixture of reconstruction criteria per modality.
 
-    Evidence-based defaults (TDE-RICA / C. elegans validation practice):
-    MSE is dominated by per-channel gain and the strongly autocorrelated
-    slow baseline of calcium fluorescence, so whole-brain calcium is compared
-    with correlation-style similarity and per-component marginal/gain
-    diagnostics. ``correlation`` is scale/shift invariant per channel;
-    ``huber`` tolerates spike outliers in voltage recordings. Any modality
-    without an entry keeps the generic MSE default.
+    A calcium mixture can retain correlation structure while adding direct
+    marginal-scale/distribution pressure; each phase still controls its total
+    reconstruction weight.
     """
     latent_dim: int = 1024
     """Species-specific latent dynamics width."""
@@ -95,6 +93,9 @@ SPECIES_PROFILES = {
         region_count=302,
         channel_count=302,
         recon_loss_types={"calcium": "correlation", "voltage": "huber"},
+        recon_loss_mix={
+            "calcium": {"correlation": 0.55, "corr_diff": 0.20,
+                        "wasserstein1": 0.25}},
         latent_dim=192,
         use_moe=False,
         poisson_rank=32,
@@ -218,6 +219,8 @@ class FeatureConfig:
     moe_num_routed: int = 6
     moe_top_k: int = 3
     perturbation_dim: Optional[int] = None
+    latent_velocity_scale: float = 0.1
+    """Initial scale for latent velocity terms in generic dynamics."""
 
 @dataclass
 class DataConfig:
@@ -496,6 +499,7 @@ class ExperimentConfig:
             "moe_num_routed": self.features.moe_num_routed,
             "moe_top_k": self.features.moe_top_k,
             "species": self.species,
+            "latent_velocity_scale": self.features.latent_velocity_scale,
             "species_vocab": self.species_vocab,
             "perturbation_dim": self.features.perturbation_dim,
             "initial_context_length": self.training.initial_context_length,

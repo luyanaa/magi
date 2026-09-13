@@ -27,3 +27,6 @@ env/
 .idea/
 .vscode/
 *.swp
+
+# Deepwork session state
+.slim/deepwork/

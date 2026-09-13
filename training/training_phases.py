@@ -77,10 +77,15 @@ class LossWeights:
                                     # predictions["<modality>_recon"] vs
                                     # targets["<modality>"] (TotalLoss registry)
     recon_loss_types: Dict[str, str] = field(default_factory=dict)
-                                    # modality -> ReconstructionLoss criterion
-                                    # ("mse" default; "correlation" /
+                                    # modality -> single ReconstructionLoss
+                                    # criterion ("mse" default; "correlation" /
                                     # "corr_diff" / "huber" / "poisson" /
-                                    # "wasserstein1" for non-Gaussian signals)
+                                    # "wasserstein1")
+    recon_loss_mix: Dict[str, Dict[str, float]] = field(default_factory=dict)
+                                    # modality -> criterion -> non-negative
+                                    # mixture weight. The normalized mixture
+                                    # can preserve temporal correlation while
+                                    # directly constraining marginal scale.
     forecast: float = 0.0              # multi-horizon signal forecast
     forecast_huber: float = 1.0
     forecast_corr_diff: float = 1.0
@@ -374,6 +379,7 @@ def get_stage_1_p3() -> TrainingPhase:
         min_lr=1e-4,
         warmup_steps=500,
         batch_size=16,
+        gradient_accumulation=1,
         lr_schedule="flat",
         optimizer="adamw",
         loss_weights=LossWeights(
@@ -384,7 +390,7 @@ def get_stage_1_p3() -> TrainingPhase:
             forecast_corr_diff=1.0,
             forecast_horizon_weights=(1.0, 0.5),
             cross_modal=0.0,
-            velocity_smooth=0.0,
+            velocity_smooth=0.02,
             generic_constraint=0.0,
             moe_load_balance=0.02,
             hebbian_reg=0.0,
@@ -396,6 +402,8 @@ def get_stage_1_p3() -> TrainingPhase:
             tsallis=0.0,
             action=0.0,
             replay=0.0,
+            cross=0.0,
+            cross_soft=0.0,
             bandpower=0.01,
             sigreg=0.05,
         ),

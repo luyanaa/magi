@@ -33,11 +33,14 @@ sys.path.insert(0, str(ROOT.parent))
 from brain_moe_pinn import BrainMoEPINNConfig
 from brain_moe_pinn.config import SPECIES_PROFILES, SUPPORTED_MODALITIES
 from brain_moe_pinn.config import ExperimentConfig
-from brain_moe_pinn.data.species_dataset import build_species_dataloaders
+from brain_moe_pinn.data.species_dataset import (
+    build_species_dataloaders, read_manifest)
 from brain_moe_pinn.training.losses import TotalLoss
 from brain_moe_pinn.training.training_loop import (
     augment_phase_loss_weights,
     masked_channel_correlation,
+    pad_control_features,
+    reduce_control,
 )
 from brain_moe_pinn.training.training_phases import LossWeights
 
@@ -62,13 +65,17 @@ def main() -> None:
     print(f"[sanity] species={cfg.species} latent_dim={cfg.latent_dim} "
           f"nominal_latent_dt={cfg.latent_dt} "
           f"rate_source={experiment.data.sample_rate_hz_source}")
-
     root = Path(args.root)
-    detected = sorted(
+    manifest_rows = read_manifest(root / "manifest.csv")
+    detected_names = {
         d.name for d in root.iterdir()
-        if d.is_dir() and d.name in SUPPORTED_MODALITIES + ("stimulus",))
+        if d.is_dir() and d.name in SUPPORTED_MODALITIES + ("stimulus",)}
+    for modality in experiment.data.modalities:
+        if any(row.get(f"{modality}_file") for row in manifest_rows):
+            detected_names.add(modality)
+    detected = sorted(detected_names)
     if not detected:
-        raise SystemExit(f"no supported modality dirs under {root}")
+        raise SystemExit(f"no supported modalities under {root}")
     print(f"[sanity] detected modalities: {detected}")
 
     roles = dict(experiment.data.roles)
@@ -115,10 +122,23 @@ def main() -> None:
             print(f"[sanity] per-sample dt ({dt_kwargs['dt'].numel()}): "
                   f"{[round(float(v), 1) for v in dt_kwargs['dt']]} s "
                   f"for {frames} frames")
+        perturbation = None
+        reduction = "resample"
+        if control_modalities:
+            control_parts = [batch[m] for m in control_modalities if m in batch]
+            if control_parts:
+                control = pad_control_features(
+                    torch.cat(control_parts, dim=1),
+                    getattr(getattr(model, "velocity_brain", None),
+                            "perturbation_dim", None))
+                perturbation = reduce_control(
+                    control, reduction, max(1, args.rollout))
+                print(f"[sanity] control: {tuple(perturbation.shape)} "
+                      f"via {reduction}")
 
         out = model.forward_modalities(
-            signals, masks=masks, num_steps=max(1, args.rollout),
-            reconstruct=True, **dt_kwargs)
+            signals, masks=masks, perturbation=perturbation,
+            num_steps=max(1, args.rollout), reconstruct=True, **dt_kwargs)
         total, metrics = TotalLoss(weights)(out, targets)
         total.backward()
         finite = all(
@@ -154,9 +174,8 @@ def main() -> None:
             raise SystemExit("sanity FAILED: non-finite loss or gradients")
 
     print("[sanity] OK - real-data forward/backward with species criteria")
-    print("[sanity] next: train.py --config %s --data %s "
-          "(kind=species, root=%s)" % (
-              args.config, "configs/data/c_elegans_salt.json", root))
+    print("[sanity] train with the matching species data profile; "
+          "canonical root=%s" % root)
 
 
 if __name__ == "__main__":

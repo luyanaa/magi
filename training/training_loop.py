@@ -19,6 +19,8 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -273,6 +275,26 @@ def masked_channel_correlation(
     return float(rho.detach().mean()) if rho.numel() else 0.0
 
 
+def pad_control_features(
+    control: torch.Tensor, width: Optional[int]
+) -> torch.Tensor:
+    """Right-pad source control channels to the model perturbation width."""
+    if width is None:
+        return control
+    if control.dim() != 3:
+        raise ValueError("control must have shape (B, C, T)")
+    width = int(width)
+    if width <= 0:
+        raise ValueError("control width must be positive")
+    if control.shape[1] > width:
+        raise ValueError(
+            f"control has {control.shape[1]} channels but model width is "
+            f"{width}")
+    if control.shape[1] == width:
+        return control
+    return F.pad(control, (0, 0, 0, width - control.shape[1]))
+
+
 def partition_generic_batch(
     batch,
     signal_modalities,
@@ -283,6 +305,7 @@ def partition_generic_batch(
     rollout_steps: int = 1,
     require_future_targets: bool = False,
     require_multi_horizon: bool = False,
+    control_dim: Optional[int] = None,
 ):
     """Split a loader batch into current signals, future targets, and control."""
     moved = {
@@ -373,6 +396,7 @@ def partition_generic_batch(
     control_parts = [moved[m] for m in control_modalities if m in moved]
     if control_parts:
         concatenated = torch.cat(control_parts, dim=1)
+        concatenated = pad_control_features(concatenated, control_dim)
         perturbation = reduce_control(
             concatenated, control_reduction, rollout_steps)
     return signals, targets, perturbation
@@ -419,17 +443,23 @@ def augment_phase_loss_weights(
     weights,
     recon_modalities,
     recon_loss_types: Optional[Dict[str, str]] = None,
+    recon_loss_mix: Optional[Dict[str, Dict[str, float]]] = None,
 ):
     """Enable supported generic terms without hiding unsupported objectives.
 
     Generic species models do not emit standard EEG/fMRI hubs or the latent
     HRF bridge, so cross-modal objectives are explicitly disabled rather than
-    silently skipped.  Policy terms remain user-controlled and are validated
+    silently skipped. Policy terms remain user-controlled and are validated
     per batch by ``TotalLoss``.
     """
     from dataclasses import replace
     extras = dict(getattr(weights, "recon_extra", {}) or {})
     types = dict(getattr(weights, "recon_loss_types", {}) or {})
+    mixes = {
+        str(modality): dict(criteria)
+        for modality, criteria in (
+            getattr(weights, "recon_loss_mix", {}) or {}).items()
+    }
     changed = False
     dedicated = {"eeg", "fmri", "meg"}
     for modality in recon_modalities:
@@ -443,6 +473,10 @@ def augment_phase_loss_weights(
                 and modality not in types):
             types[modality] = criterion
             changed = True
+    for modality, criteria in (recon_loss_mix or {}).items():
+        if modality in recon_modalities and modality not in dedicated:
+            mixes[modality] = dict(criteria)
+            changed = True
     structural = {
         field: getattr(weights, field, 0.0)
         for field in ("cross_modal", "cross", "cross_soft")
@@ -453,7 +487,8 @@ def augment_phase_loss_weights(
             weights, cross_modal=0.0, cross=0.0, cross_soft=0.0)
     if not changed:
         return weights
-    return replace(weights, recon_extra=extras, recon_loss_types=types)
+    return replace(weights, recon_extra=extras, recon_loss_types=types,
+                   recon_loss_mix=mixes)
 
 
 class MetricsLogger:
@@ -693,8 +728,12 @@ class BrainMoETrainer:
             m for m in self.signal_modalities if m != "behavior")
         self.recon_loss_types = dict(
             (profile.recon_loss_types if profile else {}) or {})
+        self.recon_loss_mix = dict(
+            getattr(profile, "recon_loss_mix", {}) if profile else {})
         if config.get("recon_loss_types"):
             self.recon_loss_types.update(config["recon_loss_types"])
+        if config.get("recon_loss_mix"):
+            self.recon_loss_mix.update(config["recon_loss_mix"])
         self.require_future_targets = bool(
             experiment.get(
                 "paired_next_step_targets",
@@ -1601,16 +1640,7 @@ class BrainMoETrainer:
         return metrics
 
     def _generic_step_kwargs(self, tensors: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Physics/species kwargs for one generic forward from the live batch.
-
-        One latent step advances one *window*, so its physical duration in
-        seconds is ``frames_per_window * dt_row``: the sampling interval comes
-        from the manifest per sample (worms are imaged at 3.69-5.72 Hz), not
-        from a global constant. Passing it makes the MT-KDA/OU time constants
-        mean seconds for whatever rate the batch carries, and the per-sample
-        species tags keep replay batches from being conditioned as the stage
-        species.
-        """
+        """Build physical-clock and species kwargs from the live batch."""
         tensors = self._generic_batch_tensors if tensors is None else tensors
         kwargs: Dict[str, Any] = {}
         frame_counts = None
@@ -1619,20 +1649,18 @@ class BrainMoETrainer:
                 continue
             mask = tensors.get(f"{modality}_mask")
             if isinstance(mask, torch.Tensor) and mask.shape == value.shape:
-                # Collapse channels first: frame_counts must be one value per
-                # sample, not one value per channel.
                 valid_frames = mask.detach().to(value.device).bool().any(dim=1)
                 frame_counts = valid_frames.sum(dim=-1).clamp_min(1)
             else:
                 frame_counts = torch.full(
-                    (value.shape[0],), float(value.shape[-1]),
-                    device=value.device)
+                    (value.shape[0],), float(value.shape[-1]), device=value.device)
             break
         dt_values = tensors.get("dt")
         if frame_counts is not None and dt_values is not None:
             try:
                 if isinstance(dt_values, torch.Tensor):
-                    per_sample = dt_values.detach().flatten().to(self.device).float()
+                    per_sample = dt_values.detach().flatten().to(
+                        self.device).float()
                 elif isinstance(dt_values, (list, tuple)):
                     per_sample = torch.tensor(
                         [float(v) for v in dt_values], device=self.device)
@@ -1652,6 +1680,8 @@ class BrainMoETrainer:
                 if int(getattr(self, "_rollout_steps", 1)) > 1:
                     kwargs["step_dt"] = kwargs["dt"]
         species_tags = tensors.get("species")
+        if isinstance(species_tags, torch.Tensor):
+            species_tags = species_tags.detach().flatten().tolist()
         if isinstance(species_tags, (list, tuple)) and species_tags:
             kwargs["species_names"] = [str(tag) for tag in species_tags]
         return kwargs
@@ -1707,6 +1737,7 @@ class BrainMoETrainer:
         components = {
             "eeg_encoder": getattr(target, "eeg_encoder", None),
             "fmri_encoder": getattr(target, "fmri_encoder", None),
+            "velocity_brain": getattr(target, "velocity_brain", None),
             "decoder": getattr(
                 target, "decoder", getattr(target, "decoder_router", None)),
         }
@@ -1717,6 +1748,7 @@ class BrainMoETrainer:
         if "moe_router" in policy:
             set_frozen(router, bool(policy["moe_router"]))
         self._active_freeze_policy = dict(policy)
+        self._phase_thawed_components = set()
 
     def _apply_timed_freeze_policy(
         self,
@@ -2005,7 +2037,7 @@ class BrainMoETrainer:
         if self.ds_config is not None:
             # DeepSpeed fixes its micro batch at engine init and never re-reads
             # it, and the DeepSpeed branch calls model.backward() every step
-            # instead of accumulating itself.  A phase whose batch differs from
+            # instead of accumulating itself. A phase whose batch differs from
             # what the engine was told therefore trains at a different
             # effective batch than the config claims, silently.
             configured_micro = int(
@@ -2029,23 +2061,22 @@ class BrainMoETrainer:
                     f"{gradient_accumulation}. DeepSpeed cannot change "
                     "gradient accumulation after engine initialization; use "
                     "one accumulation value for all selected phases.")
-        base_lr = phase_config.get("learning_rate", 3e-5)
-        min_lr = phase_config.get("min_lr", 1e-6)
-
-        # Update loss weights for this phase. Generic (non-EEG) runs get
-        # their species reconstruction terms auto-enabled here without
-        # editing the shared phase tables.
+        self._active_gradient_accumulation = gradient_accumulation
+        # Update loss weights for this phase. Generic species runs get their
+        # reconstruction criteria from the species/data profile.
         phase_loss_weights = phase_config.get("loss_weights", None)
         if self.generic_model and self.recon_modalities:
             if phase_loss_weights is None:
                 phase_loss_weights = LossWeights()
             phase_loss_weights = augment_phase_loss_weights(
                 phase_loss_weights, self.recon_modalities,
-                self.recon_loss_types)
+                self.recon_loss_types, self.recon_loss_mix)
         if phase_loss_weights is not None:
             self.total_loss.loss_weights = phase_loss_weights
         elif phase_name != "Magi EEG Encoder Pretraining":
             print(f"[WARNING] Phase '{phase_name}' has no loss_weights; using defaults")
+        base_lr = phase_config.get("learning_rate", 3e-5)
+        min_lr = phase_config.get("min_lr", 1e-6)
 
         use_deepspeed = self.ds_engine is not None
 
@@ -2197,7 +2228,12 @@ class BrainMoETrainer:
             target._wiener_ataxia = ac_report.get("ataxia_current", 0.0)
             target._wiener_catalepsy = ac_report.get("catalepsy_current", 0.0)
             step_metrics = {}
-
+            if self.generic_model:
+                # Fetch the live loader batch before partitioning it below.
+                # Without this call, the generic path starts with its empty
+                # batch cache and silently falls back to no signals.
+                generic_signals = self._next_generic_signals(
+                    batch_size, step=step, total_steps=total_steps)
             step_metrics.update(self._generic_control_metrics())
             if self.generic_model:
                 signals, raw_targets, perturbation = partition_generic_batch(
@@ -2207,7 +2243,10 @@ class BrainMoETrainer:
                     control_reduction=self.control_reduction,
                     rollout_steps=rollout_steps,
                     require_future_targets=self.require_future_targets,
-                    require_multi_horizon=self._forecast_enabled)
+                    require_multi_horizon=self._forecast_enabled,
+                    control_dim=getattr(
+                        getattr(target, "velocity_brain", None),
+                        "perturbation_dim", None))
                 signal_masks = dict(self._generic_signal_masks)
             else:
                 raw_targets, raw_target_masks = self._standard_raw_targets(
@@ -2346,7 +2385,14 @@ class BrainMoETrainer:
                 is_accum_boundary = (micro_step_count + 1) % gradient_accumulation == 0
                 sync_context = self.model.no_sync() if hasattr(self.model, "no_sync") and not is_accum_boundary else None
 
-                with autocast_context(self.device, enabled=True):
+                # The generic species model differentiates through the
+                # physics field and higher-order observation path. CUDA fp16
+                # autocast eventually overflowed those gradients on the
+                # batch-one C. elegans run even though the loss was finite.
+                # Keep the verified FP32 generic path; standard EEG/fMRI
+                # training retains its existing AMP behavior.
+                with autocast_context(
+                        self.device, enabled=not self.generic_model):
                     if self.generic_model:
                         if perturbation is not None:
                             step_metrics["perturbation_norm"] = float(
@@ -2409,6 +2455,9 @@ class BrainMoETrainer:
                     if not self.generic_model:
                         targets.update(self._standard_contract_targets)
                     total_loss, loss_metrics = self.total_loss(outputs, targets)
+                    if not torch.isfinite(total_loss):
+                        raise FloatingPointError(
+                            f"non-finite loss at training step {step}")
                     total_loss = total_loss / gradient_accumulation
 
                 if sync_context is not None:
@@ -2421,7 +2470,11 @@ class BrainMoETrainer:
                 if micro_step_count % gradient_accumulation == 0:
                     self.scaler.unscale_(self.optimizer)
                     grad_clip = getattr(self, "_grad_clip", 1.0)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), grad_clip)
+                    if not torch.isfinite(grad_norm):
+                        raise FloatingPointError(
+                            f"non-finite gradient norm at training step {step}")
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad()
@@ -2457,20 +2510,26 @@ class BrainMoETrainer:
             if "moe_routing" in outputs and "router_entropy" in outputs["moe_routing"]:
                 step_metrics["router_entropy"] = outputs["moe_routing"]["router_entropy"]
 
-            # StabilityMonitor needs the energy potential for its divergence
-            # trigger.  It is free to report: the scalar is produced alongside
-            # the energy gradient in the velocity field, so no extra forward.
-            if outputs.get("E") is not None:
+            # Energy-divergence rollback is only meaningful when a physical
+            # energy contract is supplied. Generic species rollouts expose an
+            # architecture energy field, not a calibrated physical energy;
+            # feeding it into the generic stability trigger causes false
+            # phase termination as the latent scale changes during training.
+            if not self.generic_model and outputs.get("E") is not None:
                 step_metrics["E"] = float(outputs["E"])
 
-            # Signed-work ratio, stability trigger 1.  This is a *within
-            # trajectory* diagnostic, so it is only emitted when a real
-            # multi-step rollout exists; buffering single-step velocities
-            # across iterations would mix unrelated batches, which is the same
-            # mistake the old latent PSD buffer made.
-            delta_seq = outputs.get("delta_z_sequence")
-            if (isinstance(delta_seq, torch.Tensor)
-                    and delta_seq.dim() == 3 and delta_seq.shape[1] >= 3):
+            # Signed-work is a trajectory diagnostic, but the generic
+            # species path emits a latent rollout whose successive states are
+            # rollout substeps (not observations at a common physical clock).
+            # Treating those increments as a thermodynamic trigger caused
+            # repeated false rollbacks on valid runs. Keep the diagnostic out
+            # of StabilityMonitor until a physical signed-work contract is
+            # supplied; the latent rollout metrics remain available in
+            # validation.
+            if (not self.generic_model
+                    and isinstance(delta_seq, torch.Tensor)
+                    and delta_seq.dim() == 3
+                    and delta_seq.shape[1] >= 3):
                 try:
                     from ..physics.thermodynamics import (
                         compute_trajectory_diagnostics)
@@ -2617,6 +2676,7 @@ class BrainMoETrainer:
                 if self.is_main_process:
                     print(f"[Validation] Running validation at step {step}")
                 val_metrics = self.validate(model, phase_config, step, total_steps)
+                self._last_validation_metrics = dict(val_metrics)
                 if val_metrics:
                     if self.is_main_process:
                         print(f"[Validation] val_loss={val_metrics.get('val_loss', float('inf')):.4f}")
@@ -2640,21 +2700,19 @@ class BrainMoETrainer:
                         if should_stop:
                             if self.is_main_process:
                                 print(f"[Validation] Early stopping triggered at step {step}")
-                            break
-
-            # Progressive context expansion
             if ctx_schedule is not None:
                 for ctx_step, ctx_target in ctx_schedule:
-                    if step == ctx_step and current_ctx != ctx_target:
+                    if step == int(ctx_step) and current_ctx != int(ctx_target):
                         if self.is_main_process:
                             print(f"[ContextExpansion] Step {step}: expanding context {current_ctx} → {ctx_target}")
-                        current_ctx = ctx_target
+                        current_ctx = int(ctx_target)
+                        target_model = model.module if hasattr(model, "module") else model
+                        setter = getattr(target_model, "set_context_length", None)
+                        if not callable(setter):
+                            raise NotImplementedError(
+                                "model does not implement set_context_length()")
+                        setter(current_ctx)
                         self._current_context_length = current_ctx
-                        # If model supports context expansion, notify it
-                        if hasattr(model, "set_context_length"):
-                            model.set_context_length(current_ctx)
-                        elif hasattr(model, "module") and hasattr(model.module, "set_context_length"):
-                            model.module.set_context_length(current_ctx)
                         break
 
             step += 1
@@ -2752,16 +2810,20 @@ class BrainMoETrainer:
         metric_dt_used = []
         free_step_norm = []
         free_tail_ratio = []
-        intervention_enabled = getattr(
-            self.total_loss.loss_weights, "intervention_response", 0.0) > 0
         val_steps = 0
         max_val_steps = 100
-        rollout_steps = max(1, int(phase_config.get("rollout_steps", 1)))
+        intervention_enabled = getattr(
+            self.total_loss.loss_weights, "intervention_response", 0.0) > 0
+        rollout_steps = max(1, int(
+            self._rollout_steps_override
+            if getattr(self, "_rollout_steps_override", None)
+            else phase_config.get("rollout_steps", 1)))
         phase_weights = phase_config.get("loss_weights")
         if self.generic_model and self.recon_modalities:
             phase_weights = augment_phase_loss_weights(
                 phase_weights or LossWeights(), self.recon_modalities,
-                getattr(self, "recon_loss_types", {}))
+                getattr(self, "recon_loss_types", {}),
+                getattr(self, "recon_loss_mix", {}))
             self.total_loss.loss_weights = phase_weights
         self._forecast_enabled = bool(
             getattr(phase_weights, "forecast", 0.0) > 0
@@ -2794,7 +2856,10 @@ class BrainMoETrainer:
                                 require_future_targets=(
                                     self.require_future_targets),
                                 require_multi_horizon=(
-                                    self._forecast_enabled)))
+                                    self._forecast_enabled),
+                                control_dim=getattr(
+                                    getattr(target_model, "velocity_brain", None),
+                                    "perturbation_dim", None)))
                         if not signals:
                             continue
                         signal_masks = {
@@ -3017,20 +3082,26 @@ class BrainMoETrainer:
                                 and isinstance(real, torch.Tensor)
                                 and prediction.shape[-1] >= 3
                                 and prediction.shape[1] >= 2):
-                            # One-step *prediction* statistics: the decoder
-                            # output for the next window scored against that
-                            # window.  The latent advanced a single step from a
-                            # real observation, so this is not a free run.
+                            # One-step *prediction* statistics: for a
+                            # multi-horizon target, score the final horizon
+                            # against the final decoded window.  The metric
+                            # suite accepts (T, N), not (K, C, T).
                             frame_dt_s = (
                                 self._batch_frame_dt(batch)
                                 if isinstance(batch, dict) else None) or float(
                                     getattr(target_model, "latent_dt", None)
                                     or 1.0)
+                            metric_real = real[0]
+                            metric_prediction = prediction[0]
+                            if metric_real.dim() == 3:
+                                metric_real = metric_real[-1]
+                            if metric_prediction.dim() == 3:
+                                metric_prediction = metric_prediction[-1]
                             pair = run_free_run_suite(
-                                real[0].detach().transpose(0, 1).cpu().numpy(),
-                                prediction[0].detach().transpose(0, 1).cpu().numpy(),
+                                metric_real.detach().transpose(0, 1).cpu().numpy(),
+                                metric_prediction.detach().transpose(0, 1).cpu().numpy(),
                                 max_lag=min(
-                                    prediction.shape[-1] // 3, 20),
+                                    metric_prediction.shape[-1] // 3, 20),
                                 dt=frame_dt_s)
                             metric_dt_used.append(float(frame_dt_s))
                             one_step_corr.append(float(pair["corr_matrix_mse"]))
@@ -3159,8 +3230,13 @@ class BrainMoETrainer:
             else:
                 trained_steps = self.train_phase(phase)
 
-            if self.logger and self.logger.metrics_history:
-                self._last_phase_metrics = dict(self.logger.metrics_history[-1])
+            # Prefer the actual validation result for transition gates; the
+            # final training logger record is not a validation measurement.
+            phase_metrics = getattr(self, "_last_validation_metrics", None)
+            if phase_metrics is None and self.logger and self.logger.metrics_history:
+                phase_metrics = dict(self.logger.metrics_history[-1])
+            if phase_metrics is not None:
+                self._last_phase_metrics = phase_metrics
             self.global_barrier()
 
             if self.logger:

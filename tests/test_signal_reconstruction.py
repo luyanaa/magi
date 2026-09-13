@@ -2,8 +2,8 @@
 
 Covers the generic ``ReconstructionLoss`` API (per-call loss type, channel
 weights, masked reduction), the ``TotalLoss`` reconstruction registry driven
-by ``LossWeights.recon_extra``, and full-signal reconstruction of arbitrary
-neural signals through ``forward_modalities(reconstruct=True)``.
+by ``LossWeights.recon_extra``, mixed distribution-aware criteria, and
+full-signal reconstruction of arbitrary neural signals.
 """
 
 import pytest
@@ -186,9 +186,36 @@ def test_reconstruction_statistical_criteria():
         value.backward()
         assert probe.grad is not None and torch.isfinite(probe.grad).all()
 
+def test_mixed_reconstruction_loss_preserves_scale_and_gradients():
+    loss = ReconstructionLoss()
+    target = torch.randn(2, 3, 32)
+    prediction = 1.7 * target + 0.4
+    mixed = loss.mixed_loss(
+        prediction, target,
+        {"correlation": 0.6, "wasserstein1": 0.4})
+    assert torch.isfinite(mixed)
+    assert mixed > 0
+    probe = prediction.clone().requires_grad_()
+    value = loss.mixed_loss(
+        probe, target, {"correlation": 0.6, "wasserstein1": 0.4})
+    value.backward()
+    assert probe.grad is not None and torch.isfinite(probe.grad).all()
+
+def test_total_loss_uses_mixed_reconstruction_criteria():
+    pred = torch.randn(2, 3, 16)
+    target = torch.randn(2, 3, 16)
+    tl = TotalLoss(LossWeights(
+        recon_extra={"calcium": 1.0},
+        recon_loss_mix={"calcium": {"correlation": 0.5,
+                                    "wasserstein1": 0.5}},
+    ))
+    value, metrics = tl({"calcium_recon": pred}, {"calcium": target})
+    assert "recon_calcium" in metrics
+    assert torch.isfinite(value)
+
 
 def test_total_loss_per_modality_criteria():
-    """recon_loss_types selects the criterion per modality in TotalLoss."""
+    """Reconstruction criteria and generic phase augmentation contract."""
     pred = torch.randn(2, 4, 16)
     target = torch.randn(2, 4, 16)
     tl = TotalLoss(LossWeights(
@@ -201,7 +228,6 @@ def test_total_loss_per_modality_criteria():
     )
     assert "recon_calcium" in metrics and "recon_voltage" in metrics
     assert torch.isfinite(loss_value)
-
 
 def test_species_batch_helpers():
     """Dummy species batches and phase-weight augmentation contract."""
@@ -219,11 +245,14 @@ def test_species_batch_helpers():
     phase_weights = LossWeights(recon_extra={"calcium": 0.5})
     augmented = augment_phase_loss_weights(
         phase_weights, ("calcium", "voltage"),
-        recon_loss_types={"calcium": "correlation", "voltage": "huber"})
+        recon_loss_types={"calcium": "correlation", "voltage": "huber"},
+        recon_loss_mix={"calcium": {"correlation": 0.5,
+                                     "wasserstein1": 0.5}})
     assert augmented.recon_extra == {"calcium": 0.5, "voltage": 1.0}
     assert augmented.recon_loss_types == {
         "calcium": "correlation", "voltage": "huber"}
-    # Phase-selected criteria win over defaults.
+    assert augmented.recon_loss_mix == {
+        "calcium": {"correlation": 0.5, "wasserstein1": 0.5}}
     phase_weights2 = LossWeights(
         recon_extra={"calcium": 1.0},
         recon_loss_types={"calcium": "huber"})
@@ -231,7 +260,6 @@ def test_species_batch_helpers():
         phase_weights2, ("calcium",),
         recon_loss_types={"calcium": "correlation"})
     assert augmented2.recon_loss_types == {"calcium": "huber"}
-    # Nothing to add -> same object back (no accidental copies).
     assert augment_phase_loss_weights(LossWeights(), (), {}) is not None
 
 

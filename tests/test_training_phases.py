@@ -113,3 +113,16 @@ def test_generic_runs_disable_hub_only_cross_modal_objectives():
     assert augmented.cross_modal == 0.0
     assert augmented.cross == 0.0
     assert augmented.cross_soft == 0.0
+
+def test_phase_accumulation_is_consistent_across_stage_one():
+    phases = parse_phases("1")
+    assert {int(phase["gradient_accumulation"]) for phase in phases} == {1}
+
+
+def test_phase_six_declares_context_length():
+    phase = parse_phases("1")[-1]
+    assert phase["max_seq_len_eeg"] == 4096
+
+
+def test_trainer_freeze_policy_includes_velocity_brain():
+    assert "velocity_brain" in parse_phases("1")[0]["freeze_policy"]

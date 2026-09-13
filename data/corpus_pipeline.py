@@ -1442,7 +1442,12 @@ def validate_ladder(
                 if path.is_dir() and "_" not in path.name
             ]
         for modality in row_modalities:
-            path = root / modality / f"{sample_id}.npy"
+            path_value = row.get(f"{modality}_file")
+            if path_value:
+                path_ref = Path(path_value)
+                path = path_ref if path_ref.is_absolute() else (root / path_ref)
+            else:
+                path = root / modality / f"{sample_id}.npy"
             if not path.exists():
                 # Federated rows legitimately omit a modality.
                 continue
@@ -1452,7 +1457,13 @@ def validate_ladder(
             rate = row.get(f"{modality}_rate_hz") or row.get("rate_hz")
             if rate and float(rate) <= 0:
                 raise ValueError(f"{sample_id}/{modality} has non-positive rate")
-            ids_path = root / f"{modality}_ids" / f"{sample_id}.txt"
+            ids_value = row.get(f"{modality}_ids_file")
+            if ids_value:
+                ids_ref = Path(ids_value)
+                ids_path = (
+                    ids_ref if ids_ref.is_absolute() else (root / ids_ref))
+            else:
+                ids_path = root / f"{modality}_ids" / f"{sample_id}.txt"
             if ids_path.exists():
                 ids = [line for line in ids_path.read_text().splitlines() if line]
                 if len(ids) != array.shape[0]:

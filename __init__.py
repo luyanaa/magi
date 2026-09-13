@@ -185,6 +185,7 @@ class BrainMoEPINN(nn.Module):
         moe_num_routed: int = 6,
         moe_top_k: int = 3,
         poisson_rank: int = 64,
+        latent_velocity_scale: float = 0.1,
         species: str = "human",
         species_vocab: Optional[List[str]] = None,
         use_species_conditioning: bool = False,
@@ -431,7 +432,9 @@ class BrainMoEPINN(nn.Module):
             perturbation_dim=perturbation_dim,
             control_gating=self.control_gating,
             latent_dt=self.latent_dt,
+            velocity_scale=latent_velocity_scale,
         )
+
 
         if generic_observation_only:
             self.decoder_router = None
@@ -1416,6 +1419,7 @@ class BrainMoEPINNConfig:
         moe_num_routed: int = 6,
         moe_top_k: int = 3,
         poisson_rank: int = 64,
+        latent_velocity_scale: float = 0.1,
         species: str = "human",
         species_vocab: Optional[List[str]] = None,
         use_species_conditioning: bool = False,
@@ -1455,6 +1459,7 @@ class BrainMoEPINNConfig:
         self.use_channel_type_embed = use_channel_type_embed
         self.moe_num_shared = moe_num_shared
         self.moe_num_routed = moe_num_routed
+        self.latent_velocity_scale = float(latent_velocity_scale)
         self.moe_top_k = moe_top_k
         self.poisson_rank = int(poisson_rank)
         self.species = species
@@ -1490,13 +1495,12 @@ class BrainMoEPINNConfig:
             eeg_backend=features.eeg_backend,
             use_channel_type_embed=features.use_channel_type_embed,
             moe_num_shared=features.moe_num_shared,
-            moe_num_routed=features.moe_num_routed,
             moe_top_k=features.moe_top_k,
             poisson_rank=features.poisson_rank,
+            latent_velocity_scale=features.latent_velocity_scale,
             generic_observation_only=features.use_generic_observation_adapter,
             species=config.species,
             species_vocab=list(config.species_vocab),
-            use_species_conditioning=features.use_species_conditioning,
             use_sensor_emission=getattr(features, "use_sensor_emission", False),
             sensor_specs=(
                 {m: s for m, s in config.sensor_specs().items()}
@@ -1544,6 +1548,7 @@ class BrainMoEPINNConfig:
             moe_num_shared=self.moe_num_shared,
             moe_num_routed=self.moe_num_routed,
             moe_top_k=self.moe_top_k,
+            latent_velocity_scale=self.latent_velocity_scale,
             poisson_rank=self.poisson_rank,
             generic_observation_only=self.generic_observation_only,
             initial_context_length=self.initial_context_length,
