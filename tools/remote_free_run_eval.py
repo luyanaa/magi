@@ -93,7 +93,8 @@ def _concat_masks(value: torch.Tensor) -> np.ndarray:
         value.shape[0] * value.shape[2], value.shape[1])
 
 
-def _aggregate_scalar(reports: Iterable[Dict[str, Any]], path: Tuple[str, ...]):
+def _aggregate_numeric_mean(reports: Iterable[Dict[str, Any]], path: Tuple[str, ...]):
+    """Aggregate scalar or vector-valued numeric fields per report."""
     values = []
     for report in reports:
         current: Any = report
@@ -102,8 +103,15 @@ def _aggregate_scalar(reports: Iterable[Dict[str, Any]], path: Tuple[str, ...]):
                 current = None
                 break
             current = current[key]
-        if isinstance(current, (int, float)) and np.isfinite(current):
-            values.append(float(current))
+        if current is None:
+            continue
+        try:
+            array = np.asarray(current, dtype=float)
+        except (TypeError, ValueError):
+            continue
+        finite = array[np.isfinite(array)]
+        if finite.size:
+            values.append(float(np.mean(finite)))
     return {
         "n": len(values),
         "mean": float(statistics.fmean(values)) if values else None,
@@ -111,25 +119,6 @@ def _aggregate_scalar(reports: Iterable[Dict[str, Any]], path: Tuple[str, ...]):
     }
 
 
-def _aggregate_dict_mean(reports: Iterable[Dict[str, Any]], path: Tuple[str, ...]):
-    values = []
-    for report in reports:
-        current: Any = report
-        for key in path:
-            if not isinstance(current, dict) or key not in current:
-                current = None
-                break
-            current = current[key]
-        if isinstance(current, dict):
-            finite = [float(v) for v in current.values()
-                      if isinstance(v, (int, float)) and np.isfinite(v)]
-            if finite:
-                values.append(float(statistics.fmean(finite)))
-    return {
-        "n": len(values),
-        "mean": float(statistics.fmean(values)) if values else None,
-        "median": float(statistics.median(values)) if values else None,
-    }
 
 
 def _lag1(values: np.ndarray) -> Optional[float]:
@@ -334,20 +323,56 @@ def main() -> None:
         aggregate_paths.update({
             "tderica_dtw": ("model", "tderica", "time_alignment", "dtw_distance"),
             "tderica_frechet": ("model", "tderica", "time_alignment", "frechet_distance"),
+            "tderica_w1": ("model", "tderica", "distribution", "wasserstein_global"),
+            "tderica_w1_component_mean": (
+                "model", "tderica", "distribution", "wasserstein_per_component"),
+            "tderica_kl_mean": ("model", "tderica", "distribution", "kl_divergence"),
+            "tderica_cosine_diagonal_mean": (
+                "model", "tderica", "time_alignment", "cosine_diagonal_mean"),
+            "tderica_cosine_global_mean": (
+                "model", "tderica", "time_alignment", "cosine_global_mean"),
+            "tderica_kernel_transition": (
+                "model", "tderica", "dynamics", "kernel_transition"),
+            "tderica_transfer_entropy_a_to_b": (
+                "model", "tderica", "dynamics", "transfer_entropy_a_to_b"),
+            "tderica_transfer_entropy_b_to_a": (
+                "model", "tderica", "dynamics", "transfer_entropy_b_to_a"),
         })
     else:
         aggregate_paths.update({
             "tderica_dtw": ("model", "similarity", "time_alignment", "dtw_distance"),
             "tderica_frechet": ("model", "similarity", "time_alignment", "frechet_distance"),
+            "tderica_w1": ("model", "similarity", "distribution", "wasserstein_global"),
+            "tderica_w1_component_mean": (
+                "model", "similarity", "distribution", "wasserstein_per_component"),
+            "tderica_kl_mean": ("model", "similarity", "distribution", "kl_divergence"),
+            "tderica_cosine_diagonal_mean": (
+                "model", "similarity", "time_alignment", "cosine_diagonal_mean"),
+            "tderica_cosine_global_mean": (
+                "model", "similarity", "time_alignment", "cosine_global_mean"),
+            "tderica_kernel_transition": (
+                "model", "similarity", "dynamics", "kernel_transition"),
+            "tderica_transfer_entropy_a_to_b": (
+                "model", "similarity", "dynamics", "transfer_entropy_a_to_b"),
+            "tderica_transfer_entropy_b_to_a": (
+                "model", "similarity", "dynamics", "transfer_entropy_b_to_a"),
+            "tderica_jacobian_distance": (
+                "model", "similarity", "dynamics", "local_jacobian", "jacobian_distance"),
+            "tderica_expansion_diff": (
+                "model", "similarity", "dynamics", "local_jacobian", "expansion_diff"),
+            "tderica_rotation_diff": (
+                "model", "similarity", "dynamics", "local_jacobian", "rotation_diff"),
             "real_occurrence_lag1": ("model", "real_occurrence_lag1"),
             "generated_occurrence_lag1": ("model", "generated_occurrence_lag1"),
+            "motif_roughness_mean": ("model", "motif_roughness_mean"),
+            "motif_spatial_coherence_mean": ("model", "motif_spatial_coherence_mean"),
         })
     output = {
         "checkpoint": str(args.checkpoint), "split": args.split,
         "device": str(device), "rollout_windows": args.rollout,
         "n_samples": len(reports), "tderica_context_fit": not args.no_tderica_fit,
         "checkpoint_info": checkpoint_info,
-        "aggregate": {name: _aggregate_scalar(reports, path) for name, path in aggregate_paths.items()},
+        "aggregate": {name: _aggregate_numeric_mean(reports, path) for name, path in aggregate_paths.items()},
         "samples": reports,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

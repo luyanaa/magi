@@ -2075,6 +2075,10 @@ class BrainMoETrainer:
             self.total_loss.loss_weights = phase_loss_weights
         elif phase_name != "Magi EEG Encoder Pretraining":
             print(f"[WARNING] Phase '{phase_name}' has no loss_weights; using defaults")
+        forecast_warning = self.total_loss.configure_forecast(
+            self.total_loss.loss_weights, rollout_steps=rollout_steps)
+        if forecast_warning:
+            print(f"[WARNING] Phase '{phase_name}': {forecast_warning}")
         base_lr = phase_config.get("learning_rate", 3e-5)
         min_lr = phase_config.get("min_lr", 1e-6)
 
@@ -2825,6 +2829,8 @@ class BrainMoETrainer:
                 getattr(self, "recon_loss_types", {}),
                 getattr(self, "recon_loss_mix", {}))
             self.total_loss.loss_weights = phase_weights
+        self.total_loss.configure_forecast(
+            self.total_loss.loss_weights, rollout_steps=rollout_steps)
         self._forecast_enabled = bool(
             getattr(phase_weights, "forecast", 0.0) > 0
             and rollout_steps > 1)

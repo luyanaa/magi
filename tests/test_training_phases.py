@@ -15,6 +15,9 @@ from brain_moe_pinn.training.training_phases import (
     evaluate_transition_gate,
     get_stage_1_p1,
     get_stage_1_p3,
+    get_stage_1_p4,
+    get_stage_1_p5,
+    get_stage_1_p6,
 )
 
 
@@ -47,7 +50,58 @@ def test_forecast_phase_declares_multi_horizon_contract():
     assert phase["rollout"]["steps"] == 2
     assert phase["loss_weights"]["forecast"] == 1.0
     assert phase["loss_weights"]["forecast_horizon_weights"] == (1.0, 0.5)
+    assert phase["loss_weights"]["forecast_variance"] == 1.0
     assert phase["loss_weights"]["cross_modal"] == 0.0
+
+
+
+def test_scale_preservation_schedule_covers_all_post_p2_phases():
+    phases = [get_stage_1_p3(), get_stage_1_p4(),
+              get_stage_1_p5(), get_stage_1_p6()]
+
+    assert all(phase.loss_weights.forecast_variance == 1.0
+               for phase in phases)
+    assert all(phase.learning_rate == 1e-4
+               and phase.min_lr == 1e-4
+               and phase.warmup_steps == 0
+               and phase.lr_schedule == "flat"
+               for phase in phases[1:])
+
+def test_total_loss_syncs_forecast_criteria_to_runtime_horizons():
+    from brain_moe_pinn.training.losses import CompositeForecastLoss
+
+    phase_weights = LossWeights(
+        recon_extra={"calcium": 1.0},
+        forecast=1.0,
+        forecast_huber=0.25,
+        forecast_corr_diff=2.0,
+        forecast_horizon_weights=(1.0, 0.5),
+        sigreg=0.0,
+    )
+    total_loss = TotalLoss(LossWeights())
+    total_loss.loss_weights = phase_weights
+    total_loss.use_loss_normalization = False
+    warning = total_loss.configure_forecast(
+        phase_weights, rollout_steps=3)
+
+    prediction = torch.randn(2, 3, 2, 8)
+    target = torch.randn(2, 3, 2, 8)
+    value, _ = total_loss(
+        {
+            "calcium_recon": prediction[:, -1],
+            "calcium_recon_sequence": prediction,
+        },
+        {"calcium": target},
+    )
+    expected = CompositeForecastLoss(
+        huber_weight=0.25,
+        corr_diff_weight=2.0,
+        horizon_weights=None,
+    )(prediction, target)
+
+    assert warning is not None
+    assert "using equal horizon weights" in warning
+    assert torch.allclose(value, expected)
 
 
 def test_generic_reconstruction_does_not_duplicate_dedicated_terms():

@@ -186,6 +186,25 @@ def test_reconstruction_statistical_criteria():
         value.backward()
         assert probe.grad is not None and torch.isfinite(probe.grad).all()
 
+def test_log_variance_reconstruction_criterion_matches_scale_metric():
+    loss = ReconstructionLoss()
+    target = torch.randn(2, 3, 64)
+    prediction = 1.7 * target + 0.4
+    value = loss(prediction, target, loss_type="log_variance")
+    ratio = prediction.var(dim=-1, unbiased=False) / target.var(
+        dim=-1, unbiased=False)
+    expected = torch.sqrt(torch.log(ratio).square().mean()
+                          + torch.finfo(target.dtype).eps)
+    assert torch.allclose(value, expected, atol=1e-5)
+
+    collapsed = torch.zeros_like(target)
+    collapsed_value = loss(collapsed, target, loss_type="log_variance")
+    assert collapsed_value > value
+    probe = prediction.clone().requires_grad_()
+    loss(probe, target, loss_type="log_variance").backward()
+    assert probe.grad is not None and torch.isfinite(probe.grad).all()
+
+
 def test_mixed_reconstruction_loss_preserves_scale_and_gradients():
     loss = ReconstructionLoss()
     target = torch.randn(2, 3, 32)

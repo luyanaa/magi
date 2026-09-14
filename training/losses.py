@@ -45,6 +45,10 @@ class ReconstructionLoss(nn.Module):
     - ``corr_diff``: correlation on first temporal differences; targets the
       *dynamics* (increments) instead of the strongly autocorrelated
       baseline, penalizing trivial lag-copy solutions.
+    - ``log_variance``: RMSE of per-channel log variance ratios. Unlike
+      correlation and increment-correlation, this explicitly penalizes
+      marginal variance collapse or expansion while remaining symmetric in
+      log-space.
     - ``wasserstein1``: per-channel 1-D Wasserstein distance between the
       sorted prediction and target marginals (exact, differentiable via
       sort); matches the distribution axis of the multi-axis validation
@@ -53,7 +57,7 @@ class ReconstructionLoss(nn.Module):
 
     LOSS_TYPES = (
         "mse", "l1", "huber", "poisson", "correlation", "corr_diff",
-        "wasserstein1",
+        "log_variance", "wasserstein1",
     )
     ELEMENTWISE_TYPES = ("mse", "l1", "huber", "poisson")
 
@@ -97,7 +101,60 @@ class ReconstructionLoss(nn.Module):
             return self._correlation_loss(
                 pred, target, on_difference=(loss_type == "corr_diff"),
                 channel_weights=channel_weights, mask=mask)
+        if loss_type == "log_variance":
+            return self._log_variance_loss(
+                pred, target, channel_weights=channel_weights, mask=mask)
         return self._wasserstein_loss(pred, target, channel_weights, mask)
+
+    def _log_variance_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        channel_weights: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Match per-channel temporal variance in symmetric log space.
+
+        The reduction mirrors the evaluator's ``native_variance_log_rmse``:
+        each valid ``(batch, channel)`` contributes the squared log ratio of
+        predicted to target variance.  Constant or under-observed targets are
+        excluded because their variance ratio is not identifiable.
+        """
+        if pred.dim() != 3:
+            raise ValueError("log_variance loss expects shape (B, C, T)")
+        if mask is not None and mask.shape != pred.shape:
+            raise ValueError("mask must match pred shape")
+        valid = torch.ones_like(pred, dtype=torch.bool) if mask is None else (
+            mask.bool())
+        valid = valid & torch.isfinite(pred) & torch.isfinite(target)
+        count = valid.sum(dim=-1)
+        denom = count.clamp_min(1).to(pred.dtype)
+        pred_valid = pred.masked_fill(~valid, 0.0)
+        target_valid = target.masked_fill(~valid, 0.0)
+        pred_mean = pred_valid.sum(dim=-1) / denom
+        target_mean = target_valid.sum(dim=-1) / denom
+        pred_var = ((pred_valid - pred_mean.unsqueeze(-1)).square()
+                    * valid).sum(dim=-1) / denom
+        target_var = ((target_valid - target_mean.unsqueeze(-1)).square()
+                      * valid).sum(dim=-1) / denom
+        eps = torch.finfo(pred.dtype).eps
+        valid_channel = (count >= 2) & (target_var > eps)
+        log_ratio = torch.log((pred_var + eps) / (target_var + eps))
+        squared = torch.where(
+            valid_channel & torch.isfinite(log_ratio),
+            log_ratio.square(),
+            torch.zeros_like(log_ratio),
+        )
+        if channel_weights is not None:
+            if channel_weights.shape[0] != pred.shape[1]:
+                raise ValueError("channel_weights length must match channel dim")
+            squared = squared * channel_weights.to(squared.device)
+        valid_count = valid_channel.sum()
+        if int(valid_count.item()) == 0:
+            return pred.sum() * 0.0
+        mean_squared = squared.sum() / valid_count.to(squared.dtype)
+        return torch.sqrt(mean_squared + eps)
+
 
     def mixed_loss(
         self,
@@ -281,26 +338,30 @@ class ReconstructionLoss(nn.Module):
 
 
 class CompositeForecastLoss(nn.Module):
-    """Horizon-weighted robust signal and increment forecast loss.
+    """Horizon-weighted forecast loss with an explicit scale criterion.
 
-    Inputs are ``(B, K, C, T)`` tensors. Each horizon combines Huber error on
-    the signal with correlation error on first differences, so a forecast
-    cannot win only by copying a smooth baseline or by matching amplitude.
+    Inputs are ``(B, K, C, T)`` tensors. Each horizon combines robust signal
+    error, first-difference correlation, and optionally per-channel log
+    variance error. The last term prevents a forecast from minimizing
+    correlation-style objectives by collapsing its marginal variance.
     """
 
     def __init__(
         self,
         huber_weight: float = 1.0,
         corr_diff_weight: float = 1.0,
+        variance_weight: float = 0.0,
         horizon_weights: Optional[Union[torch.Tensor, list]] = None,
     ):
         super().__init__()
-        if huber_weight < 0 or corr_diff_weight < 0:
+        if (huber_weight < 0 or corr_diff_weight < 0
+                or variance_weight < 0):
             raise ValueError("forecast loss weights must be non-negative")
-        if huber_weight == 0 and corr_diff_weight == 0:
+        if huber_weight == 0 and corr_diff_weight == 0 and variance_weight == 0:
             raise ValueError("at least one forecast criterion is required")
         self.huber_weight = float(huber_weight)
         self.corr_diff_weight = float(corr_diff_weight)
+        self.variance_weight = float(variance_weight)
         self.horizon_weights = (
             None if horizon_weights is None else torch.as_tensor(
                 horizon_weights, dtype=torch.float32))
@@ -313,6 +374,7 @@ class CompositeForecastLoss(nn.Module):
                 raise ValueError("horizon_weights must have positive mass")
         self.huber = ReconstructionLoss("huber")
         self.corr_diff = ReconstructionLoss("corr_diff")
+        self.log_variance = ReconstructionLoss("log_variance")
 
     def forward(
         self,
@@ -347,9 +409,13 @@ class CompositeForecastLoss(nn.Module):
             increment = self.corr_diff(
                 prediction[:, horizon], target[:, horizon],
                 mask=horizon_mask)
+            scale = self.log_variance(
+                prediction[:, horizon], target[:, horizon],
+                mask=horizon_mask)
             total = total + weights[horizon] * (
                 self.huber_weight * robust
-                + self.corr_diff_weight * increment)
+                + self.corr_diff_weight * increment
+                + self.variance_weight * scale)
         return total
 
 
@@ -1592,13 +1658,47 @@ class TotalLoss(nn.Module):
         self.normalizer = LossNormalizer(beta=0.99)
         self.use_loss_normalization = getattr(
             loss_weights, "use_loss_normalization", True)
+        self.configure_forecast(loss_weights)
+
+    def configure_forecast(
+        self,
+        loss_weights: "LossWeights",
+        rollout_steps: Optional[int] = None,
+    ) -> Optional[str]:
+        """Rebuild forecast criteria from the active phase configuration.
+
+        The forecast module has no learnable state, so replacing it at a phase
+        boundary is both cheap and necessary: ``TotalLoss.loss_weights`` is
+        replaced per phase, while submodules are otherwise persistent.  When
+        a phase's horizon weights do not match the runtime rollout, retain all
+        horizons with equal weights and return a warning for the caller to
+        surface.  This keeps profiles with different horizon counts runnable
+        without silently using a stale criterion.
+        """
+        requested = getattr(loss_weights, "forecast_horizon_weights", None)
+        effective = requested
+        warning = None
+        if requested is not None and rollout_steps is not None:
+            try:
+                requested_count = len(requested)
+            except TypeError:
+                requested_count = None
+            if (requested_count is not None
+                    and requested_count != int(rollout_steps)):
+                warning = (
+                    "forecast_horizon_weights has "
+                    f"{requested_count} values for runtime rollout "
+                    f"{int(rollout_steps)}; using equal horizon weights")
+                effective = None
         self.forecast = CompositeForecastLoss(
             huber_weight=getattr(loss_weights, "forecast_huber", 1.0),
             corr_diff_weight=getattr(
                 loss_weights, "forecast_corr_diff", 1.0),
-            horizon_weights=getattr(
-                loss_weights, "forecast_horizon_weights", None),
+            variance_weight=getattr(
+                loss_weights, "forecast_variance", 0.0),
+            horizon_weights=effective,
         )
+        return warning
 
     def reset_loss_normalizer(self) -> None:
         """Reset per-term scale calibration when a new phase begins."""
@@ -1683,6 +1783,10 @@ class TotalLoss(nn.Module):
             target_value = targets[modality]
             sequence_prediction = predictions.get(
                 f"{modality}_recon_sequence")
+            criteria = (getattr(self.loss_weights, "recon_loss_types", None)
+                        or {}).get(modality)
+            mix = (getattr(self.loss_weights, "recon_loss_mix", None)
+                   or {}).get(modality)
             if (target_value.dim() == 4
                     and sequence_prediction is not None):
                 forecast_weight = float(
@@ -1695,16 +1799,16 @@ class TotalLoss(nn.Module):
                         total_loss, forecast_value, forecast_weight,
                         f"forecast_{modality}", metrics)
                     metrics[f"forecast_{modality}"] = forecast_value.item()
-                    continue
+                    # An explicit reconstruction mix is the scale anchor for
+                    # generic signals. Keep it alongside forecast supervision;
+                    # modalities without a mix retain forecast-only behavior.
+                    if not mix:
+                        continue
             if target_value.dim() == 4:
                 target_value = target_value[:, -1]
             mask = targets.get(f"{modality}_mask")
             if mask is not None and mask.dim() == 4:
                 mask = mask[:, -1]
-            criteria = (getattr(self.loss_weights, "recon_loss_types", None)
-                        or {}).get(modality)
-            mix = (getattr(self.loss_weights, "recon_loss_mix", None)
-                   or {}).get(modality)
             if mix:
                 recon_value = self.recon_loss.mixed_loss(
                     predictions[pred_key], target_value, mix, mask=mask)

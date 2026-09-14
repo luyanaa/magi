@@ -15,7 +15,9 @@ from brain_moe_pinn.data import EEGDenoiseNetDataset, PairedBrainDataset
 from brain_moe_pinn.data.species_dataset import (
     SpeciesSignalDataset, build_species_dataloaders,
 )
-from brain_moe_pinn.training.losses import TotalLoss, VelocitySmoothnessLoss
+from brain_moe_pinn.training.losses import (
+    ReconstructionLoss, TotalLoss, VelocitySmoothnessLoss,
+)
 from brain_moe_pinn.training.training_loop import partition_generic_batch
 from brain_moe_pinn.training.training_phases import LossWeights
 
@@ -274,7 +276,6 @@ def test_total_loss_uses_composite_forecast_term():
     criterion = CompositeForecastLoss(horizon_weights=[1.0, 2.0, 3.0])
     value = criterion(prediction, target)
     assert torch.isfinite(value)
-
     weights = LossWeights(
         recon_extra={"calcium": 1.0}, forecast=1.0,
         forecast_horizon_weights=(1.0, 2.0, 3.0), sigreg=0.0)
@@ -288,6 +289,64 @@ def test_total_loss_uses_composite_forecast_term():
     )
     assert torch.isfinite(total)
     assert "forecast_calcium" in metrics
+
+def test_composite_forecast_can_enforce_log_variance():
+    from brain_moe_pinn.training.losses import CompositeForecastLoss
+
+    target = torch.randn(2, 2, 3, 32)
+    prediction = 0.25 * target
+    criterion = CompositeForecastLoss(
+        huber_weight=0.0, corr_diff_weight=0.0, variance_weight=1.0)
+    value = criterion(prediction, target)
+    expected = torch.stack([
+        ReconstructionLoss()(prediction[:, h], target[:, h],
+                             loss_type="log_variance")
+        for h in range(target.shape[1])
+    ]).mean()
+    assert torch.allclose(value, expected)
+    assert torch.isfinite(value)
+
+
+
+
+def test_forecast_keeps_mixed_scale_supervision():
+    from brain_moe_pinn.training.losses import (
+        CompositeForecastLoss, ReconstructionLoss,
+    )
+
+    prediction = torch.randn(2, 3, 2, 8)
+    target = torch.randn(2, 3, 2, 8)
+    mix = {
+        "correlation": 0.55,
+        "corr_diff": 0.20,
+        "wasserstein1": 0.25,
+    }
+    total_loss = TotalLoss(LossWeights(
+        recon_extra={"calcium": 1.0},
+        recon_loss_mix={"calcium": mix},
+        forecast=1.0,
+        forecast_horizon_weights=(1.0, 2.0, 3.0),
+        sigreg=0.0,
+    ))
+    total_loss.use_loss_normalization = False
+
+    total, metrics = total_loss(
+        {
+            "calcium_recon": prediction[:, -1],
+            "calcium_recon_sequence": prediction,
+        },
+        {"calcium": target},
+    )
+    expected = (
+        CompositeForecastLoss(horizon_weights=(1.0, 2.0, 3.0))(
+            prediction, target)
+        + ReconstructionLoss().mixed_loss(
+            prediction[:, -1], target[:, -1], mix)
+    )
+
+    assert "forecast_calcium" in metrics
+    assert "recon_calcium" in metrics
+    assert torch.allclose(total, expected)
 
 
 def test_cross_modal_alignment_requires_explicit_labels():

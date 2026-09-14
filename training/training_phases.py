@@ -58,7 +58,10 @@ class LossWeights:
     weight is separate: it is enabled only when the loader supplies an
     explicit ``(B, K, C, T)`` future target and the phase rolls out K states.
     The composite forecast combines robust signal error with first-difference
-    correlation, using optional horizon weights.
+    correlation and, when enabled, an explicit log-variance criterion that
+    prevents marginal scale collapse.
+    Runtime horizon-count mismatches fall back to equal weighting with a
+    warning so mixed data profiles do not drop forecast horizons.
 
     Structural terms are only steering terms when their inputs are observable:
     ``cross_modal`` and ``cross`` need explicit synchronized/async pair labels,
@@ -79,8 +82,8 @@ class LossWeights:
     recon_loss_types: Dict[str, str] = field(default_factory=dict)
                                     # modality -> single ReconstructionLoss
                                     # criterion ("mse" default; "correlation" /
-                                    # "corr_diff" / "huber" / "poisson" /
-                                    # "wasserstein1")
+                                    # "corr_diff" / "log_variance" / "huber" /
+                                    # "poisson" / "wasserstein1")
     recon_loss_mix: Dict[str, Dict[str, float]] = field(default_factory=dict)
                                     # modality -> criterion -> non-negative
                                     # mixture weight. The normalized mixture
@@ -89,6 +92,7 @@ class LossWeights:
     forecast: float = 0.0              # multi-horizon signal forecast
     forecast_huber: float = 1.0
     forecast_corr_diff: float = 1.0
+    forecast_variance: float = 0.0      # per-channel log-variance RMSE
     forecast_horizon_weights: Optional[Tuple[float, ...]] = None
     velocity_smooth: float = 0.0    # monitor: batch-axis TV; needs time axis
     generic_constraint: float = 0.0  # enforced by projection, not by penalty:
@@ -388,6 +392,7 @@ def get_stage_1_p3() -> TrainingPhase:
             forecast=1.0,
             forecast_huber=1.0,
             forecast_corr_diff=1.0,
+            forecast_variance=1.0,
             forecast_horizon_weights=(1.0, 0.5),
             cross_modal=0.0,
             velocity_smooth=0.02,
@@ -420,9 +425,9 @@ def get_stage_1_p4() -> TrainingPhase:
         name="Stage 1 P4: MoE Expansion",
         stage=TrainingStage.STAGE_1_P4,
         total_steps=50000,
-        learning_rate=5e-4,
-        min_lr=5e-4,
-        warmup_steps=1000,
+        learning_rate=1e-4,
+        min_lr=1e-4,
+        warmup_steps=0,
         batch_size=16,
         lr_schedule="flat",
         optimizer="adamw",
@@ -432,6 +437,7 @@ def get_stage_1_p4() -> TrainingPhase:
             forecast=1.0,
             forecast_huber=1.0,
             forecast_corr_diff=1.0,
+            forecast_variance=1.0,
             forecast_horizon_weights=(1.0, 0.5),
             cross_modal=0.0,
             velocity_smooth=0.0,
@@ -451,8 +457,7 @@ def get_stage_1_p4() -> TrainingPhase:
         ),
         rollout_steps=2,
         freeze_config=FreezeConfig(eeg_encoder=False, fmri_encoder=False),
-        description="Top-2 routing, E=8, LR 5e-4 flat",
-        router_tau=0.7,
+        description="Top-2 routing, E=8, LR 1e-4 flat",
     )
 
 
@@ -462,11 +467,11 @@ def get_stage_1_p5() -> TrainingPhase:
         name="Stage 1 P5: Physics-Inspired Constraints",
         stage=TrainingStage.STAGE_1_P5,
         total_steps=100000,
-        learning_rate=5e-4,
-        min_lr=1e-5,
-        warmup_steps=2000,
+        learning_rate=1e-4,
+        min_lr=1e-4,
+        warmup_steps=0,
         batch_size=16,
-        lr_schedule="cosine",
+        lr_schedule="flat",
         optimizer="adamw",
         loss_weights=LossWeights(
             recon_eeg=1.0,
@@ -474,6 +479,7 @@ def get_stage_1_p5() -> TrainingPhase:
             forecast=1.0,
             forecast_huber=1.0,
             forecast_corr_diff=1.0,
+            forecast_variance=1.0,
             forecast_horizon_weights=(1.0, 0.5),
             cross_modal=0.0,
             velocity_smooth=0.0,
@@ -493,7 +499,7 @@ def get_stage_1_p5() -> TrainingPhase:
         ),
         rollout_steps=2,
         freeze_config=FreezeConfig(eeg_encoder=False, fmri_encoder=False),
-        description="Physics-inspired constraints (degeneracy, dissipation proxy, spectrum); EPR/Jacobi logged as monitors",
+        description="Physics-inspired constraints (degeneracy, dissipation proxy, spectrum); EPR/Jacobi logged as monitors; LR 1e-4 flat",
     )
 
 
@@ -504,10 +510,10 @@ def get_stage_1_p6() -> TrainingPhase:
         stage=TrainingStage.STAGE_1_P6,
         total_steps=20000,
         learning_rate=1e-4,
-        min_lr=1e-5,
-        warmup_steps=500,
+        min_lr=1e-4,
+        warmup_steps=0,
         batch_size=16,
-        lr_schedule="cosine",
+        lr_schedule="flat",
         optimizer="adamw",
         loss_weights=LossWeights(
             recon_eeg=1.0,
@@ -515,6 +521,7 @@ def get_stage_1_p6() -> TrainingPhase:
             forecast=1.0,
             forecast_huber=1.0,
             forecast_corr_diff=1.0,
+            forecast_variance=1.0,
             forecast_horizon_weights=(1.0, 0.5),
             cross_modal=0.0,
             velocity_smooth=0.0,
@@ -535,7 +542,7 @@ def get_stage_1_p6() -> TrainingPhase:
         rollout_steps=2,
         max_seq_len_eeg=4096,
         freeze_config=FreezeConfig(eeg_encoder=False, fmri_encoder=False),
-        description="Sequence length 4096, LR restart to 1e-4",
+        description="Sequence length 4096, LR 1e-4 flat",
         router_tau=0.7,
     )
 

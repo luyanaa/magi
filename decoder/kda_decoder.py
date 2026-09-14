@@ -15,11 +15,11 @@ from typing import Optional, Dict, Tuple, List
 import math
 import warnings
 
-import sys
 try:
     import fla
+    from fla import KimiDeltaAttention
     FLA_AVAILABLE = True
-except ImportError as _e:
+except (ImportError, AttributeError) as _e:
     FLA_AVAILABLE = False
     KimiDeltaAttention = None
     print(f"[KDA Decoder] Warning: fla not available ({_e}). Using PyTorch fallback.")

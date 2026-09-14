@@ -206,11 +206,18 @@ Where $\tilde{\mathcal{L}}_\ell$ is an EMA-normalized version of each steering
 loss (mean/std calibrated over warmup and frozen thereafter).  Dense stages
 steer EEG/fMRI reconstruction, dissipation, MoE load balancing, grassmannian
 regularization, spectral slope, band power, and SIGReg.  P3-P6 additionally
-declare two-horizon forecast supervision.  Stage 2 steers labelled cross-modal
-and HRF alignment; Stage 3 leaves action, replay, and intervention-response
-terms disabled until their explicit contracts are supplied.
+declare multi-horizon forecast supervision.  If a phase's configured horizon
+weights do not match the data profile's runtime rollout, the trainer keeps all
+horizons with equal weights and emits a warning.  Stage 2 steers labelled
+cross-modal and HRF alignment; Stage 3 leaves action, replay, and
+intervention-response terms disabled until their explicit contracts are
+supplied.
 
 **Reconstruction losses** (EEG, fMRI, MEG): Standard MSE between decoder output and input signal. These are the primary training signal — all other losses are auxiliary.
+For generic signals, an explicit `recon_loss_mix` remains active alongside
+multi-horizon forecast supervision; its marginal-scale term prevents
+correlation-only or low-variance forecasts from becoming the objective's
+cheapest solution.
 
 **Structured-dynamics losses:**
 - *Degeneracy constraint*: pointwise residuals in $L\nabla S$ and $M\nabla E$. These are **enforced by projection, not by penalty**, so the residual is identically zero and `generic_constraint` carries weight 0 in every phase: $(P_S L P_S)\nabla S = P_S L (P_S \nabla S) = 0$ because $P_S \nabla S = 0$, and likewise $(P_E \mathrm{diag}(M) P_E)\nabla E = 0$. The weight only becomes live if `apply_degeneracy_projection` is disabled. It remains a local algebraic statement, not a proof of global GENERIC validity or of the Jacobi identity.
