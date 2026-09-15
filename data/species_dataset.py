@@ -35,6 +35,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from brain_moe_pinn.runtime.device_utils import pin_memory_supported
+
 _FORMATS = (".npy", ".npz", ".pth")
 _STR_KEYS = ("sample_id", "subject", "session", "origin", "condition")
 _META_KEYS = _STR_KEYS + ("dt",)
@@ -134,6 +136,20 @@ def read_manifest(path: Optional[Path]) -> List[Dict[str, str]]:
     return rows
 
 
+def _row_source(row: Mapping[str, str]) -> str:
+    """Ladder source of a merged row.
+
+    ``data/merge_c_elegans.py`` writes ``<source_prefix>__<source_id>`` for
+    every unified sample, so the prefix carries the source. A row that was not
+    merged keeps its own ``source_dataset`` column, and an unqualified row
+    returns an empty label.
+    """
+    sample_id = str(row.get("sample_id", ""))
+    if "__" in sample_id:
+        return sample_id.split("__", 1)[0]
+    return str(row.get("source_dataset", ""))
+
+
 class SpeciesSignalDataset(Dataset):
     """Manifest-driven multi-modality signal dataset.
 
@@ -170,6 +186,7 @@ class SpeciesSignalDataset(Dataset):
             Mapping[str, Mapping[str, float]]] = None,
         rng_seed: int = 0,
         expected_rate_hz: Optional[float] = None,
+        control_align: bool = False,
     ):
         if not modalities:
             raise ValueError("at least one modality is required")
@@ -215,6 +232,7 @@ class SpeciesSignalDataset(Dataset):
             raise ValueError("expected_rate_hz must be positive")
         self.rate_tolerance = float(rate_tolerance)
         self.strict_rate = bool(strict_rate)
+        self.control_align = bool(control_align)
         self.normalization = str(normalization or "none").lower()
         if self.normalization not in {"none", "global_zscore"}:
             raise ValueError(
@@ -395,14 +413,43 @@ class SpeciesSignalDataset(Dataset):
                 starts.update(range(a, b - win + 1))
         return sorted(starts)
 
-    def _pick_start_time(self, start_times: List[float]) -> float:
+    def _pick_start_time(self, start_times: List[float],
+                         modality_info: Optional[List[Dict[str, Any]]] = None,
+                         ) -> float:
         if not start_times:
             return 0.0
         if not self.random_windows:
+            if self.control_align and modality_info:
+                onset = self._control_onset_seconds(modality_info)
+                if onset is not None:
+                    later = [value for value in start_times
+                             if value >= onset - 1e-9]
+                    if later:
+                        return float(later[0])
+                    return float(start_times[-1])
             return float(start_times[0])
         idx = int(torch.randint(
             len(start_times), (1,), generator=self.rng).item())
         return float(start_times[idx])
+
+    def _control_onset_seconds(
+            self, modality_info: List[Dict[str, Any]]) -> Optional[float]:
+        """First frame with a non-zero control value, in seconds.
+
+        Intervention evaluation must score the window that *contains* the
+        drive; the first eligible window of a recording is typically
+        pre-stimulus (measured: Randi pulses start at 19-126 s, Toyoshima
+        salt at 30-630 s).
+        """
+        for info in modality_info:
+            if self.roles.get(info["modality"]) != "control":
+                continue
+            data = info["data"]
+            active = (data != 0).any(dim=0).nonzero()
+            if not active.numel():
+                return None
+            return float(int(active[0].item()) / max(info["rate"], 1e-12))
+        return None
 
     @staticmethod
     def _slice_window(
@@ -522,7 +569,7 @@ class SpeciesSignalDataset(Dataset):
             raise ValueError(
                 f"modalities in sample {sample_id!r} have no synchronized "
                 "physical-time windows")
-        chosen = self._pick_start_time(valid_times)
+        chosen = self._pick_start_time(valid_times, modality_info)
         chosen_idx = min(
             range(len(valid_times)),
             key=lambda i: abs(valid_times[i] - chosen))
@@ -895,6 +942,8 @@ def build_species_dataloaders(
     pin_memory: bool = False,
     persistent_workers: bool = False,
     prefetch_factor: int = 2,
+    sources: Optional[Sequence[str]] = None,
+    control_align: bool = False,
 ) -> Union[Tuple[DataLoader, DataLoader],
            Tuple[DataLoader, DataLoader, DataLoader]]:
     """Train/val(/test) loaders with group-preserving splits.
@@ -914,6 +963,12 @@ def build_species_dataloaders(
     single-rate contract of the caller's profile. Each species trains its own
     model against its own ladder; the *code path* is shared, the model instance
     is not.
+
+    ``sources`` keeps only rows of the named ladder sources, matched on the
+    merged ``<source>__<sample>`` id prefix that ``data/merge_c_elegans.py``
+    writes. Federated corpora use it for a per-source evaluation profile: a
+    source whose subjects are too few to reach the validation split otherwise
+    contributes a single held-out row.
     """
     if seq_len is None and seq_seconds is None:
         seq_len = 256
@@ -947,6 +1002,12 @@ def build_species_dataloaders(
             roles=roles, species=species,
             expected_rate_hz=expected_rate_hz, strict_rate=strict_rate)
         rows = [dict(r) for r in probe.rows]
+    if sources:
+        wanted = {str(source) for source in sources}
+        rows = [row for row in rows if _row_source(row) in wanted]
+        if not rows:
+            raise ValueError(
+                f"no rows under {root} match sources {sorted(wanted)}")
     train_rows, val_rows, test_rows = split_rows(
         rows, by=split_by, seed=seed, val_frac=val_frac, test_frac=test_frac)
     if normalization_mode == "global_zscore":
@@ -956,12 +1017,17 @@ def build_species_dataloaders(
     def loader(rowset, do_shuffle):
         ds = SpeciesSignalDataset(
             **{**base, "rows": rowset, "rng_seed": seed,
-               "random_windows": bool(do_shuffle)})
+               "random_windows": bool(do_shuffle),
+               "control_align": control_align})
         drop = do_shuffle and len(rowset) >= batch_size
         loader_kwargs = dict(
             batch_size=batch_size, shuffle=do_shuffle,
             num_workers=num_workers, drop_last=drop,
-            collate_fn=species_collate, pin_memory=pin_memory)
+            collate_fn=species_collate,
+            # Profiles declare pin_memory for the CUDA training host; the
+            # device module decides whether it does anything here (MPS/CPU
+            # hosts would otherwise warn on every loader construction).
+            pin_memory=pin_memory and pin_memory_supported())
         if num_workers > 0:
             loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
             loader_kwargs["persistent_workers"] = bool(persistent_workers)

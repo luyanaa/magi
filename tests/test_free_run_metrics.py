@@ -204,3 +204,95 @@ def test_pareto_selection_returns_non_dominated_compromise():
     selected = select_pareto_checkpoint(reports)
     assert selected["pareto_checkpoints"] == ["a", "b"]
     assert selected["compromise_checkpoint"] in {"a", "b"}
+
+def test_fixed_basis_loader_validates_names_and_common_baseline_summary(tmp_path):
+    from tools.tderica_free_run import (
+        _compare_metric_reports, _load_fixed_basis,
+    )
+
+    basis_path = tmp_path / "basis.npz"
+    np.savez(
+        basis_path,
+        coeffEmbed2=np.zeros((2, 3, 2)),
+        strNamesOrdered=np.array(["A", "B"]),
+    )
+    coeff, names = _load_fixed_basis(basis_path)
+    assert coeff.shape == (2, 3, 2)
+    assert names == ["A", "B"]
+
+    model = {
+        "native": {
+            "corr_matrix_mse": 0.2,
+            "autocorr": {"mse": 0.3},
+            "variance_ratio": {"log_rmse": 0.4},
+        },
+        "tderica": {
+            "distribution": {
+                "wasserstein_global": 0.2,
+                "wasserstein_per_component": [0.1, 0.3],
+                "kl_divergence": [2.0, 4.0],
+            },
+            "time_alignment": {
+                "cosine_diagonal_mean": 0.5,
+                "cosine_global_mean": 0.6,
+            },
+        },
+    }
+    baseline = {
+        "native": {
+            "corr_matrix_mse": 0.5,
+            "autocorr": {"mse": 0.6},
+            "variance_ratio": {"log_rmse": 0.7},
+        },
+        "tderica": {
+            "distribution": {
+                "wasserstein_global": 0.8,
+                "wasserstein_per_component": [0.7, 0.9],
+                "kl_divergence": [6.0, 8.0],
+            },
+            "time_alignment": {
+                "cosine_diagonal_mean": 0.2,
+                "cosine_global_mean": 0.3,
+            },
+        },
+    }
+    comparison = _compare_metric_reports(model, baseline)
+    assert comparison["projection_contract"] == "same_fixed_basis"
+    assert comparison["model_minus_baseline"]["tderica_w1"] == pytest.approx(-0.6)
+    assert comparison["model_minus_baseline"]["tderica_kl_mean"] == pytest.approx(-4.0)
+    assert comparison["model_minus_baseline"]["tderica_cosine_global_mean"] == pytest.approx(0.3)
+
+    duplicate_path = tmp_path / "duplicate.npz"
+    np.savez(
+        duplicate_path,
+        coeffEmbed2=np.zeros((2, 3, 2)),
+        strNamesOrdered=np.array(["A", "A"]),
+    )
+    with pytest.raises(ValueError, match="unique"):
+        _load_fixed_basis(duplicate_path)
+
+    nonfinite_path = tmp_path / "nonfinite.npz"
+    np.savez(
+        nonfinite_path,
+        coeffEmbed2=np.array([[[np.nan, 0.0], [0.0, 0.0], [0.0, 0.0]]]),
+        strNamesOrdered=np.array(["A", "B"]),
+    )
+    with pytest.raises(ValueError, match="finite"):
+        _load_fixed_basis(nonfinite_path)
+
+def test_fixed_projection_uses_shared_finite_channel_mask():
+    from tools.tderica_free_run import (
+        _fixed_components, _fixed_valid_channels,
+    )
+
+    coeff = np.zeros((1, 3, 2))
+    coeff[0, :, 0] = 1.0
+    signal = np.arange(20, dtype=float).reshape(10, 2)
+    signal[:, 1] = np.nan
+    toolbox = ROOT.parent / "TDE-RICA"
+    valid = _fixed_valid_channels(signal, coeff, toolbox)
+    assert valid.tolist() == [True, False]
+    components = _fixed_components(
+        signal, coeff, toolbox, valid_channels=valid)
+    assert components.shape == (8, 1)
+    assert np.isfinite(components).all()

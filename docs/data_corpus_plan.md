@@ -578,10 +578,18 @@ The downloaded Randi text export is now handled by
 `data/ingest_randi.py`. It validates the 0.5 s source clock, emits a
 15-second three-level pulse from the notebook's event files, masks
 out-of-range fluorescence frame-by-frame, preserves source labels and event
-JSON, and writes a 281-position target vocabulary. The supplied labels are
-partially populated and contain duplicates, so this adapter declares targets
-as `recording_local_cell` rather than making an unsupported cross-recording
-neuron-identity claim. Use `configs/species/c_elegans_randi.json` with
+JSON, and writes a 281-position target vocabulary. The legacy default
+(`min_value=0`, `max_value=200`, `scale=minmax`) reproduces the supplied
+notebook's model-input representation; it is not a physical fluorescence
+calibration and its full-recording min/max uses future frames if applied before
+forecast splits. For leakage-safe preprocessing, use
+`scale=prefix_minmax` with an explicit calibration prefix; for source-value
+analysis, use `scale=none` with explicit bounds. Neither path supplies the
+external indicator and membrane calibration required to infer absolute mV or
+total current. The supplied labels are partially populated and contain
+duplicates, so this adapter declares targets as `recording_local_cell` rather
+than making an unsupported cross-recording neuron-identity claim. Use
+`configs/species/c_elegans_randi.json` with
 `configs/data/c_elegans_randi.json`; `opto` has width 282 (waveform plus 281
 target-gated features) and sparse controls use `peak` reduction.
 

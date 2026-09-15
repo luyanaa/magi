@@ -36,11 +36,22 @@ __all__ = [
     "IMAGING_METHODS",
     "REPORTERS",
     "READOUT_KINDS",
+    "OBSERVED_SPACES",
     "resolve_sensor",
     "sensor_spec_from_profile",
 ]
 
 READOUT_KINDS = ("dff", "ratio", "absolute", "voltage", "static", "bold")
+OBSERVED_SPACES = (
+    "native",
+    "raw_fluorescence",
+    "fraction",
+    "dff",
+    "ratio",
+    "standardized",
+    "voltage",
+    "bold",
+)
 
 
 @dataclass(frozen=True)
@@ -335,7 +346,7 @@ ELECTRICAL_REPORTER = Reporter(
 
 @dataclass(frozen=True)
 class SensorSpec:
-    """A profile's binding of (modality, imaging method, reporter, readout)."""
+    """A profile's binding of sensor, representation, and filtering state."""
 
     modality: str
     imaging: ImagingMethod
@@ -343,6 +354,10 @@ class SensorSpec:
     readout: str
     calibration_required: bool
     notes: tuple = field(default_factory=tuple)
+    observed_space: str = "native"
+    """Numeric space supplied to the model (not necessarily physical units)."""
+    already_filtered: bool = False
+    """Whether acquisition/preprocessing already applied the observation filter."""
     hrf: Optional[Mapping[str, float]] = None
     """Haemodynamic initialisation for a BOLD readout (Friston's Table 1
     priors unless the profile overrides them); the emission then *learns* the
@@ -380,6 +395,8 @@ class SensorSpec:
             "imaging": self.imaging.name,
             "reporter": self.reporter.name,
             "readout": self.readout,
+            "observed_space": self.observed_space,
+            "already_filtered": self.already_filtered,
             "localization": self.reporter.localization,
             "hrf": dict(self.hrf) if self.hrf else None,
             "emission_tau_s": self.emission_tau_s,
@@ -436,6 +453,21 @@ def resolve_sensor(modality: str, spec: Optional[Mapping[str, Any]]) -> SensorSp
     if readout not in READOUT_KINDS:
         raise ValueError(
             f"readout {readout!r} must be one of {READOUT_KINDS}")
+    default_observed_space = {
+        "dff": "dff",
+        "ratio": ("standardized" if reporter.name == "yc2.60" else "ratio"),
+        "absolute": "raw_fluorescence",
+        "voltage": "voltage",
+        "bold": "bold",
+        "static": "native",
+    }.get(readout, "native")
+    observed_space = str(
+        spec.get("observed_space", default_observed_space))
+    if observed_space not in OBSERVED_SPACES:
+        raise ValueError(
+            f"observed_space {observed_space!r} must be one of "
+            f"{OBSERVED_SPACES}")
+    already_filtered = bool(spec.get("already_filtered", False))
     if readout == "bold" and reporter.family != "hemodynamic":
         raise ValueError(
             f"modality {modality!r}: readout 'bold' requires the haemodynamic "
@@ -470,6 +502,10 @@ def resolve_sensor(modality: str, spec: Optional[Mapping[str, Any]]) -> SensorSp
             f"cannot back a dynamic readout ({readout!r}); declare "
             f"readout='static' and exclude it from the dynamics contract")
     notes = []
+    if already_filtered:
+        notes.append(
+            "input includes acquisition/preprocessing low-pass and aliasing; "
+            "the emission remains the single latent-to-observed filter pass")
     if reporter.localization == "nuclear" and reporter.tau_off_s is None:
         notes.append("nuclear localisation adds an unmeasured slow component: "
                      "fit the emission tau instead of importing it")
@@ -488,6 +524,7 @@ def resolve_sensor(modality: str, spec: Optional[Mapping[str, Any]]) -> SensorSp
     return SensorSpec(
         modality=modality, imaging=imaging, reporter=reporter, readout=readout,
         calibration_required=calibration_required, notes=tuple(notes),
+        observed_space=observed_space, already_filtered=already_filtered,
         hrf=dict(hrf) if hrf else None)
 
 

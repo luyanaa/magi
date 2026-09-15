@@ -38,6 +38,7 @@ from .core.observation_adapters import (
     GenericSignalAdapter,
     ChannelSignalAdapter,
     SignalReconstructionHead,
+    preserve_signal_scale,
 )
 from .encoders.hub_fusion import HubTokenFusion, CrossModalAdapter, SlowManifoldProjector, LatentHRFBridge
 from .core.hebbian_memory import (
@@ -846,6 +847,13 @@ class BrainMoEPINN(nn.Module):
                         decoded,
                         dt=(frame_dt if frame_dt is not None
                             else self.latent_dt))
+                # The observable reconstruction must stay in the raw units
+                # supplied by the loader. Correlation-style supervision is
+                # intentionally gain-invariant, so anchor the decoder's
+                # per-channel gain to the valid context before exposing or
+                # supervising the prediction.
+                decoded = preserve_signal_scale(
+                    decoded, signals[modality], masks.get(modality))
                 decoded_steps.append(decoded)
             if emission is not None:
                 result[f"{modality}_emission"] = emission.parameter_summary(
@@ -980,6 +988,7 @@ class BrainMoEPINN(nn.Module):
         # --- Slow Manifold Projector + Latent HRF Bridge ---
         # Operate on full token sequences (not just hub tokens)
         eeg_slow = self.slow_projector(eeg_tokens)   # (B, L_eeg, 256)
+        fmri_slow = self.slow_projector(fmri_tokens)  # (B, L_fmri, 256)
         z_pred_fmri_slow, hrf_align_loss = self.latent_hrf(
             eeg_slow, fmri_slow, subject_features=subject_features,
             pair_labels=cross_modal_labels)
@@ -1007,6 +1016,8 @@ class BrainMoEPINN(nn.Module):
         hrf_residual = self.slow_projector.inverse_project(z_pred_fmri_slow.mean(dim=1))
         z_t = z_global
         states = [z_t] if return_all else []
+        control_terms = []
+        delta_z_seq = []
         emit_sequences = bool(return_sequences or num_steps > 1)
         rollout_states = []
         use_noise = (self.noise_mode == "always"

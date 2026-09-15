@@ -8,6 +8,11 @@ reference representation fitted only on each sample's context window. The
 per-sample context fit avoids asserting cross-source neuron identity in the
 unified federated ladder; for a fixed pre-fit motif basis, use
 ``tools/tderica_free_run.py`` with that basis externally.
+
+Each sample is labelled with its ladder source (``toyoshima_salt``,
+``randi_pumpprobe``, ``hf_activity``) and carries per-horizon native metrics,
+so one run yields the source x horizon breakdown without re-running the
+loader per source.
 """
 from __future__ import annotations
 
@@ -52,19 +57,41 @@ def _device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def _load_checkpoint(model: torch.nn.Module, path: Path, device: torch.device) -> Dict[str, Any]:
+def _load_checkpoint(model: torch.nn.Module, path: Path, device: torch.device,
+                     config_path: Optional[Path] = None) -> Dict[str, Any]:
     state = torch.load(path, map_location=device, weights_only=False)
     model_state = state.get("model_state", state.get("state_dict"))
     if not isinstance(model_state, dict):
         raise ValueError(f"checkpoint has no model_state/state_dict: {path}")
-    incompatible = model.load_state_dict(model_state, strict=False)
-    return {
+    info: Dict[str, Any] = {
         "checkpoint_step": state.get("step"),
         "checkpoint_phase": state.get("phase"),
-        "missing_keys": list(incompatible.missing_keys),
-        "unexpected_keys": list(incompatible.unexpected_keys),
         "world_size": state.get("world_size"),
+        "config_sha256": state.get("config_sha256"),
+        "config_path": state.get("config_path"),
     }
+    if config_path is not None:
+        # A checkpoint and a species profile are chosen independently; the
+        # stored fingerprint makes the pairing checkable instead of assumed.
+        # Report it before load_state_dict so a shape error is not the first
+        # (and least informative) symptom of the wrong profile.
+        import hashlib
+        candidate = Path(config_path).resolve()
+        info["evaluated_config_path"] = str(candidate)
+        info["evaluated_config_sha256"] = hashlib.sha256(
+            candidate.read_bytes()).hexdigest()
+        stored = info.get("config_sha256")
+        info["config_match"] = (
+            None if not stored
+            else bool(stored == info["evaluated_config_sha256"]))
+        if info["config_match"] is False:
+            print("[config] WARNING: checkpoint was produced by a different "
+                  f"profile ({info.get('config_path')}); evaluating "
+                  f"{candidate} anyway", flush=True)
+    incompatible = model.load_state_dict(model_state, strict=False)
+    info["missing_keys"] = list(incompatible.missing_keys)
+    info["unexpected_keys"] = list(incompatible.unexpected_keys)
+    return info
 
 
 def _as_per_sample_dt(value: Any, batch_size: int, device: torch.device) -> torch.Tensor:
@@ -119,6 +146,99 @@ def _aggregate_numeric_mean(reports: Iterable[Dict[str, Any]], path: Tuple[str, 
     }
 
 
+
+
+_SOURCE_PREFIXES = {
+    "toyoshima_salt": "Toyoshima",
+    "randi_pumpprobe": "Randi",
+    "hf_activity": "Simeon",
+}
+
+
+def _source_label(sample_id: str, origin: str) -> str:
+    """Recover the ladder source of a merged row.
+
+    ``data/merge_c_elegans.py`` writes ``<source_prefix>__<source_id>`` as the
+    unified sample id, so the prefix is the authoritative source label; the
+    origin string is only a fallback for rows assembled by other tooling.
+    """
+    prefix = str(sample_id).split("__", 1)[0]
+    if prefix in _SOURCE_PREFIXES:
+        return prefix
+    text = f"{sample_id} {origin}"
+    for label, marker in _SOURCE_PREFIXES.items():
+        if marker.lower() in text.lower():
+            return label
+    return "unknown"
+
+
+def _horizon_reports(real_all: np.ndarray, generated_all: np.ndarray,
+                     rollouts: int) -> List[Dict[str, Any]]:
+    """Per-horizon native metrics for the ``K`` forecast windows.
+
+    ``real_all``/``generated_all`` are ``(K*T, C)`` in horizon order, so each
+    horizon is one contiguous ``T``-frame block. Reporting them separately is
+    what makes the stage/source/horizon table possible: a single concatenated
+    score cannot show whether horizon 3 collapsed while horizon 1 held.
+    """
+    frames_total = real_all.shape[0]
+    if rollouts < 1 or frames_total % rollouts:
+        raise ValueError(
+            f"{frames_total} frames do not divide into {rollouts} horizons")
+    horizon_frames = frames_total // rollouts
+    entries: List[Dict[str, Any]] = []
+    for horizon in range(rollouts):
+        start = horizon * horizon_frames
+        stop = start + horizon_frames
+        real = real_all[start:stop]
+        generated = generated_all[start:stop]
+        if real.shape[0] < 3:
+            continue
+        real_std = np.std(real, axis=0)
+        generated_std = np.std(generated, axis=0)
+        entries.append({
+            "horizon": horizon + 1,
+            "frames": int(real.shape[0]),
+            "raw_std_ratio": float(
+                generated_std.mean() / max(real_std.mean(), 1e-12)),
+            "raw_std_ratio_median": float(np.median(
+                generated_std / np.maximum(real_std, 1e-12))),
+            "native": run_free_run_suite(real, generated),
+        })
+    return entries
+
+
+def _group_aggregate(reports: Iterable[Dict[str, Any]],
+                     paths: Dict[str, Tuple[str, ...]]) -> Dict[str, Any]:
+    return {name: _aggregate_numeric_mean(reports, path)
+            for name, path in paths.items()}
+
+
+def _horizon_aggregate(reports: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate per-horizon native metrics across samples."""
+    buckets: Dict[int, List[Dict[str, Any]]] = {}
+    for report in reports:
+        for entry in report.get("horizons", ()) or ():
+            buckets.setdefault(int(entry["horizon"]), []).append(entry)
+    paths = {
+        "raw_std_ratio": ("raw_std_ratio",),
+        "raw_std_ratio_median": ("raw_std_ratio_median",),
+        "native_corr_matrix_mse": ("native", "corr_matrix_mse"),
+        "native_autocorr_mse": ("native", "autocorr", "mse"),
+        "native_variance_log_rmse": ("native", "variance_ratio", "log_rmse"),
+    }
+    return {
+        str(horizon): {"n": len(entries),
+                       "metrics": _group_aggregate(entries, paths)}
+        for horizon, entries in sorted(buckets.items())
+    }
+
+
+def _first(value: Any, default: Any) -> Any:
+    """First element of a batched metadata field (species batches are lists)."""
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else default
+    return default if value is None else value
 
 
 def _lag1(values: np.ndarray) -> Optional[float]:
@@ -201,7 +321,8 @@ def main() -> None:
     device = _device(args.device)
     experiment_config = BrainMoEPINNConfig.from_file(str(args.config))
     model = experiment_config.to_model().to(device).eval()
-    checkpoint_info = _load_checkpoint(model, args.checkpoint, device)
+    checkpoint_info = _load_checkpoint(
+        model, args.checkpoint, device, config_path=args.config)
 
     from train import build_data_loaders
     loaders = build_data_loaders(args.data)
@@ -210,6 +331,7 @@ def main() -> None:
         raise ValueError(f"requested split {args.split!r} is unavailable")
 
     reports: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
     if args.save_arrays is not None:
         args.save_arrays.mkdir(parents=True, exist_ok=True)
 
@@ -252,7 +374,20 @@ def main() -> None:
             target_mask = _concat_masks(future_mask[0])
             valid_channels = target_mask.all(axis=0)
             if int(valid_channels.sum()) < 2:
-                raise ValueError(f"sample {sample_index} has fewer than two fully observed future channels")
+                # A window whose future frames are masked out cannot be scored.
+                # Large heterogeneous audits contain such rows, so they are
+                # recorded as skips (and counted in the report) instead of
+                # aborting the whole run; the model itself is never excused.
+                skipped.append({
+                    "index": sample_index,
+                    "sample_id": str(_first(batch.get("sample_id"), sample_index)),
+                    "reason": f"{int(valid_channels.sum())} fully observed "
+                              "future channels",
+                })
+                if len(skipped) == 1:
+                    print(f"[skip] sample {sample_index}: "
+                          f"{skipped[-1]['reason']}", flush=True)
+                continue
             context_all = current[0].detach().float().cpu().numpy().T
             context_mask_np = context_mask[0].detach().bool().cpu().numpy().T
             context_valid = context_mask_np[:, valid_channels].all(axis=0)
@@ -290,11 +425,13 @@ def main() -> None:
             persistence_report = tderica_biological_report(
                 real, persistence, dt_s=frame_dt_s, include_d3=False,
                 tderica_path=str(args.tderica))
-            sample_id = batch.get("sample_id", [str(sample_index)])
-            if isinstance(sample_id, (list, tuple)):
-                sample_id = sample_id[0]
+            sample_id = _first(batch.get("sample_id"), str(sample_index))
+            origin = _first(batch.get("origin"), "")
+            subject = _first(batch.get("subject"), "")
             reports.append({
                 "index": sample_index, "sample_id": str(sample_id),
+                "origin": str(origin), "subject": str(subject),
+                "source": _source_label(str(sample_id), str(origin)),
                 "channels_scored": int(real.shape[1]),
                 "channels_available": int(real_all.shape[1]),
                 "frames": int(real.shape[0]), "frame_dt_s": frame_dt_s,
@@ -302,6 +439,7 @@ def main() -> None:
                 "raw_std_ratio": std_ratio,
                 "raw_std_ratio_median": std_ratio_median,
                 "generated_tail_std_ratio": generated_tail_ratio,
+                "horizons": _horizon_reports(real_all, generated_all, args.rollout),
                 "model": tderica_report, "persistence": persistence_report,
             })
             if args.save_arrays is not None:
@@ -367,18 +505,30 @@ def main() -> None:
             "motif_roughness_mean": ("model", "motif_roughness_mean"),
             "motif_spatial_coherence_mean": ("model", "motif_spatial_coherence_mean"),
         })
+    by_source: Dict[str, List[Dict[str, Any]]] = {}
+    for report in reports:
+        by_source.setdefault(str(report.get("source", "unknown")), []).append(report)
     output = {
         "checkpoint": str(args.checkpoint), "split": args.split,
         "device": str(device), "rollout_windows": args.rollout,
         "n_samples": len(reports), "tderica_context_fit": not args.no_tderica_fit,
         "checkpoint_info": checkpoint_info,
-        "aggregate": {name: _aggregate_numeric_mean(reports, path) for name, path in aggregate_paths.items()},
+        "n_skipped": len(skipped),
+        "skipped": skipped,
+        "aggregate": _group_aggregate(reports, aggregate_paths),
+        "aggregate_by_source": {
+            source: {"n_samples": len(group),
+                     "metrics": _group_aggregate(group, aggregate_paths)}
+            for source, group in sorted(by_source.items())
+        },
+        "aggregate_by_horizon": _horizon_aggregate(reports),
         "samples": reports,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(output, indent=2, default=_json_default) + "\n")
     print(json.dumps({"output": str(args.output), "n_samples": len(reports),
-                      "device": str(device), "aggregate": output["aggregate"]}, indent=2))
+                      "n_skipped": len(skipped), "device": str(device),
+                      "aggregate": output["aggregate"]}, indent=2))
 
 
 if __name__ == "__main__":

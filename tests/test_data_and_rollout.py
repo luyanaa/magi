@@ -16,7 +16,8 @@ from brain_moe_pinn.data.species_dataset import (
     SpeciesSignalDataset, build_species_dataloaders,
 )
 from brain_moe_pinn.training.losses import (
-    ReconstructionLoss, TotalLoss, VelocitySmoothnessLoss,
+    ReconstructionLoss, RolloutAutocorrelationLoss, TotalLoss,
+    VelocitySmoothnessLoss,
 )
 from brain_moe_pinn.training.training_loop import partition_generic_batch
 from brain_moe_pinn.training.training_phases import LossWeights
@@ -289,6 +290,34 @@ def test_total_loss_uses_composite_forecast_term():
     )
     assert torch.isfinite(total)
     assert "forecast_calcium" in metrics
+
+
+def test_rollout_autocorrelation_loss_matches_concatenated_horizons():
+    torch.manual_seed(0)
+    target = torch.randn(2, 3, 2, 16)
+    criterion = RolloutAutocorrelationLoss(max_lag=6)
+
+    assert torch.allclose(criterion(target, target), torch.zeros(()), atol=1e-7)
+    shifted = torch.roll(target, shifts=3, dims=-1)
+    assert criterion(shifted, target).item() > 1e-8
+
+    total_loss = TotalLoss(LossWeights(
+        recon_extra={"calcium": 1.0},
+        forecast=1.0,
+        forecast_autocorr=0.5,
+        forecast_horizon_weights=(1.0, 1.0, 1.0),
+        sigreg=0.0,
+    ))
+    total_loss.use_loss_normalization = False
+    total, metrics = total_loss(
+        {
+            "calcium_recon": shifted[:, -1],
+            "calcium_recon_sequence": shifted,
+        },
+        {"calcium": target},
+    )
+    assert torch.isfinite(total)
+    assert "forecast_autocorr_calcium" in metrics
 
 def test_composite_forecast_can_enforce_log_variance():
     from brain_moe_pinn.training.losses import CompositeForecastLoss

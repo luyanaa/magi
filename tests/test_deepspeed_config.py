@@ -14,9 +14,9 @@ import pytest
 
 from brain_moe_pinn.training.training_loop import (
     _PRECISION_DTYPES,
+    _enable_deepspeed_gradient_overflow_check,
     apply_precision,
 )
-
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 SHIPPED = [
     "ds_config_zero2.json",
@@ -57,6 +57,8 @@ def test_none_precision_preserves_config():
     assert apply_precision(cfg, None) == cfg
 
 
+
+
 def test_precision_does_not_mutate_input():
     cfg = _load("ds_config_zero2.json")
     before = json.dumps(cfg, sort_keys=True)
@@ -86,3 +88,19 @@ def test_unknown_precision_is_rejected():
 
 def test_precision_is_a_choice_of_exactly_two():
     assert sorted(_PRECISION_DTYPES) == ["bf16", "fp16"]
+
+
+def test_overflow_guard_preserves_autocast_and_enables_zero_check():
+    class Optimizer:
+        check_grad_overflow = False
+
+        @staticmethod
+        def check_overflow():
+            return None
+
+    class Engine:
+        optimizer = Optimizer()
+
+    engine = Engine()
+    assert _enable_deepspeed_gradient_overflow_check(engine) is True
+    assert engine.optimizer.check_grad_overflow is True

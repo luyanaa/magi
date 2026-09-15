@@ -58,10 +58,11 @@ class LossWeights:
     weight is separate: it is enabled only when the loader supplies an
     explicit ``(B, K, C, T)`` future target and the phase rolls out K states.
     The composite forecast combines robust signal error with first-difference
-    correlation and, when enabled, an explicit log-variance criterion that
-    prevents marginal scale collapse.
-    Runtime horizon-count mismatches fall back to equal weighting with a
-    warning so mixed data profiles do not drop forecast horizons.
+    correlation, when enabled an explicit log-variance criterion, and an
+    optional rollout autocorrelation criterion that compares the concatenated
+    temporal horizons. Runtime horizon-count mismatches are configuration
+    errors. Data profiles resolve the rollout count and explicit horizon
+    weights before training.
 
     Structural terms are only steering terms when their inputs are observable:
     ``cross_modal`` and ``cross`` need explicit synchronized/async pair labels,
@@ -93,6 +94,7 @@ class LossWeights:
     forecast_huber: float = 1.0
     forecast_corr_diff: float = 1.0
     forecast_variance: float = 0.0      # per-channel log-variance RMSE
+    forecast_autocorr: float = 0.0      # concatenated rollout autocorrelation
     forecast_horizon_weights: Optional[Tuple[float, ...]] = None
     velocity_smooth: float = 0.0    # monitor: batch-axis TV; needs time axis
     generic_constraint: float = 0.0  # enforced by projection, not by penalty:
@@ -374,7 +376,7 @@ def get_stage_1_p2() -> TrainingPhase:
 
 
 def get_stage_1_p3() -> TrainingPhase:
-    """Stage 1 P3: Supervise two explicit future windows."""
+    """Stage 1 P3: Supervise profile-defined future windows."""
     return TrainingPhase(
         name="Stage 1 P3: Multi-Horizon Forecasting",
         stage=TrainingStage.STAGE_1_P3,
@@ -509,8 +511,8 @@ def get_stage_1_p6() -> TrainingPhase:
         name="Stage 1 P6: Long-Context Expansion",
         stage=TrainingStage.STAGE_1_P6,
         total_steps=20000,
-        learning_rate=1e-4,
-        min_lr=1e-4,
+        learning_rate=5e-5,
+        min_lr=5e-5,
         warmup_steps=0,
         batch_size=16,
         lr_schedule="flat",
@@ -522,9 +524,10 @@ def get_stage_1_p6() -> TrainingPhase:
             forecast_huber=1.0,
             forecast_corr_diff=1.0,
             forecast_variance=1.0,
+            forecast_autocorr=0.05,
             forecast_horizon_weights=(1.0, 0.5),
             cross_modal=0.0,
-            velocity_smooth=0.0,
+            velocity_smooth=0.01,
             generic_constraint=0.0,
             moe_load_balance=0.01,
             hebbian_reg=0.0,
@@ -542,7 +545,7 @@ def get_stage_1_p6() -> TrainingPhase:
         rollout_steps=2,
         max_seq_len_eeg=4096,
         freeze_config=FreezeConfig(eeg_encoder=False, fmri_encoder=False),
-        description="Sequence length 4096, LR 1e-4 flat",
+        description="Sequence length 4096, LR 5e-5 flat",
         router_tau=0.7,
     )
 

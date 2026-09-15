@@ -19,7 +19,7 @@
   "persistent_workers": true,
   "prefetch_factor": 4,
   "split_by": "subject",
-  "val_frac": 0.1,
+  "val_frac": 1.0,
   "align_channels": false,
   "max_union_channels": 302,
   "return_masks": true,
@@ -39,5 +39,8 @@
   },
   "use_trials": false,
   "control_width": 282,
-  "control_note": "Unified source-harmonized control: 15-second context windows at each manifest rate. For multi-horizon rollouts, each complete future control window is reduced independently into one perturbation vector; current-window segment reduction is only the fallback when future controls are absent. Feature 0 is the scalar Toyoshima salt or Randi waveform; features 1..281 are Randi recording-local target gates. HuggingFace rows omit the control modality. Calcium IDs remain source-local and are not union-aligned."
+  "include_sources": [
+    "hf_activity"
+  ],
+  "control_note": "Source-scoped evaluation view of the unified manifest (HuggingFace activity rows only). These rows carry no control track, which is the no-intervention arm of the unified contract; val_frac=1.0 parks every worm in the held-out view."
 }

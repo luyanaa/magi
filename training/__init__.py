@@ -5,7 +5,8 @@ from .training_phases import (
     get_all_phases, get_phase_neg_1, get_stage_1_p1,
 )
 from .losses import (
-    ReconstructionLoss, VelocitySmoothnessLoss, GenerickeConstraintLoss,
+    ReconstructionLoss, VelocitySmoothnessLoss, RolloutAutocorrelationLoss,
+    GenerickeConstraintLoss,
     MoELoadBalancingLoss, GrassmannianRegularization, JacobiRegularization,
     HebbianRegularization, NSPLoss, CrossModalAlignmentLoss,
     CrossSoftContrastiveLoss, InterventionResponseLoss, WeakSIGRegLoss,
@@ -16,7 +17,7 @@ __all__ = [
     "TrainingStage", "TrainingPhase", "LossWeights", "FreezeConfig",
     "get_all_phases", "get_phase_neg_1", "get_stage_1_p1",
     "ReconstructionLoss", "VelocitySmoothnessLoss",
-    "GenerickeConstraintLoss", "MoELoadBalancingLoss",
+    "RolloutAutocorrelationLoss", "GenerickeConstraintLoss",
     "GrassmannianRegularization", "JacobiRegularization",
     "HebbianRegularization", "NSPLoss", "CrossModalAlignmentLoss",
     "CrossSoftContrastiveLoss", "InterventionResponseLoss",

@@ -50,8 +50,8 @@ def test_ingest_writes_sessions_control_and_provenance(tmp_path):
            condition_offsets=(0, 40, 80), condition_names=("a", "b"),
            condition_padding=0, max_cells=5, overwrite=True)
     import csv
-    rows = {r["sample_id"]: r for r in
-            csv.DictReader(open(out / "manifest.csv"))}
+    with open(out / "manifest.csv") as manifest:
+        rows = {r["sample_id"]: r for r in csv.DictReader(manifest)}
     assert set(rows) == {"00_a", "01_b"}
     row = rows["00_a"]
     assert row["species"] == "zebrafish"

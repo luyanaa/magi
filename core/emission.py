@@ -1,31 +1,29 @@
 """Observation-channel model for calcium imaging (opt-in).
 
-The salt/homogenized *C. elegans* corpora do not contain "calcium": they
-contain a per-neuron z-scored YFP/CFP ratio of a FRET indicator (YC2.60),
-sampled at a few volumes per second, median-filtered, detrended and
-standardised. Two properties of that channel are structural, not noise:
+The salt/homogenized *C. elegans* corpora do not contain calibrated voltage or
+absolute calcium: they contain a per-neuron z-scored YFP/CFP ratio of a FRET
+indicator (YC2.60), sampled at a few volumes per second, median-filtered,
+detrended and standardised. Two properties of that channel are structural:
 
-1. **Low-pass + aliasing.** The indicator's own kinetics and the release's
-   smoothing make the observable band-limited well below Nyquist (measured on
-   the pilot: 95%-power bandwidth ~1.0 Hz, spectral centroid ~0.17 Hz at
-   ~4 Hz sampling), so the observable is a *filtered* version of the state;
-   its frame-to-frame autocorrelation is ~0.79 while the 60 s window
-   correlation is ~0.
-2. **Saturating non-linear converter.** Fluorescence follows a Hill function
-   of [Ca2+] (``F = F0 + (Fmax - F0) * [Ca]^h / ([Ca]^h + Kd^h)``), per
-   individual because expression level varies -- the Iwasaki-lab/CREST
-   treatment of this chain. A per-neuron z-score removes the operating point,
-   so the observable is a monotone *re-parameterisation* of the underlying
-   state, and a linear decoder in observed units can only approximate it.
+1. **Low-pass + aliasing.** The indicator's kinetics, acquisition integration,
+   and preprocessing make the observable a filtered, sampled version of the
+   latent state. The model therefore applies one learnable latent-to-observed
+   temporal filter; it does not claim that the target trace itself is raw
+   membrane dynamics.
+2. **Representation-dependent nonlinearity.** Calibrated raw fluorescence or
+   a fluorescence fraction may use a Hill converter. A standardized ratio or
+   dF/F has no known F0/Fmax operating point in this repository, so it stays
+   in its observed numeric representation instead of being falsely squashed
+   to [0, 1].
 
-``CalciumEmission`` makes both explicit and *estimable*: it maps the decoder's
-pre-readout signal to the observed units through a learnable per-channel
-first-order low-pass (time constant in **seconds**, applied with the batch's
-``dt``) and a learnable per-channel Hill saturation. The fitted time constants
-are the quantity of interest -- they can be compared against the independent
-AR(1) estimates on the recording (see ``diagnostics/species_parameters.py``)
--- and nothing here touches the shared latent dynamics: it is the observation
-channel only.
+``SensorEmission`` makes the temporal observation channel explicit and
+estimable: it maps the decoder's latent pre-readout signal to the sampled
+observed units through a learnable per-channel first-order low-pass (time
+constant in **seconds**, applied with the batch's ``dt``). The fitted time
+constants are the quantity of interest -- they can be compared against
+independent AR(1) estimates on the recording (see
+``diagnostics/species_parameters.py``). The shared latent dynamics are
+untouched.
 """
 
 from __future__ import annotations
@@ -40,13 +38,13 @@ from .hrf import LearnedHemodynamicResponse, BalloonParameters
 
 
 class SensorEmission(nn.Module):
-    """Decoder signal -> observed readout for one modality, per its sensor spec.
+    """Map latent decoder dynamics to one modality's observed readout.
 
-    The low-pass time constant is initialised from the reporter's documented
-    kinetics when the registry has them (GCaMP8f 67 ms, Voltron 0.8 ms, ...)
-    and otherwise from ``init_tau_s``, which is then a fit target rather than a
-    literature value. Voltage readouts (GEVI) are treated as linear in the
-    state and skip the Hill term; saturating calcium readouts keep it.
+    ``already_filtered`` is provenance metadata for the target trace; it does
+    not disable this module. The module is the single model-side
+    latent-to-observed pass and therefore applies the configured temporal
+    filter once. Hill conversion is enabled only for calibrated fluorescence
+    spaces (or for the legacy ``spec=None`` standalone API).
 
     Args:
         max_channels: channel capacity (per-channel parameters)
@@ -55,7 +53,6 @@ class SensorEmission(nn.Module):
         init_hill_h / init_hill_kd: initial Hill coefficient / half-saturation
         dt_default_s: frame interval used when a batch supplies no ``dt``
     """
-
     def __init__(
         self,
         max_channels: int = 2048,
@@ -77,8 +74,21 @@ class SensorEmission(nn.Module):
         self.dt_default_s = float(dt_default_s)
         self.spec = spec
         self.readout = getattr(spec, "readout", "dff")
-        self.apply_hill = self.readout not in ("voltage", "absolute", "bold")
+        self.observed_space = getattr(spec, "observed_space", "native")
+        self.already_filtered = bool(getattr(spec, "already_filtered", False))
+        # The decoder represents the latent pre-observation dynamics. The
+        # emission therefore applies one temporal filter even when the target
+        # trace was acquired with indicator/acquisition filtering; it is the
+        # model's one-pass latent -> observed map, not a second preprocessing
+        # pass over the target.
         self.apply_lowpass = self.readout != "bold"
+        # A ratio/dF/F/standardized trace has no calibrated F0/Fmax in this
+        # repository, so do not falsely force it through a [0, 1] Hill
+        # fraction. Calibrated raw fluorescence/fraction readouts may opt in.
+        self.apply_hill = (
+            spec is None
+            or self.observed_space in ("raw_fluorescence", "fraction")
+        )
         # BOLD: the haemodynamic response *is* the low-pass, so the first-order
         # indicator filter is replaced by the (learned, HRF-initialised) drive
         # -> BOLD emission below.
@@ -119,15 +129,17 @@ class SensorEmission(nn.Module):
             "h": F.softplus(self.log_hill_h[:num_channels]) + 1e-6,
             "kd": F.softplus(self.log_hill_kd[:num_channels]) + 1e-6,
         }
-
-    def parameter_summary(self, num_channels: int) -> Dict[str, float]:
-        """Detached scalars for logging/reporting (seconds, dimensionless)."""
+    def parameter_summary(self, num_channels: int) -> Dict[str, object]:
+        """Detached scalars and representation metadata for logging."""
         tau = self.tau_s(num_channels).detach()
         out = {
             "tau_s_median": float(tau.median()),
             "tau_s_min": float(tau.min()),
             "tau_s_max": float(tau.max()),
             "readout": self.readout,
+            "observed_space": self.observed_space,
+            "already_filtered": self.already_filtered,
+            "temporal_filter_applied": self.apply_lowpass,
         }
         spec = getattr(self, "spec", None)
         if spec is not None:
@@ -180,7 +192,9 @@ class SensorEmission(nn.Module):
             # latent -> drive was learned above; drive -> BOLD is the
             # structured, HRF-initialised emission (dt is the TR here).
             return self.hrf(scaled, dt if dt is not None else self.dt_default_s)
-        filtered = _first_order_lowpass(scaled, tau, dt, self.dt_default_s)
+        filtered = (
+            _first_order_lowpass(scaled, tau, dt, self.dt_default_s)
+            if self.apply_lowpass else scaled)
         if not self.apply_hill:
             # Voltage readouts are treated as linear in the (low-passed) state;
             # there is no saturation curve to invert.

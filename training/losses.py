@@ -418,6 +418,102 @@ class CompositeForecastLoss(nn.Module):
                 + self.variance_weight * scale)
         return total
 
+class RolloutAutocorrelationLoss(nn.Module):
+    """Match normalized temporal autocorrelation across forecast horizons.
+
+    Inputs have shape ``(B, K, C, T)``. Horizons are concatenated in their
+    physical order before autocorrelation is computed, so the term constrains
+    the temporal structure of the complete rollout rather than each window in
+    isolation.
+    """
+
+    def __init__(self, max_lag: int = 16):
+        super().__init__()
+        if max_lag < 1:
+            raise ValueError("max_lag must be positive")
+        self.max_lag = int(max_lag)
+
+    @staticmethod
+    def _flatten(values: torch.Tensor) -> torch.Tensor:
+        return values.permute(0, 2, 1, 3).reshape(
+            values.shape[0], values.shape[2], -1)
+
+    def forward(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if prediction.dim() != 4 or target.dim() != 4:
+            raise ValueError(
+                "rollout autocorrelation inputs must have shape (B,K,C,T)")
+        if prediction.shape != target.shape:
+            raise ValueError(
+                "rollout autocorrelation prediction and target shapes must match")
+        if mask is not None and mask.shape != target.shape:
+            raise ValueError(
+                "rollout autocorrelation mask must match prediction shape")
+
+        prediction = self._flatten(prediction)
+        target = self._flatten(target)
+        if mask is None:
+            mask = torch.ones_like(target, dtype=torch.bool)
+        else:
+            mask = self._flatten(mask.to(dtype=torch.bool))
+
+        max_lag = min(self.max_lag, prediction.shape[-1] - 1)
+        total = prediction.sum() * 0.0
+        normalizer = prediction.new_zeros(())
+        eps = torch.finfo(prediction.dtype).eps
+        for lag in range(1, max_lag + 1):
+            pair = mask[..., :-lag] & mask[..., lag:]
+            count = pair.sum(dim=-1)
+            valid = count >= 2
+            if not bool(valid.any()):
+                continue
+            denom = count.clamp_min(1).to(prediction.dtype)
+            pred_a = prediction[..., :-lag]
+            pred_b = prediction[..., lag:]
+            target_a = target[..., :-lag]
+            target_b = target[..., lag:]
+            pred_mean_a = (pred_a * pair).sum(dim=-1) / denom
+            pred_mean_b = (pred_b * pair).sum(dim=-1) / denom
+            target_mean_a = (target_a * pair).sum(dim=-1) / denom
+            target_mean_b = (target_b * pair).sum(dim=-1) / denom
+            pred_cov = (
+                (pred_a - pred_mean_a.unsqueeze(-1))
+                * (pred_b - pred_mean_b.unsqueeze(-1))
+                * pair
+            ).sum(dim=-1) / denom
+            target_cov = (
+                (target_a - target_mean_a.unsqueeze(-1))
+                * (target_b - target_mean_b.unsqueeze(-1))
+                * pair
+            ).sum(dim=-1) / denom
+            pred_var_a = (
+                (pred_a - pred_mean_a.unsqueeze(-1)).square() * pair
+            ).sum(dim=-1) / denom
+            pred_var_b = (
+                (pred_b - pred_mean_b.unsqueeze(-1)).square() * pair
+            ).sum(dim=-1) / denom
+            target_var_a = (
+                (target_a - target_mean_a.unsqueeze(-1)).square() * pair
+            ).sum(dim=-1) / denom
+            target_var_b = (
+                (target_b - target_mean_b.unsqueeze(-1)).square() * pair
+            ).sum(dim=-1) / denom
+            pred_corr = pred_cov / (
+                torch.sqrt(pred_var_a * pred_var_b).clamp_min(eps))
+            target_corr = target_cov / (
+                torch.sqrt(target_var_a * target_var_b).clamp_min(eps))
+            weight = count[valid].to(prediction.dtype)
+            total = total + (
+                (pred_corr[valid] - target_corr[valid]).square() * weight
+            ).sum()
+            normalizer = normalizer + weight.sum()
+        return total / normalizer.clamp_min(1.0)
+
+
 
 class VelocitySmoothnessLoss(nn.Module):
     """Temporal total-variation of the latent velocity along a rollout.
@@ -1649,6 +1745,7 @@ class TotalLoss(nn.Module):
         self.action = ActionLoss(weight=1.0)
         self.replay = ReplayLoss(weight=1.0)
         self.intervention_response = InterventionResponseLoss(weight=1.0)
+        self.rollout_autocorr = RolloutAutocorrelationLoss(max_lag=16)
         self.bandpower = BandPowerLoss(weight=1.0)
         self.sigreg = WeakSIGRegLoss(
             sketch_dim=getattr(loss_weights, "sigreg_sketch_dim", 64),
@@ -1666,18 +1763,15 @@ class TotalLoss(nn.Module):
         rollout_steps: Optional[int] = None,
     ) -> Optional[str]:
         """Rebuild forecast criteria from the active phase configuration.
-
         The forecast module has no learnable state, so replacing it at a phase
         boundary is both cheap and necessary: ``TotalLoss.loss_weights`` is
-        replaced per phase, while submodules are otherwise persistent.  When
-        a phase's horizon weights do not match the runtime rollout, retain all
-        horizons with equal weights and return a warning for the caller to
-        surface.  This keeps profiles with different horizon counts runnable
-        without silently using a stale criterion.
+        replaced per phase, while submodules are otherwise persistent. An
+        explicit horizon-weight vector must match the runtime rollout exactly;
+        a mismatch is a configuration error rather than a reason to silently
+        change the objective.
         """
         requested = getattr(loss_weights, "forecast_horizon_weights", None)
         effective = requested
-        warning = None
         if requested is not None and rollout_steps is not None:
             try:
                 requested_count = len(requested)
@@ -1685,11 +1779,11 @@ class TotalLoss(nn.Module):
                 requested_count = None
             if (requested_count is not None
                     and requested_count != int(rollout_steps)):
-                warning = (
+                raise ValueError(
                     "forecast_horizon_weights has "
                     f"{requested_count} values for runtime rollout "
-                    f"{int(rollout_steps)}; using equal horizon weights")
-                effective = None
+                    f"{int(rollout_steps)}; resolve the data-profile "
+                    "rollout contract before training")
         self.forecast = CompositeForecastLoss(
             huber_weight=getattr(loss_weights, "forecast_huber", 1.0),
             corr_diff_weight=getattr(
@@ -1698,7 +1792,7 @@ class TotalLoss(nn.Module):
                 loss_weights, "forecast_variance", 0.0),
             horizon_weights=effective,
         )
-        return warning
+        return None
 
     def reset_loss_normalizer(self) -> None:
         """Reset per-term scale calibration when a new phase begins."""
@@ -1799,6 +1893,18 @@ class TotalLoss(nn.Module):
                         total_loss, forecast_value, forecast_weight,
                         f"forecast_{modality}", metrics)
                     metrics[f"forecast_{modality}"] = forecast_value.item()
+                    autocorr_weight = float(
+                        getattr(self.loss_weights, "forecast_autocorr", 0.0))
+                    if autocorr_weight > 0:
+                        autocorr_value = self.rollout_autocorr(
+                            sequence_prediction, target_value,
+                            mask=targets.get(f"{modality}_mask"))
+                        total_loss = self._add_loss(
+                            total_loss, autocorr_value, autocorr_weight,
+                            f"forecast_autocorr_{modality}", metrics)
+                        metrics[
+                            f"forecast_autocorr_{modality}"] = (
+                                autocorr_value.item())
                     # An explicit reconstruction mix is the scale anchor for
                     # generic signals. Keep it alongside forecast supervision;
                     # modalities without a mix retain forecast-only behavior.

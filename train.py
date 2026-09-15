@@ -23,8 +23,11 @@ Usage:
 import os
 import sys
 import argparse
+import hashlib
 import json
+import math
 import signal
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -34,8 +37,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from brain_moe_pinn import BrainMoEPINNConfig
 from brain_moe_pinn.config import load_experiment_config
-from brain_moe_pinn.data import EEGDenoiseNetDataset, PairedBrainDataset
-from brain_moe_pinn.data.species_dataset import build_species_dataloaders
+from brain_moe_pinn.data import (
+    EEGDenoiseNetDataset,
+    PairedBrainDataset,
+    build_species_dataloaders,
+)
+from brain_moe_pinn.runtime.device_utils import pin_memory_supported
 from brain_moe_pinn.training.training_loop import BrainMoETrainer
 from brain_moe_pinn.training.training_loop import (
     apply_precision,
@@ -144,7 +151,7 @@ def build_data_loaders(profile_path: Path, leave_subject_out=None, *,
             batch_size=int(batch_size if batch_size is not None
                            else (default_batch_size or 32)),
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=pin_memory_supported(),
             collate_fn=EEGDenoiseNetDataset.collate_fn,
         )
         return (
@@ -225,7 +232,8 @@ def build_data_loaders(profile_path: Path, leave_subject_out=None, *,
         common = dict(
             batch_size=int(batch_size if batch_size is not None
                            else (default_batch_size or 16)),
-            num_workers=num_workers, pin_memory=True)
+            num_workers=num_workers,
+            pin_memory=pin_memory_supported())
         loaders = (
             torch.utils.data.DataLoader(
                 train_set, shuffle=True, drop_last=True, **common),
@@ -281,6 +289,9 @@ def build_data_loaders(profile_path: Path, leave_subject_out=None, *,
         pin_memory=bool(profile.get("pin_memory", False)),
         persistent_workers=bool(profile.get("persistent_workers", False)),
         prefetch_factor=max(1, int(profile.get("prefetch_factor", 2))),
+        sources=(tuple(profile["include_sources"])
+                 if profile.get("include_sources") else None),
+        control_align=bool(profile.get("control_align", False)),
     )
     if loader_kwargs["future_steps"] > 1 and not loader_kwargs[
             "return_next_step_targets"]:
@@ -327,6 +338,92 @@ def parse_phases(phase_str: str):
     return phases
 
 
+def cap_phase_steps(phases, max_steps):
+    """Clamp every selected phase to a bounded experiment length.
+
+    The declared phases carry full-scale budgets (P4 is 50k steps, P5 100k).
+    A bounded corpus or a budget-limited run cannot honour them, and the
+    previous workflow could only stop such a run by signalling a preemption
+    checkpoint. `--phase_steps` makes the intended budget explicit: each
+    phase keeps its own budget when it is already below the cap.
+    """
+    if max_steps is None:
+        return phases
+    cap = int(max_steps)
+    if cap < 1:
+        raise ValueError("--phase_steps must be a positive integer")
+    capped = []
+    for phase in phases:
+        runtime_phase = dict(phase)
+        declared = int(runtime_phase.get("total_steps", cap))
+        runtime_phase["total_steps"] = min(declared, cap)
+        warmup = runtime_phase.get("warmup_steps")
+        if warmup is not None and int(warmup) > runtime_phase["total_steps"]:
+            runtime_phase["warmup_steps"] = runtime_phase["total_steps"]
+        capped.append(runtime_phase)
+    return capped
+
+
+def apply_data_profile_rollout_contract(phases, data_profile):
+    """Apply a data profile's rollout and horizon-weight contract."""
+    if not isinstance(data_profile, dict):
+        raise TypeError("data_profile must be a mapping")
+
+    raw_steps = data_profile.get("rollout_steps")
+    raw_weights = data_profile.get("rollout_horizon_weights")
+    if raw_steps is None and raw_weights is None:
+        return phases
+    if raw_steps is None:
+        raise ValueError(
+            "rollout_horizon_weights requires rollout_steps in the data "
+            "profile")
+
+    steps = int(raw_steps)
+    if steps < 1:
+        raise ValueError("data-profile rollout_steps must be positive")
+
+    future_steps = data_profile.get("future_steps")
+    if future_steps is not None and int(future_steps) != steps:
+        raise ValueError(
+            "data-profile future_steps must equal rollout_steps: "
+            f"{future_steps} != {steps}")
+
+    if raw_weights is None:
+        raise ValueError(
+            "data profile must declare rollout_horizon_weights when "
+            "rollout_steps is set")
+    if not isinstance(raw_weights, (list, tuple)):
+        raise TypeError("rollout_horizon_weights must be a list or tuple")
+
+    horizon_weights = tuple(float(value) for value in raw_weights)
+    if len(horizon_weights) != steps:
+        raise ValueError(
+            "rollout_horizon_weights must contain exactly one value per "
+            f"rollout step: {len(horizon_weights)} != {steps}")
+    if (any(not math.isfinite(value) or value < 0
+            for value in horizon_weights)
+            or sum(horizon_weights) <= 0):
+        raise ValueError(
+            "rollout_horizon_weights must be finite, non-negative, and "
+            "have positive mass")
+
+    resolved = []
+    for phase in phases:
+        runtime_phase = dict(phase)
+        runtime_phase["rollout_steps"] = steps
+        rollout = dict(runtime_phase.get("rollout") or {})
+        rollout["steps"] = steps
+        runtime_phase["rollout"] = rollout
+        loss_weights = runtime_phase.get("loss_weights")
+        if loss_weights is not None:
+            runtime_phase["loss_weights"] = replace(
+                loss_weights,
+                forecast_horizon_weights=horizon_weights,
+            )
+        resolved.append(runtime_phase)
+    return resolved
+
+
 def main():
     parser = argparse.ArgumentParser(description="Brain MoE-PINN Training")
     parser.add_argument("--deepspeed_config", type=str, default="configs/ds_config_zero2.json",
@@ -339,6 +436,10 @@ def main():
                              "fp16 compute path")
     parser.add_argument("--phase", type=str, default="1,2,3",
                         help="Training phases to run, e.g. '-1,1,2,3'; Phase -1 runs Magi v2 EEG pretraining and requires --eeg_backend v2")
+    parser.add_argument("--phase_steps", type=int, default=None,
+                        help="Cap every selected phase's total_steps for a "
+                             "bounded experiment run; the declared schedule "
+                             "stays authoritative when a phase already fits")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from checkpoint path")
     parser.add_argument("--log_dir", type=str, default="./logs",
@@ -416,6 +517,7 @@ def main():
 
     # Parse phases
     phases = parse_phases(args.phase)
+    phases = cap_phase_steps(phases, args.phase_steps)
 
     # Parse Mamba-2 kwargs
     mamba2_kwargs = None
@@ -432,6 +534,7 @@ def main():
         if not config_path.is_absolute():
             config_path = Path(__file__).parent / config_path
         config = BrainMoEPINNConfig.from_file(str(config_path))
+        config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
     else:
         config = BrainMoEPINNConfig(
             eeg_channels=args.eeg_channels,
@@ -451,8 +554,6 @@ def main():
             use_imagination=args.use_imagination,
             use_generic_moe=args.use_generic_moe,
             perturbation_dim=args.perturbation_dim,
-            eeg_backend=args.eeg_backend,
-            use_magi_v2=args.use_magi_v2,
             max_channels=args.max_channels,
             ecog_amplitude_scale=args.ecog_amplitude_scale,
             species=args.species,
@@ -478,6 +579,8 @@ def main():
     trainer_config["model_config"] = dict(config.__dict__)
     trainer_config["magi_pretraining_enabled"] = magi_pretraining_selected
     if args.config:
+        trainer_config["config_path"] = str(config_path)
+        trainer_config["config_sha256"] = config_sha256
         experiment = load_experiment_config(str(config_path))
         trainer_config["experiment_data"] = {
             "modalities": list(experiment.data.modalities),
@@ -515,6 +618,7 @@ def main():
         trainer_config["use_mixer"] = False
         with open(data_path) as fh:
             data_profile = json.load(fh)
+        phases = apply_data_profile_rollout_contract(phases, data_profile)
         if data_profile.get("roles"):
             trainer_config["modality_roles"] = dict(data_profile["roles"])
             trainer_config.setdefault("experiment_data", {})["roles"] = dict(
@@ -535,8 +639,18 @@ def main():
         if data_profile.get("control_reduction"):
             trainer_config["control_reduction"] = str(
                 data_profile["control_reduction"])
-        if data_profile.get("rollout_steps"):
-            trainer_config["rollout_steps"] = int(data_profile["rollout_steps"])
+        if data_profile.get("rollout_steps") is not None:
+            rollout_steps = int(data_profile["rollout_steps"])
+            trainer_config["rollout_steps"] = rollout_steps
+            trainer_config.setdefault("experiment_data", {})[
+                "rollout_steps"] = rollout_steps
+        if data_profile.get("rollout_horizon_weights") is not None:
+            horizon_weights = tuple(
+                float(value)
+                for value in data_profile["rollout_horizon_weights"])
+            trainer_config["rollout_horizon_weights"] = horizon_weights
+            trainer_config.setdefault("experiment_data", {})[
+                "rollout_horizon_weights"] = horizon_weights
         if data_profile.get("recon_loss_mix"):
             trainer_config["recon_loss_mix"] = dict(
                 data_profile["recon_loss_mix"])
@@ -554,7 +668,6 @@ def main():
         print(f"[Data] Loaders built from {data_path} ({summary} samples)")
     # DeepSpeed's batch assertion is only satisfiable if the micro batch
     # equals what the loader yields and the accumulation matches the phase.
-    deepspeed_config = apply_precision(deepspeed_config, args.precision)
     deepspeed_config = rectify_deepspeed_config(
         deepspeed_config,
         micro_batch=getattr(train_loader, 'batch_size', None),

@@ -28,5 +28,6 @@
   "control_modalities": ["stimulus"],
   "control_reduction": "resample",
   "rollout_steps": 2,
+  "rollout_horizon_weights": [1.0, 0.5],
   "seed": 0
 }

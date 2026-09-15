@@ -306,7 +306,8 @@ def test_emission_model_saturates_and_is_learnable():
     signal = torch.randn(2, 4, 64)
     out = emission(signal, dt=0.25)
     assert out.shape == signal.shape
-    assert float(out.min()) >= 0.0 and float(out.max()) <= 1.0
+    out_detached = out.detach()
+    assert float(out_detached.min()) >= 0.0 and float(out_detached.max()) <= 1.0
     summary = emission.parameter_summary(4)
     assert summary["tau_s_median"] == pytest.approx(1.5, abs=1e-3)
     loss = out.mean()
@@ -431,7 +432,7 @@ def test_voltage_emission_skips_the_hill_term():
     emission = SensorEmission(max_channels=3, spec=spec)
     out = emission(_torch.randn(1, 3, 32) * 5.0, dt=0.002)
     # linear readout: the output is not squashed into [0, 1]
-    assert float(out.abs().max()) > 1.0
+    assert float(out.abs().max().detach()) > 1.0
     summary = emission.parameter_summary(3)
     assert summary["readout"] == "voltage" and "hill_h_median" not in summary
 

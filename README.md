@@ -215,9 +215,17 @@ supplied.
 
 **Reconstruction losses** (EEG, fMRI, MEG): Standard MSE between decoder output and input signal. These are the primary training signal — all other losses are auxiliary.
 For generic signals, an explicit `recon_loss_mix` remains active alongside
-multi-horizon forecast supervision; its marginal-scale term prevents
+multi-horizon forecast supervision. Its distributional term discourages
 correlation-only or low-variance forecasts from becoming the objective's
-cheapest solution.
+cheapest solution. The reconstruction boundary additionally enforces the
+raw-unit contract: with `normalization: "none"`, no unit-interval or
+z-score conversion is inserted after loading. `forward_modalities(...,
+reconstruct=True)` matches each measurable decoded channel's standard
+deviation to the valid raw context, ignores masked padding, preserves the
+predicted mean and temporal shape, and never reads future targets. The
+internal linear head may have a different latent amplitude; the exposed
+reconstruction is the raw-scale surface.
+
 
 **Structured-dynamics losses:**
 - *Degeneracy constraint*: pointwise residuals in $L\nabla S$ and $M\nabla E$. These are **enforced by projection, not by penalty**, so the residual is identically zero and `generic_constraint` carries weight 0 in every phase: $(P_S L P_S)\nabla S = P_S L (P_S \nabla S) = 0$ because $P_S \nabla S = 0$, and likewise $(P_E \mathrm{diag}(M) P_E)\nabla E = 0$. The weight only becomes live if `apply_degeneracy_projection` is disabled. It remains a local algebraic statement, not a proof of global GENERIC validity or of the Jacobi identity.
@@ -275,6 +283,12 @@ and older token-ledger hypotheses. The executable CLI schedule is:
 `*` Nominal batch visits are `loop steps × configured phase batch`; they are
 not token counts. DeepSpeed gradient accumulation, sampler reuse, and dataset
 windowing determine the effective global-sample count.
+
+`--phase_steps N` caps every selected phase at `N` loop steps (a phase already
+below the cap keeps its declared budget, and `warmup_steps` is clamped to the
+cap). Bounded-corpus experiments use it instead of signalling a preemption
+checkpoint to stop a full-scale schedule; the declared table above remains the
+full-scale target.
 
 Stage 2 expands its model context from 4,096 to 8,192 to 16,384. Stage 3
 expands from 16,384 to 32,768 to 65,536. These schedules update model-side
@@ -344,7 +358,7 @@ The first intervention ladder uses processed traces and explicit event metadata 
 | Local C. elegans salt pilot | 0.197 GiB | Salt stimulus; not optogenetic | Ingested and verified |
 | Randi C. elegans PumpProbe, [OSF e2syt](https://api.osf.io/v2/nodes/e2syt/files/osfstorage/) | 1.2 GiB local export, 113 recordings | Recording-local neuron-targeted optogenetic stimulation; source target IDs, labels, and event files are preserved | Canonical ladder ingested and model-smoke verified |
 | HuggingFace `celegans_neural_data` | 669.5 MB parquet; 919 emitted worms | Calcium-only activity; source has no unified intervention track | Downloaded and ingested into the canonical ladder |
-| Unified C. elegans manifest root | Small manifest; references the three canonical roots | One `stimulus` control contract, source-local calcium identities | 1,056 rows assembled; remote training pending |
+| Unified C. elegans manifest root | Small manifest; references the three canonical roots | One `stimulus` control contract, source-local calcium identities | 1,056 rows; P3-P6 remote run complete with per-source free-run evaluation (§C. elegans unified P3-P6 run) |
 | [DANDI:001569](https://dandiarchive.org/dandiset/001569/draft) | 2.833 GiB, 13 NWB assets | Targeted two-photon photostimulation of rsChRmine-expressing neurons | Inspect one asset before full download |
 | [OpenNeuro ds001541](https://openneuro.org/datasets/ds001541/versions/1.1.3) | 6.947 GiB, 597 snapshot files | DRN population optogenetic fMRI | Use population/region scope, not neuron one-hot |
 | Velez-Angel et al. zebrafish lateral-line study | No public archive identified | Single-neuromast stimulation plus whole-brain calcium imaging | Contact-gated; not included in the storage budget |
@@ -364,8 +378,14 @@ recording-local target-position experiment. The adapter follows the supplied
 TSMixer-Ext pulse levels, uses the measured 0.5-second clock rather than the
 gist's 0.05-second plotting value, masks invalid fluorescence frames instead
 of deleting target channels, and preserves the original labels under
-`randi_labels/`. It does **not** import gKDR-GMM metadata; that metadata remains
-owned by the separate Toyoshima salt adapter.
+`randi_labels/`. The default `[0, 200]` + per-recording min-max path is the
+legacy model-input representation, not a physical fluorescence calibration.
+Use `--scale prefix_minmax --fit-frames N` to fit the model scale on a
+calibration prefix without using future frames, or `--scale none
+--max-value ...` for source-value analysis. Neither path recovers absolute
+voltage/current without external indicator and membrane calibration. It does
+**not** import gKDR-GMM metadata; that metadata remains owned by the separate
+Toyoshima salt adapter.
 
 The unified C. elegans profile is
 `configs/species/c_elegans_unified.json` plus
@@ -426,7 +446,12 @@ if windows, workers, or future model features grow. These are planning tiers,
 not a claim about a remote provider's SKU. A remote run still needs a short
 calibration for peak allocated/reserved VRAM and throughput before scaling.
 
-Remote training is **pending and intentionally not launched**. The current
+Remote training has since run at this profile: the unified C. elegans P3-P6
+run executed 10,000 loop steps at batch 1 on one RTX 3080 Ti with a peak GPU
+allocation of 0.4 GiB and 6.6 steps/s, which is consistent with the planning
+floor above and leaves the 8 GiB tier as headroom rather than a requirement
+(§C. elegans unified P3-P6 run).
+
 For biological free-run evaluation, use the neighboring `../TDE-RICA` toolbox
 as an independent reference rather than treating reconstruction loss as a
 generator score. The local adapter is `tools/tderica_free_run.py`; it reports
@@ -1120,17 +1145,24 @@ removed design documents live in git history.*
   optical modality declares its **imaging method** (LSFM/SPIM, LFM/XLFM,
   remote-scanning LSFM, SCAPE/3D-AOD two-photon, spinning-disk 4D, widefield
   2P) and its **functional reporter** (GCaMP6f/6s/7f, jGCaMP8f/s,
-  H2B-GCaMP6s/7f, YC2.60 FRET, Positron2-Kv, Voltron, Arch, pERK). That pair
-  fixes the frame-integration window, the slice/plane phase smear, the readout
-  kind (`dff`/`ratio`/`voltage`/`static`) and whether windowed dynamics are
-  meaningful at all (a pERK fixed-tissue map is refused for next-step
-  targets). With `features.use_sensor_emission` (on for `c_elegans` and
-  `zebrafish`) the decoder emits through that channel -- per-channel
-  indicator low-pass in **seconds** plus a Hill saturation for
-  calcium-family reporters, skipped for GEVI voltage -- and reports the
-  fitted `tau`/`h`/`Kd` with its provenance (`imaging`, `reporter`,
-  `calibration_required`). The latent dynamics are untouched; reconstruction
-  metrics carry their units and their persistence/channel-mean baselines.
+  H2B-GCaMP6s/7f, YC2.60 FRET, Positron2-Kv, Voltron, Arch, pERK). It also
+  declares the model-facing observed space (`dff`, `ratio`, `standardized`,
+  `raw_fluorescence`, `fraction`, or `voltage`) and whether acquisition/
+  preprocessing already filtered the target. The latent decoder still applies
+  one model-side latent-to-observed temporal pass; the provenance flag does not
+  add a second filter or disable that pass.
+- That sensor declaration fixes the frame-integration window, the slice/plane
+  phase smear, the readout kind and whether windowed dynamics are meaningful
+  at all (a pERK fixed-tissue map is refused for next-step targets). With
+  `features.use_sensor_emission` (on for `c_elegans` and `zebrafish`) the
+  decoder emits through that channel -- per-channel indicator low-pass in
+  **seconds** plus a representation-appropriate readout. Hill saturation is
+  used only for calibrated raw/fraction fluorescence; standardized YC2.60
+  ratio and dF/F remain in their observed numeric space. GEVI voltage skips
+  the Hill term. The fitted `tau`/`h`/`Kd` are reported with their provenance
+  (`imaging`, `reporter`, `calibration_required`). The latent dynamics are
+  untouched; reconstruction metrics carry their units and their
+  persistence/channel-mean baselines.
   Control tracks are validated too: `control_diagnostics` reports
   `control_active_frac` and `control_collapse_ratio`, and training warns once
   when a single-step rollout reduces an alternating drive to ~0.
@@ -1222,13 +1254,15 @@ removed design documents live in git history.*
 |---|---|---|
 | HIGH | Pretrained checkpoints | Download NeuroSTORM/BrainLM/Magi weights; CLI and loaders are ready |
 | HIGH | Dynamics -> fMRI (BOLD) | Implemented as a learnable emission (`core/hrf.py`): Friston 2003 Balloon-Windkessel response as the initialisation, zero-init smooth correction + learnable vasodilatory lag, gains and compressive output; causal, TR-aware, and reporting the measured effective-HRF peak/FWHM/undershoot plus the deviation from the reference. Wired for `human`/`mouse` (`data.sensors.fmri`). Next: fit it on a real BOLD corpus (Kondo mouse widefield fMRI / HCP-style human runs) and compare the fitted peak latency against the measured HRF |
-| HIGH | Targeted intervention corpora | Randi PumpProbe text adapter is implemented and verified on 113 local recordings with 2 Hz timing, target-gated controls, and pulse-preserving reduction; targets remain recording-local positions because source labels are incomplete/duplicated. DANDI:001569 and OpenNeuro ds001541 still need scope-specific adapters and held-out-target validation |
+| HIGH | Targeted intervention corpora | Randi PumpProbe text adapter is implemented and verified on 113 local recordings with 2 Hz timing, target-gated controls, and pulse-preserving reduction; targets remain recording-local positions because source labels are incomplete/duplicated. The Randi intervention evaluation now runs end-to-end (112 rows, drive-aligned windows), and it measures what the model does with the drive, not just what the corpus contains. DANDI:001569 and OpenNeuro ds001541 still need scope-specific adapters and held-out-target validation |
+| HIGH | Control pathway supervision | The unified P3-P6 checkpoint is materially unsteered: on drive-aligned windows the recorded drive moves the free run by 0.4 % (salt) to 1.8 % (Randi) of the real effect, with cosine ≈ 0 against both the real effect direction and the 1.68× targeted-channel contrast the Randi data itself carries. `perturbation_map` starts at exactly zero, so the path only grows from forecast gradients. That checkpoint also predates the future-control alignment fix in `partition_generic_batch`, so the next gate is a post-fix rerun of `tools/intervention_eval.py`; only then choose a dedicated intervention loss or drive-weighted sampling. |
+| HIGH | Calibrated distributional objective | Held-out W1 0.837 and mean KL 14.72 against gates of 0.05 / 5, with kernel transition 5.26 on the D3 subset; P4-P6 improve every axis over P3 but do not approach the gates. The next experiment is a calibrated distributional objective in the fixed TDE-RICA component space, not more steps of the reconstruction mixture |
 | HIGH | Zebrafish (ZAPBench) | Adapter implemented and verified offline against the release constants (`data/zapbench.py`: condition sessions, 26-d stimulus control, region/cell reduction, mandatory `--rate-hz`, provenance columns; `configs/species/zebrafish.json` + `configs/data/zebrafish_zapbench.json`). Next: point `--source` at `gs://zapbench-release/volumes/20240930/traces` (zarr + gcsfs) and ingest a region-reduced subset |
-| HIGH | Real corpora ingestion | **Salt pilot, Randi PumpProbe, and HuggingFace C. elegans ladders are ingested and verified**: salt uses per-sample timing and animal provenance; Randi uses 113 recordings, measured 0.5 s timing, masked fluorescence QC, preserved source labels/events, and recording-local optogenetic controls; HF emits 919 worms from 42,798 rows with unlabeled slots dropped. The unified manifest root and profiles are staged; its control path pads source-width controls to 282. Next: remote calibration/training, then ZAPBench/Allen adapters |
+| HIGH | Real corpora ingestion | **Salt pilot, Randi PumpProbe, and HuggingFace C. elegans ladders are ingested and verified**: salt uses per-sample timing and animal provenance; Randi uses 113 recordings, measured 0.5 s timing, masked fluorescence QC, preserved source labels/events, and recording-local optogenetic controls; HF emits 919 worms from 42,798 rows with unlabeled slots dropped. The unified manifest root and profiles are staged; its control path pads source-width controls to 282. The first unified P3-P6 training run, its per-source free-run evaluation, and the controlled intervention evaluation are complete (§C. elegans unified P3-P6 run, §Controlled intervention evaluation); next is held-out-target intervention validation, then ZAPBench/Allen adapters |
 | HIGH | Cluster bring-up | Multi-node smoke (`torchrun --nnodes=2 --nproc_per_node=4`, DeepSpeed ZeRO-2/3): forward/backward, checkpoint save/load, elastic resume; profile 16/24/32/48–80 GiB tiers and re-measure target-topology VRAM and throughput before any full-scale run |
 | MED | Phase -1 Magi v2 pretraining | `configs/data/eegdenoisenet.json` now provides an EEG-only clean/artifact loader; materialize the public arrays, then run topology-specific checkpoint/resume, masked-leakage, causal-NTP, and EMA validation |
 | MED | Time constants | `latent_dt` single-source done (species sample rate → model; OU integrator synced, default-preserving). Remaining: wire-or-drop `SlowGateTransition` (zero callers today); document seconds conventions for monitors/free-run cadence |
-| MED | Marginal recalibration | Recalibrate OU projection and per-component gains on held-out rollouts before claiming output-marginal preservation |
+| MED | Marginal recalibration | Per-channel raw-unit gain is anchored at the reconstruction boundary; full OU/TDE-RICA component-level marginal recalibration on held-out rollouts remains before claiming full output-marginal preservation |
 | MED | Subject adaptation | Re-review the low-rank test-time adaptation design and wire into Stage 3 |
 
 ### C. elegans optimization checkpoint (2026-09)
@@ -1297,6 +1331,299 @@ loss returned a finite scalar, the threshold-aware evaluator ran successfully,
 and `tools/real_data_sanity.py` compiled/imported. The local workstation
 environment does not provide NumPy, so numerical tests were run remotely.
 
+### C. elegans unified P3-P6 run (three sources, 2026-09)
+
+The unified three-source manifest (1,056 rows: 24 Toyoshima salt, 113 Randi
+PumpProbe, 919 HuggingFace) was trained end-to-end for the first time. The run
+continues Stage 1 at P3 from the previous P3 artifact and trains P3-P6 at 3,000
+steps per phase on the unified corpus:
+
+```bash
+python -u train.py \
+  --config configs/species/c_elegans_unified.json \
+  --data configs/data/c_elegans_unified.json \
+  --deepspeed_config configs/ds_config_zero2.json \
+  --phase 1 --phase_steps 3000 \
+  --resume "<previous>/best_Stage 1 P3: Multi-Horizon Forecasting_step2000.pt" \
+  --log_dir ../logs_unified_p3p6 --checkpoint_dir ../ckpt_unified_p3p6
+```
+
+Measured: 950 training rows / 106 validation rows (subject-grouped, seed 0),
+1,504 s wall clock for 10,000 loop steps on one RTX 3080 Ti at batch 1
+(6.6 steps/s: P3 1,000 steps in 2.50 min, P4 3,000 in 7.43 min, P5 3,000 in
+7.62 min, P6 3,000 in 7.52 min; peak GPU allocation 0.4 GiB). The logged total
+loss falls from 0.0515 at P4 step 380 to 0.0067 at P6 step 2800. Four phase-end
+checkpoints were written
+(`checkpoint_Stage 1 P3/P4/P5/P6..._step3000.pt`).
+
+Four defects blocked or silently invalidated this run and were fixed in the
+same pass:
+
+| Defect | Effect before the fix | Fix |
+|---|---|---|
+| `configs/data/c_elegans_*.json` roots used `../../data_ladder/...` | Resolved to `<repo>/data_ladder`, which does not exist, so every `--data configs/data/...` invocation died in the loader probe | Roots are `../../../data_ladder/...`, matching the sibling-layout convention already used by `configs/data/eegdenoisenet.json` |
+| Phase budgets were fixed at full scale (P4 50k, P5 100k) | A bounded corpus could only be run by signalling a preemption checkpoint | `--phase_steps N` caps each selected phase and clamps its warmup |
+| `train_phase()` saved only on the 5,000-step cadence | A 3,000-step phase finished and persisted nothing; the completed run would have produced zero usable checkpoints | `train_phase()` saves at phase end, matching the Magi pretraining path |
+| Evaluator had no source or horizon breakdown | Per-source questions could not be answered from one validation run | `tools/remote_free_run_eval.py` labels each sample's ladder source and reports per-horizon native metrics, `aggregate_by_source`, and `aggregate_by_horizon`; unscoreable windows are recorded as skips instead of aborting an audit |
+
+Checkpoint `Stage 1 P6: Long-Context Expansion, step 3000` (loaded with zero
+missing and zero unexpected keys) evaluated on the 106-row held-out validation
+split, three autonomous rollout windows per sample, TDE-RICA fitted per
+sample's context window, `--no-d3`:
+
+| Group | n | Raw std ratio | Corr-matrix MSE | Autocorr MSE | Variance log-RMSE | TDE-RICA W1 | TDE-RICA KL | Gen. lag-1 | Real lag-1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| All | 106 | 0.6306 | 0.3063 | 0.2735 | 1.4686 | 0.8366 | 14.72 | 0.8724 | 0.9799 |
+| HuggingFace (no control) | 94 | 0.6042 | 0.3247 | 0.2805 | 1.4150 | 0.8294 | 14.24 | 0.8759 | 0.9873 |
+| Randi PumpProbe | 11 | 0.8621 | 0.1645 | 0.2263 | 1.9455 | 0.9140 | 18.51 | 0.8347 | 0.9153 |
+| Toyoshima salt | 1 | 0.5686 | 0.1391 | 0.1349 | 1.2556 | 0.6638 | 17.63 | 0.9573 | 0.9900 |
+
+Persistence baseline on the same rows scores 0.4936 correlation-matrix MSE
+against the model's 0.3063, so the free run beats "hold the last observation".
+
+Same split, same evaluator, earlier checkpoint of the same run (P3, step 3000)
+versus the final P6 checkpoint:
+
+| Metric | P3 step 3000 | P6 step 3000 |
+|---|---:|---:|
+| Raw std ratio | 0.5351 | 0.6306 |
+| Corr-matrix MSE | 0.3145 | 0.3063 |
+| Autocorr MSE | 0.2877 | 0.2735 |
+| Variance log-RMSE | 1.7423 | 1.4686 |
+| TDE-RICA W1 | 0.8671 | 0.8366 |
+| TDE-RICA KL | 17.29 | 14.72 |
+| Generated occurrence lag-1 | 0.7733 | 0.8724 |
+
+P6 dominates P3 on every axis measured, which is the first within-run evidence
+that the P4-P6 phases (routing, physics-inspired constraints, long-context
+continuation) improve the free-run distribution rather than only the
+reconstruction loss.
+
+Horizon breakdown on the held-out split (each row's `(K,C,T)` targets are three
+successive 15-second windows, so horizon `k` spans seconds `[15k, 15(k+1))`
+after the context):
+
+| Horizon | n | Raw std ratio | Corr-matrix MSE | Autocorr MSE | Variance log-RMSE |
+|---|---:|---:|---:|---:|---:|
+| 1 | 106 | 1.129 | 0.3278 | 0.2176 | 2.0104 |
+| 2 | 106 | 0.882 | 0.4160 | 0.2193 | 1.8951 |
+| 3 | 106 | 1.055 | 0.3619 | 0.2057 | 1.8944 |
+
+Scale and autocorrelation hold across the three horizons; correlation
+structure degrades in the middle window rather than monotonically.
+
+Source audits use the source-scoped profiles
+(`configs/data/c_elegans_unified_audit_{toyoshima,randi,hf}.json`, same
+15-second window and 282-wide control contract as training, `val_frac=1.0` so
+every row of that source is scored). These are **not** held-out splits: the
+Toyoshima and Randi audits include rows used for training, and the HF audit
+scores 918 of the 919 HuggingFace rows, so they measure the corpus fit, not
+generalisation. They exist because the mixed validation split carries only one
+salt row:
+
+| Source audit | n scored | Raw std ratio | Corr-matrix MSE | Autocorr MSE | Variance log-RMSE | TDE-RICA W1 | TDE-RICA KL | Gen. lag-1 | Real lag-1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Toyoshima salt | 23 | 0.7002 | 0.1164 | 0.1163 | 1.0061 | 0.7512 | 17.27 | 0.9215 | 0.9778 |
+| Randi PumpProbe | 112 | 0.9447 | 0.1568 | 0.2141 | 1.6342 | 0.9713 | 19.52 | 0.8204 | 0.9178 |
+| HuggingFace | 889 (29 skipped) | 0.6232 | 0.3157 | 0.2761 | 1.3854 | 0.8781 | 13.88 | 0.8812 | 0.9869 |
+
+The 29 HuggingFace rows are skipped, not dropped silently: each has fewer than
+two calcium channels whose entire future window is observed, and the report
+records them under `skipped`.
+
+Against the gKDR-GMM reference gates (W1 ≤ 0.05, mean KL < 5, kernel
+transition < 1, raw standard deviation near 1) the run is still short: W1 is
+0.84 on the held-out split, KL is 14.7, and the raw standard-deviation ratio is
+0.63. The kernel-transition gate is not evaluated here (`--no-d3`); it stays
+open until a stratified D3 run reproduces it. The four P6 free-run reports
+above (106 + 23 + 112 + 918 rows) completed in ≈11 minutes of wall clock on the
+same single card, and the P3 comparison report on the 106-row split took
+≈6 minutes.
+
+### Controlled intervention evaluation (2026-09)
+
+Free-run scoring says nothing about whether the recorded drive actually steers
+the model, because it deliberately runs without control. `tools/intervention_eval.py`
+rolls the same context three times — with the recorded drive, with an explicit
+all-zero drive, and with no drive argument — and compares the recorded-versus-
+zero difference against the held-out future's own deviation from persistence:
+
+```bash
+python tools/intervention_eval.py \
+  --config configs/species/c_elegans_unified.json \
+  --data configs/data/c_elegans_unified_intervention_randi.json \
+  --checkpoint "<P6>/checkpoint_Stage 1 P6: Long-Context Expansion_step3000.pt" \
+  --output intervention_randi.json --split val --max-samples 112 \
+  --rollout 3 --device cuda
+```
+
+Two evaluation-construction facts had to be measured first:
+
+1. The val split's first eligible window is **pre-stimulus** for both
+   intervention sources (measured first-drive onsets: Randi 19–126 s, median
+   24 s; Toyoshima salt 30–630 s, median 630 s). Every control-bearing row
+   therefore scored `drive_norm = 0`. The `control_align` profile key starts
+   each evaluation window at the first frame whose control value is non-zero;
+   with it, 23/23 salt and 110/112 Randi rows carry an active drive.
+2. The documented "zero stimulus is an exact no-op" invariant did **not** hold
+   for a trained checkpoint. Both the readout (`perturbation_map`) and the
+   input-conditioned gate (`gate_map`) are only *zero-initialised*; their
+   trained biases keep responding to the mere presence of a control tensor
+   (measured 9–13 × 10⁻³ maximum absolute calcium deviation against the
+   no-control rollout). Both paths are now masked by drive presence, which
+   makes the invariant structural rather than initialisation-dependent:
+   re-running the same evaluation reports `zero_drive_max_abs_diff = 0.0`
+   exactly for every row.
+
+The P6 checkpoint reported below predates a contract fix in
+`training_loop.partition_generic_batch`: when `*_future` controls are present,
+each full future control window is now reduced independently for its matching
+rollout horizon; the old path reduced the current context window into rollout
+segments. The historical intervention numbers remain valid for that checkpoint,
+but a post-fix checkpoint is required before deciding whether a dedicated
+intervention loss is necessary.
+
+Results on the P6 checkpoint, drive-aligned windows, three horizons:
+
+| Arm | Rows | Drive-active | Model effect ‖·‖ | Real effect ‖·‖ | Gain | Direction cosine | Channel-pattern corr |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Toyoshima salt (stimulus vs no-stimulus) | 23 | 23 | 0.507 | 147.99 | 0.0036 | 0.001 | −0.019 |
+| Randi PumpProbe (optogenetic vs no-op) | 112 | 110 | 1.446 | 87.15 | 0.0179 | −0.001 | 0.007 |
+
+Targeted-versus-non-target channels, Randi rows with an active target gate
+(106 rows). Gate `k` addresses calcium channel `k − 1` in the recording-local
+channel order:
+
+| Quantity | Model | Data |
+|---|---:|---:|
+| Targeted / non-target mean &#124;effect&#124; ratio | 1.011 | 1.676 |
+
+Interpretation, stated at the strength the measurement supports:
+
+- The conditioning pathway is **materially inert** in this checkpoint: the
+  drive moves the free run by 0.4 % (salt) to 1.8 % (Randi) of the distance
+  the recording actually moved, with no directional agreement (cosine ≈ 0)
+  and no spatial agreement across channels.
+- The data itself carries the expected specificity — Randi's targeted channels
+  respond 1.68× more than non-targeted ones — and the model reproduces none of
+  it (ratio 1.01). The intervention signal is present in the corpus and absent
+  from the model's response.
+- This does not invalidate the free-run numbers above: those rollouts pass
+  `perturbation=None`, so they never enter the masked path. It does mean the
+  parameter/objective question for the next run is the control pathway's
+  supervision, not just the reconstruction mixture.
+- `perturbation_map` starts at exactly zero, so every step of control learning
+  is driven purely by forecast gradients. Ten thousand unified steps are
+  evidently not enough to grow that path; the next experiment should either
+  raise the control pathway's learning signal (dedicated intervention loss,
+  larger weight on driven windows) or verify that the latent dynamics can be
+  steered at all before scaling the corpus.
+
+### Validation coverage and checkpoint reproducibility (2026-09)
+
+Every free-run claim in the previous two sections rests on this evaluation
+matrix, all of it on the same checkpoint (`Stage 1 P6: Long-Context
+Expansion, step 3000`) and one RTX 3080 Ti:
+
+| Report | Rows scored | Windows | TDE-RICA | Artifact |
+|---|---:|---:|---|---|
+| Held-out validation split | 106 | 3 × 15 s | per-sample context fit | `eval_unified_p6_val_full.json` |
+| Toyoshima salt audit | 23 | 3 × 15 s | per-sample fit | `eval_unified_p6_salt_arrays/` + `eval_unified_p6_audit_toyoshima.json` |
+| Randi PumpProbe audit | 112 | 3 × 15 s | per-sample fit | `eval_unified_p6_audit_randi.json` |
+| HuggingFace audit | 889 (29 skipped) | 3 × 15 s | per-sample fit | `eval_unified_p6_audit_hf.json` |
+| Dynamics subset (`--full-d3`) | 8 | 3 × 15 s | D3 estimators enabled | `eval_unified_p6_val_d3.json` |
+| Intervention arms | 23 + 112 | 3 × 15 s | n/a | `intervention_p6_*_aligned.json` |
+
+Per-sample and per-channel distributions are saved from the `--save-arrays`
+matrices by `tools/per_channel_distributions.py`
+(`per_channel_distributions.json` + `.npz`):
+
+| Arrays | Samples | Active channels/sample | Generated/real channel σ ratio (mean, q05, q95) | Lag-1 real → generated |
+|---|---:|---:|---|---|
+| Validation split (P6) | 106 | 47.4 | 0.954, 0.253, 2.372 | 0.967 → 0.225 |
+| Validation split (P3) | 106 | 47.4 | 0.902, 0.235, 2.367 | 0.967 → 0.064 |
+| HuggingFace audit | 889 | 36.9 | 0.918, 0.236, 2.411 | 0.976 → 0.256 |
+| Randi audit | 112 | 114.0 | 1.406, 0.422, 2.746 | 0.894 → 0.060 |
+| Toyoshima salt audit | 23 | 67.1 | 0.807, 0.416, 1.570 | 0.750 → 0.324 |
+
+Two readings: P6 roughly triples the generated lag-1 of P3 (0.064 → 0.225)
+without changing the scale distribution, and the Randi arm is the weak one —
+over-dispersed per channel (1.41) with almost no temporal correlation
+generated (0.060 against a real 0.894). The ratio excludes channels whose real
+trace is near-constant (below 1e-3 of the sample's median σ); including them
+makes the pooled mean meaningless (measured 5.7 × 10⁸ before the guard).
+
+The full D3 run closes the kernel-transition gate question on an 8-row subset
+(dynamics estimators are the expensive part):
+
+| Metric | 8-row subset |
+|---|---:|
+| Raw std ratio | 0.930 |
+| Corr-matrix MSE | 0.242 |
+| TDE-RICA W1 | 1.498 |
+| TDE-RICA KL | 18.27 |
+| Kernel transition | 5.259 |
+| Jacobian distance | 8.767 |
+| Expansion / rotation diff | 0.211 / 0.337 |
+| Transfer entropy real→gen / gen→real | 4.094 / 2.472 |
+| Occurrence lag-1 (real → generated) | 0.981 → 0.909 |
+
+The subset's other metrics differ from the 106-row means (it is a harder
+draw), so only the gate conclusion is drawn from it: kernel transition is
+5.26, more than 5× above the requested `< 1`, and it is not re-measured here.
+
+Independent-seed check. The same schedule (P4-P6 at 3,000 steps per phase, from
+the same P3 artifact) was re-run with `--seed 1` and evaluated on the same
+106-row held-out split:
+
+| Metric | Seed 42 | Seed 1 |
+|---|---:|---:|
+| Raw std ratio | 0.6306 | 0.5914 |
+| Corr-matrix MSE | 0.3063 | 0.2924 |
+| Autocorr MSE | 0.2735 | 0.2776 |
+| Variance log-RMSE | 1.4686 | 1.5242 |
+| TDE-RICA W1 | 0.8366 | 0.8402 |
+| TDE-RICA KL | 14.72 | 15.41 |
+| Generated occurrence lag-1 | 0.8724 | 0.8687 |
+
+Every axis agrees within a few percent, so the reported levels are not an
+artefact of one initialization. An earlier seed-1 run at half the per-phase
+budget (1,500 steps) landed in the same range (std ratio 0.527, W1 0.861,
+KL 16.98), which also bounds how much of the P3 → P6 gain is step budget.
+
+Checkpoint/profile pairing is now explicit rather than assumed: `train.py`
+hashes the resolved species profile into every checkpoint
+(`config_sha256`), and the evaluators compare it against the `--config` they
+are given, reporting `config_match` and printing a warning **before** loading
+weights when the pair differs:
+
+```text
+[config] WARNING: checkpoint was produced by a different profile
+(.../c_elegans_unified.json); evaluating (.../c_elegans.json) anyway
+```
+
+Verified both ways: the same profile reports `config_match: true` with
+identical hashes; a different profile warns first and then fails on the
+shape mismatch it would have hit silently otherwise. Checkpoints written
+before this change report `config_match: null` and load as before.
+
+### Post-gate review after the first unified run
+
+What the measurements above justify changing, separated from what they do not:
+
+| Finding (measured) | Reading | Next action |
+|---|---|---|
+| P6 dominates P3 on every free-run axis (W1 0.867 → 0.837, KL 17.3 → 14.7, occurrence lag-1 0.773 → 0.872, std ratio 0.535 → 0.631) | The P4-P6 phases (routing, physics-inspired regularization, long-context continuation) improve the *distribution*, not just the reconstruction loss | Keep the phase structure; do not re-tune it before the objective changes |
+| Held-out W1 0.837 / KL 14.72 vs gates 0.05 / 5; kernel transition 5.26 vs < 1 | A 25-minute, 10k-step run is not near the gates, and the P3 → P6 gain is modest, so more steps of the same objective are not the answer | Add an explicit distributional term in the fixed TDE-RICA component space (the gKDR-GMM reference basis), as concluded before this run |
+| Drive effect ≈ 0.4 % (salt) / 1.8 % (Randi) of the real effect; cosine ≈ 0; targeted ratio 1.011 vs data's 1.676 | The control path is not merely weak, it is untrained: `perturbation_map` starts at exactly zero and only forecast gradients can grow it | Supervise the control path directly (intervention-matched loss, or drive-weighted sampling) and re-measure with `tools/intervention_eval.py` before any steerability claim |
+| Randi arm: per-channel σ ratio 1.406 with generated lag-1 0.060 (real 0.894) | The latent dynamics are too fast for the 2 Hz Randi windows; the HF arm (0.918 / 0.256) behaves far better on the same checkpoint | Investigate source-conditioned dynamics (per-source adapter or mixing weight) or horizon supervision on Randi before pooling sources in one objective |
+| Aggregate held-out std ratio 0.631 vs per-channel mean 0.954 | Contraction in the aggregate is partly a channel-mix effect (large-σ channels shrink more), not a uniform gain error | Report both numbers; treat the per-channel distribution, not the pooled ratio, as the scale gate |
+
+Nothing above is a claim that the architecture is wrong. The evidence supports
+one objective change (distributional term), one supervision gap (control
+pathway), and one data-mix question (Randi), all of which are measurable with
+the tools added here.
+
 ### Toyoshima fixed-basis evaluation
 
 The gKDR-GMM comparison must use the Toyoshima cohort and its fixed basis,
@@ -1327,6 +1654,17 @@ python tools/tderica_free_run.py \
   --tderica ../TDE-RICA \
   --output toyoshima_fixed_basis_report.json
 ```
+
+For a baseline-comparable report, pass a persistence trace from the same
+evaluation window with `--persistence`. The real, generated, and persistence
+signals are then projected through the same fixed basis; the JSON keeps the
+baseline report under `baseline_reports.persistence` and records model-minus-
+baseline metric deltas under `baseline_comparison`. The evaluator validates
+finite coefficients and unique ordered channel names and fails closed when the
+basis artifact is absent or incompatible. For traces with missing channels, it
+intersects finite delay-embedded channel masks across real, generated, and
+persistence inputs and records the retained canonical names in the report. It
+does not fit a replacement basis on the evaluation window.
 
 The Pareto utilities in `diagnostics/free_run_metrics.py` treat raw standard
 deviation error, W1, KL, kernel-transition distance, occurrence gap, and native
@@ -1410,7 +1748,7 @@ python tools/remote_free_run_eval.py \
   place; distribution and criteria choices per modality follow the
   TDE-RICA/C. elegans validation practice (see `SPECIES_PROFILES`).
 - Convention: torch-native code; numpy only for offline diagnostics.
-- Conditioning semantics: control readouts and gates are bias-free/zero-initialized — zero stimulus is an exact no-op in any trained state; noise is off unless `noise_mode` explicitly enables it.
+- Conditioning semantics: control readouts are bias-free with a zero-initialized readout, and the input-conditioned gates are masked by drive presence, so an all-zero stimulus is an exact no-op in any trained state; measured by `tools/intervention_eval.py` as `zero_drive_invariant_max_abs_diff`. Noise is off unless `noise_mode` explicitly enables it.
 - Species/channel metadata is conditioning, not homology.
 - Verified by inspection (2026-09): `EngramLandscape.consolidate()` is an
   unimplemented future API with zero callers (never on a hot path); the

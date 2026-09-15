@@ -79,6 +79,95 @@ def _masked_channel_statistics(
     std = var.clamp_min(0.0).sqrt()
     rms = ((compute.square() * valid).sum(dim=1, keepdim=True) / count).sqrt()
     return mean, std, rms
+def preserve_signal_scale(
+    prediction: torch.Tensor,
+    reference: torch.Tensor,
+    reference_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Match each predicted channel's raw standard deviation to its reference.
+
+    Generic reconstruction is trained on scale-invariant criteria as well as
+    distributional terms, so a decoder can otherwise settle on a
+    low-amplitude waveform without losing much objective value.  The observed
+    signal is the scale authority: this anchor changes gain only, leaving the
+    predicted temporal shape and mean intact.  Invalid/padded reference frames
+    are excluded; channels with a constant reference are emitted as constant,
+    while channels whose prediction has no measurable variation are left
+    unchanged because no gain can recover a missing waveform.
+    """
+    if prediction.dim() != 3 or reference.dim() != 3:
+        raise ValueError(
+            "prediction and reference must have shape (B, channels, time)")
+    if prediction.shape[:2] != reference.shape[:2]:
+        raise ValueError(
+            "prediction and reference must share batch and channel dimensions")
+    if reference_mask is not None and reference_mask.shape != reference.shape:
+        raise ValueError("reference_mask must match reference shape")
+
+    # Statistics stay at least float32 even when mixed-precision inference
+    # supplies fp16/bfloat16 activations.  Otherwise a large raw baseline or
+    # a small channel variance can be quantized before the gain is computed.
+    stats_dtype = (
+        torch.float64
+        if prediction.dtype == torch.float64 or reference.dtype == torch.float64
+        else torch.float32
+    )
+    prediction_stats = prediction.to(
+        device=prediction.device, dtype=stats_dtype)
+    reference_stats = reference.to(
+        device=prediction.device, dtype=stats_dtype)
+    valid_reference = torch.isfinite(reference_stats)
+    if reference_mask is not None:
+        valid_reference = valid_reference & reference_mask.to(
+            device=prediction.device, dtype=torch.bool)
+    reference_count = valid_reference.sum(dim=-1, keepdim=True)
+    reference_denom = reference_count.clamp_min(1).to(stats_dtype)
+    safe_reference = torch.where(
+        valid_reference, reference_stats, torch.zeros_like(reference_stats))
+    reference_mean = safe_reference.sum(dim=-1, keepdim=True) / reference_denom
+    reference_centered = torch.where(
+        valid_reference, reference_stats - reference_mean,
+        torch.zeros_like(reference_stats))
+    reference_var = (
+        reference_centered.square().sum(dim=-1, keepdim=True)
+        / reference_denom)
+    reference_std = reference_var.clamp_min(0.0).sqrt()
+
+    valid_prediction = torch.isfinite(prediction_stats)
+    prediction_count = valid_prediction.sum(dim=-1, keepdim=True)
+    prediction_denom = prediction_count.clamp_min(1).to(stats_dtype)
+    safe_prediction = torch.where(
+        valid_prediction, prediction_stats,
+        torch.zeros_like(prediction_stats))
+    prediction_mean = (
+        safe_prediction.sum(dim=-1, keepdim=True) / prediction_denom)
+    prediction_centered = torch.where(
+        valid_prediction, prediction_stats - prediction_mean,
+        torch.zeros_like(prediction_stats))
+    prediction_var = (
+        prediction_centered.square().sum(dim=-1, keepdim=True)
+        / prediction_denom)
+    prediction_std = prediction_var.clamp_min(0.0).sqrt()
+
+    eps = torch.finfo(stats_dtype).eps
+    measurable = (
+        (reference_count >= 2)
+        & (prediction_count >= 2)
+        & (reference_std > eps)
+        & (prediction_std > eps))
+    constant_reference = (
+        (reference_count >= 1)
+        & (prediction_count >= 1)
+        & (reference_std <= eps))
+
+    gain = reference_std / prediction_std.clamp_min(eps)
+    scaled = prediction_centered * gain + prediction_mean
+    candidate = torch.where(constant_reference, prediction_mean, scaled)
+    result = torch.where(
+        measurable | constant_reference, candidate, prediction_stats)
+    return result.to(dtype=prediction.dtype)
+
+
 
 
 class ChannelSignalAdapter(nn.Module):

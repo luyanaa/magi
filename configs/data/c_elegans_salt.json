@@ -1,6 +1,6 @@
 {
   "kind": "species",
-  "root": "../../data_ladder/c_elegans_salt",
+  "root": "../../../data_ladder/c_elegans_salt",
   "modalities": [
     "calcium",
     "stimulus"
@@ -21,6 +21,7 @@
   "future_steps": 2,
   "seed": 0,
   "control_reduction": "resample",
-  "control_note": "The control track is reduced into two half-cycle means for the two-step rollout; future_steps=2 supplies two complete calcium forecast windows.",
-  "rollout_steps": 2
+  "control_note": "Aligned future control windows are reduced independently to one vector per forecast horizon; future_steps=2 supplies two complete calcium forecast windows. Context-window reduction remains the compatibility fallback when future controls are absent.",
+  "rollout_steps": 2,
+  "rollout_horizon_weights": [1.0, 0.5]
 }

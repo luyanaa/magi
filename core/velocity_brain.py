@@ -686,6 +686,7 @@ class VelocityBrain(nn.Module):
             mobility_term = M_diag * grad_S
 
         control_term = torch.zeros_like(z)
+        drive_presence = None
         if perturbation is not None:
             if self.perturbation_map is None:
                 raise ValueError(
@@ -693,14 +694,24 @@ class VelocityBrain(nn.Module):
             if perturbation.shape != (z.shape[0], self.perturbation_dim):
                 raise ValueError(
                     "perturbation must have shape (B, perturbation_dim)")
-            control_term = self.perturbation_map(
-                perturbation.to(dtype=z.dtype, device=z.device))
+            gate_input = perturbation.to(dtype=z.dtype, device=z.device)
+            # Structural no-op: the readout has a trained bias (zero-init only
+            # fixes the first step), so the raw map is not zero at u = 0.
+            # Masking by presence keeps "control tensor present but all zero"
+            # identical to "no control" in any trained state, which is what the
+            # data contract (`no_op_when_off`) and the free-run baseline rely on.
+            drive_presence = (gate_input != 0).any(
+                dim=-1, keepdim=True).to(gate_input.dtype)
+            control_term = self.perturbation_map(gate_input) * drive_presence
 
         arousal_term = self.arousal_scale * self.arousal_vector
 
         if perturbation is not None and self.gate_map is not None:
-            gates = 1.0 + torch.tanh(
-                self.gate_map(perturbation.to(dtype=z.dtype, device=z.device)))
+            # Same presence mask for the gates: a trained gate bias would
+            # otherwise keep reacting to the mere presence of a control tensor
+            # (measured ~1e-2-scale calcium deviation in
+            # tools/intervention_eval.py before this mask).
+            gates = 1.0 + torch.tanh(self.gate_map(gate_input)) * drive_presence
             mobility_term = mobility_term * gates[:, 0:1]
             arousal_term = arousal_term * gates[:, 1:2]
 

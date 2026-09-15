@@ -787,7 +787,7 @@ def test_structured_moe_perturbs_operators_not_velocity():
 def test_dissipation_loss_does_not_crush_mobility():
     """M must not appear in the objective; degeneracy is enforced by projection."""
     torch.manual_seed(0)
-    mobility = torch.rand(2, 8, requires_grad=True) + 0.2
+    mobility = (torch.rand(2, 8) + 0.2).detach().requires_grad_(True)
     grad_E = torch.randn(2, 8)
     grad_S = torch.randn(2, 8, requires_grad=True)
     delta_z = torch.randn(2, 8, requires_grad=True).abs()

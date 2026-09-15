@@ -214,8 +214,30 @@ def test_reduce_control_and_partition():
         control_modalities=("stimulus",), control_reduction="resample",
         rollout_steps=2, control_dim=4)
     assert padded.shape == (1, 2, 4)
-    assert torch.equal(padded[0, :, 0], torch.tensor([1.5, 5.5]))
+    assert torch.equal(padded[0, :, 0], padded.new_tensor([1.5, 5.5]))
     assert torch.count_nonzero(padded[..., 1:]) == 0
+
+def test_partition_prefers_future_control_horizons():
+    batch = {
+        "calcium": torch.zeros(1, 1, 4),
+        "calcium_future": torch.zeros(1, 2, 1, 4),
+        "stimulus": torch.full((1, 1, 4), 99.0),
+        "stimulus_future": torch.tensor(
+            [[[[2.0, 2.0, 2.0, 2.0]],
+              [[4.0, 4.0, 4.0, 4.0]]]]),
+    }
+    _, targets, perturbation = partition_generic_batch(
+        batch, ("calcium", "stimulus"), ("calcium",), None,
+        control_modalities=("stimulus",), control_reduction="mean",
+        rollout_steps=2, require_future_targets=True,
+        require_multi_horizon=True)
+
+    assert targets["calcium"].shape == (1, 2, 1, 4)
+    assert perturbation.shape == (1, 2, 1)
+    assert torch.equal(
+        perturbation[0, :, 0], perturbation.new_tensor([2.0, 4.0]))
+
+
 
 def test_roles_declaration_and_loader():
     import tempfile

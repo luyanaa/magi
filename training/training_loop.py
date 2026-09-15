@@ -135,6 +135,25 @@ def apply_precision(config: Dict, precision: Optional[str]) -> Dict:
     cfg.pop("bf16", None)
     return cfg
 
+def _enable_deepspeed_gradient_overflow_check(engine: Any) -> bool:
+    """Make ZeRO reject non-finite autocast gradients before an Adam update.
+
+    DeepSpeed's ``torch_autocast`` path can leave
+    ``DeepSpeedZeroOptimizer.check_grad_overflow`` disabled even though the
+    gradients are still accumulated in reduced precision.  A non-finite
+    gradient can then poison Adam's moment state and turn later parameters
+    into NaN.  Enabling the built-in overflow path keeps the model's mixed
+    precision forward pass unchanged; it only skips an unsafe update.
+    """
+    optimizer = getattr(engine, "optimizer", None)
+    if optimizer is None or not hasattr(optimizer, "check_overflow"):
+        return False
+    if not hasattr(optimizer, "check_grad_overflow"):
+        return False
+    optimizer.check_grad_overflow = True
+    return True
+
+
 
 def rectify_deepspeed_config(
     config: Dict,
@@ -200,18 +219,18 @@ def reduce_control(
     reduction: str = "resample",
     rollout_steps: int = 1,
 ) -> torch.Tensor:
-    """Reduce windowed control ``(B, U, T)`` to per-step perturbation.
+    """Reduce windowed control ``(B, U, T)`` to perturbation inputs.
 
     - ``resample`` (default): ``rollout_steps`` segment means -> ``(B, K, U)``
-      for per-latent-step conditioning.  With ``rollout_steps == 1`` this is
-      a single window mean, identical to ``mean``.
-    - ``peak``/``max``: segment maxima -> ``(B, K, U)``.  Use this for sparse
+      for per-step conditioning when only the current window is available.
+    - ``peak``/``max``: segment maxima -> ``(B, K, U)``. Use this for sparse
       optogenetic pulses when a segment mean would dilute the intervention.
-    - ``mean``: one control vector per window, collapsing all within-window
-      timing.  A salt step, a grating onset, or an event time is reduced to
-      the window average, so the model can no longer see when the stimulus
-      happened — keep this only for genuinely stationary controls.
+    - ``mean``: one control vector per window, collapsing within-window timing.
     - ``last``: last frame in the window.
+
+    Multi-horizon loaders expose each future control window separately. The
+    partitioner reduces those windows independently; this function keeps the
+    single-window primitive used by both paths.
     """
     if control.dim() == 2:
         return control
@@ -295,6 +314,33 @@ def pad_control_features(
     return F.pad(control, (0, 0, 0, width - control.shape[1]))
 
 
+def _reduce_future_control(
+    control: torch.Tensor,
+    reduction: str,
+    rollout_steps: int,
+) -> torch.Tensor:
+    """Reduce aligned future controls ``(B, K, U, T)`` to ``(B, K, U)``."""
+    if control.dim() != 4:
+        raise ValueError(
+            "future control must have shape (B, K, U, T)")
+    batch, horizons, channels, time = control.shape
+    steps = max(1, int(rollout_steps))
+    if horizons != steps:
+        raise ValueError(
+            f"future control provides {horizons} horizons but "
+            f"rollout_steps={steps}")
+    reduced = reduce_control(
+        control.reshape(batch * horizons, channels, time),
+        reduction,
+        rollout_steps=1)
+    if reduced.dim() == 3:
+        reduced = reduced[:, 0]
+    if reduced.dim() != 2:
+        raise ValueError(
+            "future control reduction must return one vector per horizon")
+    return reduced.reshape(batch, horizons, channels)
+
+
 def partition_generic_batch(
     batch,
     signal_modalities,
@@ -307,7 +353,14 @@ def partition_generic_batch(
     require_multi_horizon: bool = False,
     control_dim: Optional[int] = None,
 ):
-    """Split a loader batch into current signals, future targets, and control."""
+    """Split a loader batch into current signals, future targets, and control.
+
+    For a multi-horizon control modality, ``<modality>_future`` is reduced
+    independently per future window so the perturbation step matches the
+    corresponding full-window target. ``<modality>_next`` and then the current
+    context remain compatibility fallbacks when aligned future controls are
+    unavailable.
+    """
     moved = {
         key: move_to_device(value, device)
         for key, value in batch.items()
@@ -393,12 +446,53 @@ def partition_generic_batch(
         if key in moved:
             targets[key] = moved[key]
     perturbation = None
-    control_parts = [moved[m] for m in control_modalities if m in moved]
-    if control_parts:
-        concatenated = torch.cat(control_parts, dim=1)
-        concatenated = pad_control_features(concatenated, control_dim)
-        perturbation = reduce_control(
-            concatenated, control_reduction, rollout_steps)
+    control_sources = []
+    has_aligned_future = False
+    steps = max(1, int(rollout_steps))
+    for modality in control_modalities:
+        current = moved.get(modality)
+        if current is None:
+            continue
+        future = moved.get(f"{modality}_future")
+        if future is not None:
+            if future.dim() != 4:
+                raise ValueError(
+                    f"{modality}_future control must have shape (B,K,U,T)")
+            if future.shape[1] != steps:
+                raise ValueError(
+                    f"{modality}_future provides {future.shape[1]} horizons "
+                    f"but rollout_steps={steps}")
+            control_sources.append(future)
+            has_aligned_future = True
+        else:
+            # A one-step future control is still preferable to the context
+            # window. With no multi-horizon control available, the existing
+            # segment reduction remains the least surprising fallback.
+            control_sources.append(
+                moved.get(f"{modality}_next", current))
+    if control_sources:
+        if has_aligned_future:
+            aligned_sources = []
+            for control in control_sources:
+                if control.dim() == 3:
+                    control = control.unsqueeze(1).expand(
+                        -1, steps, -1, -1)
+                aligned_sources.append(control)
+            concatenated = torch.cat(aligned_sources, dim=2)
+            flat = concatenated.reshape(
+                concatenated.shape[0] * concatenated.shape[1],
+                concatenated.shape[2], concatenated.shape[3])
+            flat = pad_control_features(flat, control_dim)
+            concatenated = flat.reshape(
+                concatenated.shape[0], concatenated.shape[1],
+                flat.shape[1], flat.shape[2])
+            perturbation = _reduce_future_control(
+                concatenated, control_reduction, steps)
+        else:
+            concatenated = torch.cat(control_sources, dim=1)
+            concatenated = pad_control_features(concatenated, control_dim)
+            perturbation = reduce_control(
+                concatenated, control_reduction, rollout_steps)
     return signals, targets, perturbation
 
 
@@ -800,6 +894,12 @@ class BrainMoETrainer:
                 model_parameters=self.model.parameters(),
                 config=deepspeed_config,
             )
+            self._deepspeed_overflow_guard = (
+                _enable_deepspeed_gradient_overflow_check(self.ds_engine))
+            if self._deepspeed_overflow_guard and self.is_main_process:
+                print(
+                    "[STABILITY] DeepSpeed gradient-overflow checking enabled; "
+                    "mixed-precision autocast remains active")
             self.scaler = None  # DeepSpeed manages its own mixed precision
         else:
             self.ds_config = None
@@ -1155,6 +1255,15 @@ class BrainMoETrainer:
             "global_rank": self.rank,
         }
 
+        # Profile identity: an evaluation picks a checkpoint and a species
+        # profile independently, so the checkpoint records which profile
+        # produced it (train.py hashes the resolved config file). Evaluators
+        # compare the two instead of trusting that the pairing is right.
+        config_sha = self.config.get("config_sha256")
+        if config_sha:
+            state["config_sha256"] = str(config_sha)
+            state["config_path"] = str(self.config.get("config_path", ""))
+
         if self.optimizer is not None and self.ds_engine is None:
             state["optimizer_state"] = self.optimizer.state_dict()
 
@@ -1182,8 +1291,12 @@ class BrainMoETrainer:
             if self.is_main_process:
                 print(f"[Elastic] World size changed: {saved_world_size} → {self.world_size}. "
                       f"Checkpoint was saved on {saved_world_size} ranks, now running on {self.world_size}.")
-
-        model = self.ds_engine if self.ds_engine is not None else self.model
+        # Load the raw module state even when DeepSpeed wraps it. Checkpoints
+        # written by the native trainer use unprefixed keys, while
+        # ``DeepSpeedEngine.state_dict()`` exposes ``module.``-prefixed keys.
+        # ``self.model`` is the same module passed to DeepSpeed at init and is
+        # therefore the portable checkpoint boundary.
+        model = self.model
         try:
             model.load_state_dict(checkpoint["model_state"])
         except RuntimeError:
@@ -1204,8 +1317,8 @@ class BrainMoETrainer:
             if self.is_main_process and skipped > 0:
                 print(f"[Elastic] Skipped {skipped} keys due to shape mismatch")
             model.load_state_dict(converted)
-
-        if self.optimizer is not None and "optimizer_state" in checkpoint:
+        if (self.ds_engine is None and self.optimizer is not None
+                and "optimizer_state" in checkpoint):
             self.optimizer.load_state_dict(checkpoint["optimizer_state"])
 
         return checkpoint["step"], checkpoint["phase"]
@@ -1615,27 +1728,37 @@ class BrainMoETrainer:
         tensors = self._generic_batch_tensors if tensors is None else tensors
         metrics: Dict[str, float] = {}
         reduction = getattr(self, "control_reduction", "resample")
+        rollout_steps = max(1, int(getattr(self, "_rollout_steps", 1)))
         for modality in getattr(self, "control_modalities", ()) or ():
-            track = tensors.get(modality)
+            track = tensors.get(f"{modality}_future")
+            diagnostic_steps = 1
+            if isinstance(track, torch.Tensor) and track.dim() == 4:
+                # Each future window is one physical rollout horizon; flatten
+                # the horizon axis so diagnostics use the same reduction as
+                # the aligned partitioner.
+                track = track.reshape(
+                    -1, track.shape[2], track.shape[3])
+            else:
+                track = tensors.get(
+                    f"{modality}_next", tensors.get(modality))
+                diagnostic_steps = rollout_steps
             if not isinstance(track, torch.Tensor) or track.dim() != 3:
                 continue
-            stats = control_diagnostics(track, reduction,
-                                        getattr(self, "_rollout_steps", 1))
-            metrics.update({f"{modality}_{k}": v for k, v in stats.items()})
+            stats = control_diagnostics(track, reduction, diagnostic_steps)
             if (not getattr(self, "_control_warned", False)
                     and reduction == "resample"
-                    and int(getattr(self, "_rollout_steps", 1)) == 1
+                    and diagnostic_steps == 1
                     and stats.get("control_active_frac", 0.0) > 0.0
                     and stats.get("control_collapse_ratio", 1.0) < 0.1):
                 self._control_warned = True
                 print(
-                    f"[Control] '{modality}': with rollout_steps=1 the window "
-                    f"mean is the only control the model sees "
+                    f"[Control] '{modality}': each future window is reduced "
+                    f"to one control mean "
                     f"(collapse ratio "
                     f"{stats.get('control_collapse_ratio', 0.0):.3f}, "
                     f"active {stats.get('control_active_frac', 0.0):.2f}). "
                     f"For an alternating drive use "
-                    f"control_reduction=\"last\" or rollout_steps>1, "
+                    f"control_reduction=\"last\" or preserve finer timing, "
                     f"otherwise the stimulus timing is discarded.")
         return metrics
 
@@ -2721,6 +2844,11 @@ class BrainMoETrainer:
 
             step += 1
 
+        # Parity with the Magi pretraining path: a phase that completes must
+        # persist its weights. Without this save, a bounded run whose budget
+        # never lands on the 5000-step save/validation cadence finishes every
+        # phase and leaves nothing behind.
+        self.save_checkpoint(step, phase_name)
         return step
 
     def _apply_hebbian_spectral_norm(self, model):

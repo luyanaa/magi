@@ -1,10 +1,13 @@
 """Focused contracts for the normalized training-phase boundary."""
 
+import json
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from train import parse_phases
+from train import apply_data_profile_rollout_contract, parse_phases
 from brain_moe_pinn.training.losses import TotalLoss
 from brain_moe_pinn.training.training_loop import (
     BrainMoETrainer,
@@ -54,22 +57,36 @@ def test_forecast_phase_declares_multi_horizon_contract():
     assert phase["loss_weights"]["cross_modal"] == 0.0
 
 
+def test_data_profile_drives_rollout_and_horizon_weights():
+    root = Path(__file__).resolve().parents[1]
+    with (root / "configs/data/c_elegans_unified.json").open() as handle:
+        profile = json.load(handle)
 
-def test_scale_preservation_schedule_covers_all_post_p2_phases():
-    phases = [get_stage_1_p3(), get_stage_1_p4(),
-              get_stage_1_p5(), get_stage_1_p6()]
+    phases = apply_data_profile_rollout_contract(
+        parse_phases("1"), profile)
 
-    assert all(phase.loss_weights.forecast_variance == 1.0
-               for phase in phases)
-    assert all(phase.learning_rate == 1e-4
-               and phase.min_lr == 1e-4
-               and phase.warmup_steps == 0
-               and phase.lr_schedule == "flat"
-               for phase in phases[1:])
+    assert profile["rollout_steps"] == profile["future_steps"] == 3
+    assert profile["rollout_horizon_weights"] == [1.0, 0.5, 0.25]
+    assert all(phase["rollout_steps"] == 3 for phase in phases)
+    assert all(phase["rollout"]["steps"] == 3 for phase in phases)
+    assert all(
+        phase["loss_weights"].forecast_horizon_weights
+        == (1.0, 0.5, 0.25)
+        for phase in phases)
+
+
+def test_data_profile_rejects_inconsistent_rollout_contract():
+    with pytest.raises(ValueError, match="exactly one value per"):
+        apply_data_profile_rollout_contract(
+            parse_phases("1"),
+            {
+                "future_steps": 3,
+                "rollout_steps": 3,
+                "rollout_horizon_weights": [1.0, 0.5],
+            })
+
 
 def test_total_loss_syncs_forecast_criteria_to_runtime_horizons():
-    from brain_moe_pinn.training.losses import CompositeForecastLoss
-
     phase_weights = LossWeights(
         recon_extra={"calcium": 1.0},
         forecast=1.0,
@@ -81,27 +98,9 @@ def test_total_loss_syncs_forecast_criteria_to_runtime_horizons():
     total_loss = TotalLoss(LossWeights())
     total_loss.loss_weights = phase_weights
     total_loss.use_loss_normalization = False
-    warning = total_loss.configure_forecast(
-        phase_weights, rollout_steps=3)
 
-    prediction = torch.randn(2, 3, 2, 8)
-    target = torch.randn(2, 3, 2, 8)
-    value, _ = total_loss(
-        {
-            "calcium_recon": prediction[:, -1],
-            "calcium_recon_sequence": prediction,
-        },
-        {"calcium": target},
-    )
-    expected = CompositeForecastLoss(
-        huber_weight=0.25,
-        corr_diff_weight=2.0,
-        horizon_weights=None,
-    )(prediction, target)
-
-    assert warning is not None
-    assert "using equal horizon weights" in warning
-    assert torch.allclose(value, expected)
+    with pytest.raises(ValueError, match="resolve the data-profile"):
+        total_loss.configure_forecast(phase_weights, rollout_steps=3)
 
 
 def test_generic_reconstruction_does_not_duplicate_dedicated_terms():
@@ -176,6 +175,13 @@ def test_phase_accumulation_is_consistent_across_stage_one():
 def test_phase_six_declares_context_length():
     phase = parse_phases("1")[-1]
     assert phase["max_seq_len_eeg"] == 4096
+
+
+
+def test_phase_six_uses_stable_long_rollout_learning_rate():
+    phase = get_stage_1_p6().to_runtime_config()
+    assert phase["learning_rate"] == pytest.approx(5e-5)
+    assert phase["min_lr"] == pytest.approx(5e-5)
 
 
 def test_trainer_freeze_policy_includes_velocity_brain():

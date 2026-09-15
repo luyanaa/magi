@@ -426,3 +426,16 @@ def set_device(local_rank: int):
 def current_device_name() -> str:
     """Human-readable name of the current accelerator."""
     return _detect_accelerator() or "cpu"
+
+
+def pin_memory_supported(device: Optional[Union[str, torch.device]] = None) -> bool:
+    """Whether pinned host memory is useful on the resolved device.
+
+    Pinned buffers let host->device copies overlap compute; CUDA and XPU
+    implement that path. Everywhere else the flag is inert, and MPS warns on
+    every DataLoader construction, so the decision lives here instead of being
+    hardcoded at each loader call site (same policy as every other device
+    decision in this module).
+    """
+    device_type = get_device_type(device)
+    return device_type in ("cuda", "xpu") and _device_available(device_type)

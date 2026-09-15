@@ -19,7 +19,7 @@
   "persistent_workers": true,
   "prefetch_factor": 4,
   "split_by": "subject",
-  "val_frac": 0.1,
+  "val_frac": 1.0,
   "align_channels": false,
   "max_union_channels": 302,
   "return_masks": true,
@@ -30,14 +30,11 @@
   "rollout_steps": 3,
   "rollout_horizon_weights": [1.0, 0.5, 0.25],
   "normalization": "none",
-  "recon_loss_mix": {
-    "calcium": {
-      "correlation": 0.55,
-      "corr_diff": 0.20,
-      "wasserstein1": 0.25
-    }
-  },
   "use_trials": false,
   "control_width": 282,
-  "control_note": "Unified source-harmonized control: 15-second context windows at each manifest rate. For multi-horizon rollouts, each complete future control window is reduced independently into one perturbation vector; current-window segment reduction is only the fallback when future controls are absent. Feature 0 is the scalar Toyoshima salt or Randi waveform; features 1..281 are Randi recording-local target gates. HuggingFace rows omit the control modality. Calcium IDs remain source-local and are not union-aligned."
+  "include_sources": [
+    "randi_pumpprobe"
+  ],
+  "control_align": true,
+  "control_note": "Intervention view of the unified manifest (Randi PumpProbe rows). Each evaluation window starts at the first frame where the target-gated opto drive is non-zero, because the first eligible 15-second window is pre-stimulus (measured onsets 19-126 s). Free-run reports use configs/data/c_elegans_unified_audit_randi.json instead."
 }

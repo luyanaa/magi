@@ -48,7 +48,9 @@
       "calcium": {
         "imaging": "spinning_disk_4d",
         "reporter": "yc2.60",
-        "readout": "ratio"
+        "readout": "ratio",
+        "observed_space": "standardized",
+        "already_filtered": true
       }
     }
   },

@@ -18,11 +18,15 @@ duplicated labels are canonical IDs.
 
 The pulse waveform follows the supplied TSMixer-Ext notebook: three consecutive
 levels (3.0, 1.5, 0.75) for ten source frames each.  At the observed 0.5-second
-frame interval this is a 15-second pulse.  Fluorescence values outside the
-explicit [0, 200] range, including NaN/Inf, are masked frame-by-frame rather
+frame interval this is a 15-second pulse.  The legacy default masks fluorescence
+outside the explicit [0, 200] range, including NaN/Inf, frame-by-frame rather
 than deleting an entire channel; this retains target positions while preventing
-extreme values from entering the model.  Valid values are per-channel min-max
-scaled to [-3, 3] by default, matching the notebook's model input scale.
+extreme values from entering the legacy model input.  Valid values are
+per-channel min-max scaled to [-3, 3] by default, matching the notebook's model
+input scale.  That scale is not a physical fluorescence calibration.  For
+physical analysis, use ``scale='none'`` with explicit bounds, or
+``scale='prefix_minmax'`` with a calibration prefix so future frames cannot
+set the input scale.
 
 Usage::
 
@@ -133,12 +137,21 @@ def _clean_calcium(
     scale: str,
     output_min: float = DEFAULT_OUTPUT_MIN,
     output_max: float = DEFAULT_OUTPUT_MAX,
+    fit_frames: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
-    """Mask invalid fluorescence and optionally scale each channel."""
-    if scale not in {"none", "minmax"}:
-        raise ValueError("scale must be 'none' or 'minmax'")
+    """Mask invalid fluorescence and scale without leaking future frames."""
+    if scale not in {"none", "minmax", "prefix_minmax"}:
+        raise ValueError(
+            "scale must be 'none', 'minmax', or 'prefix_minmax'")
     if min_value is not None and max_value is not None and min_value >= max_value:
         raise ValueError("min_value must be less than max_value")
+    if fit_frames is not None and int(fit_frames) <= 0:
+        raise ValueError("fit_frames must be positive when supplied")
+    if scale == "prefix_minmax" and fit_frames is None:
+        raise ValueError("prefix_minmax requires fit_frames")
+    if scale != "prefix_minmax" and fit_frames is not None:
+        raise ValueError(
+            "fit_frames is only valid with scale='prefix_minmax'")
 
     finite = np.isfinite(raw)
     valid = finite.copy()
@@ -151,24 +164,35 @@ def _clean_calcium(
         above = finite & (raw > float(max_value))
         valid &= raw <= float(max_value)
 
+    if scale == "prefix_minmax":
+        scale_fit_frames = min(int(fit_frames), raw.shape[0])
+    elif scale == "minmax":
+        scale_fit_frames = raw.shape[0]
+    else:
+        scale_fit_frames = 0
+
     cleaned = np.zeros(raw.shape, dtype=np.float64)
     if scale == "none":
         cleaned[valid] = raw[valid]
     else:
-        # Fit each channel only on valid source values.  Invalid frames remain
-        # zero and are excluded by the emitted calcium mask.
+        # Fit each channel only on the declared calibration scope. Invalid
+        # frames remain zero and are excluded by the emitted calcium mask.
         for channel in range(raw.shape[1]):
             channel_valid = valid[:, channel]
-            if not channel_valid.any():
+            fit_valid = channel_valid.copy()
+            if scale == "prefix_minmax":
+                fit_valid[scale_fit_frames:] = False
+            if not fit_valid.any():
                 continue
-            values = raw[channel_valid, channel]
+            values = raw[fit_valid, channel]
             lo = float(values.min())
             hi = float(values.max())
             if hi <= lo:
                 continue
             cleaned[channel_valid, channel] = (
                 float(output_min)
-                + (values - lo) * (float(output_max) - float(output_min))
+                + (raw[channel_valid, channel] - lo)
+                * (float(output_max) - float(output_min))
                 / (hi - lo)
             )
 
@@ -178,6 +202,13 @@ def _clean_calcium(
         "raw_above_max_frames": int(above.sum()),
         "raw_invalid_frames": int((~valid).sum()),
         "raw_all_invalid_channels": int((~valid.any(axis=0)).sum()),
+        "scale_fit_frames": int(scale_fit_frames),
+        "scale_fit_uses_future_frames": int(scale == "minmax"),
+        "scale_fit_empty_channels": int(sum(
+            not (valid[:scale_fit_frames, channel].any()
+                 if scale_fit_frames else False)
+            for channel in range(raw.shape[1])
+        )) if scale != "none" else 0,
     }
     return (
         np.ascontiguousarray(cleaned.T, dtype=np.float32),
@@ -283,7 +314,6 @@ def _build_opto(
         events.append(event)
     return control, windows, events, invalid_count
 
-
 def _write_companion(
     path: Path,
     content: str,
@@ -325,6 +355,7 @@ def convert_randi_directory(
     min_value: Optional[float] = DEFAULT_MIN_VALUE,
     max_value: Optional[float] = DEFAULT_MAX_VALUE,
     scale: str = "minmax",
+    fit_frames: Optional[int] = None,
     overwrite: bool = False,
 ) -> Path:
     """Convert Randi text recordings into canonical ``calcium`` + ``opto``.
@@ -382,6 +413,7 @@ def convert_randi_directory(
             min_value=min_value,
             max_value=max_value,
             scale=scale,
+            fit_frames=fit_frames,
         )
         opto, windows, events, invalid_events = _build_opto(
             raw.shape[0], targets, starts, labels,
@@ -422,6 +454,10 @@ def convert_randi_directory(
                 f"{min_value if min_value is not None else '-inf'}:"
                 f"{max_value if max_value is not None else 'inf'}"
             ),
+            "observation_space": (
+                "source_fluorescence" if scale == "none"
+                else "model_representation"),
+            "physical_calibration": "unavailable",
             "timestamp_start_s": f"{timestamps[0]:.9g}",
             "timestamp_end_s": f"{timestamps[-1]:.9g}",
             "frame_count": str(int(raw.shape[0])),
@@ -506,8 +542,13 @@ def main() -> None:
                         help="inclusive valid fluorescence lower bound")
     parser.add_argument("--max-value", type=float, default=DEFAULT_MAX_VALUE,
                         help="inclusive valid fluorescence upper bound")
-    parser.add_argument("--scale", choices=("none", "minmax"), default="minmax",
-                        help="valid calcium output scaling")
+    parser.add_argument(
+        "--scale", choices=("none", "minmax", "prefix_minmax"),
+        default="minmax",
+        help="valid calcium output scaling; prefix_minmax uses --fit-frames")
+    parser.add_argument(
+        "--fit-frames", type=int, default=None,
+        help="calibration-prefix length for prefix_minmax; never uses future frames")
     parser.add_argument("--overwrite", action="store_true",
                         help="overwrite existing sample arrays and companions")
     args = parser.parse_args()
@@ -521,6 +562,7 @@ def main() -> None:
         min_value=args.min_value,
         max_value=args.max_value,
         scale=args.scale,
+        fit_frames=args.fit_frames,
         overwrite=args.overwrite,
     )
 

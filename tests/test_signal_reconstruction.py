@@ -17,8 +17,8 @@ from brain_moe_pinn.core.observation_adapters import (
     _linear_resample,
     _portable_resample_required,
     _resample_time,
+    preserve_signal_scale,
 )
-
 
 def _make_generic_model():
     torch.manual_seed(0)
@@ -96,6 +96,13 @@ def test_forward_modalities_reconstructs_arbitrary_signal():
     out = model.forward_modalities(signals, reconstruct=True, num_steps=2)
     recon = out["calcium_recon"]
     assert recon.shape == signals["calcium"].shape
+    # Reconstruction gain is anchored to the raw context per channel.
+    assert torch.allclose(
+        recon.std(dim=-1, unbiased=False),
+        signals["calcium"].std(dim=-1, unbiased=False),
+        atol=1e-5,
+        rtol=1e-5,
+    )
     # Any modality under the channel cap gets reconstructed, behavior included.
     assert "behavior_recon" in out
     assert out["behavior_recon"].shape == signals["behavior"].shape
@@ -126,6 +133,42 @@ def test_forward_modalities_reconstructs_arbitrary_signal():
         if p.grad is not None
     )
     assert dynamics_grad > 0 and head_grad > 0 and adapter_grad > 0
+
+
+def test_preserve_signal_scale_handles_masks_and_constant_channels():
+    reference = torch.tensor(
+        [[[1.0, 2.0, 3.0, 4.0, 99.0, 99.0],
+          [7.0, 7.0, 7.0, 7.0, 7.0, 7.0]]])
+    mask = torch.tensor(
+        [[[True, True, True, True, False, False],
+          [True, True, True, True, True, True]]])
+    prediction = torch.randn(1, 2, 6)
+    output = preserve_signal_scale(prediction, reference, mask)
+    reference_std = reference[:, 0, :4].std(dim=-1, unbiased=False)
+    output_std = output[:, 0].std(dim=-1, unbiased=False)
+    assert torch.allclose(output_std, reference_std, atol=1e-6)
+    assert torch.allclose(
+        output[:, 1].std(dim=-1, unbiased=False),
+        torch.zeros(1),
+        atol=1e-6,
+    )
+
+
+def test_preserve_signal_scale_uses_float32_stats_for_low_precision_inputs():
+    reference = torch.tensor(
+        [[[1000.0, 1001.0, 1002.0, 1003.0]]], dtype=torch.float16)
+    prediction = torch.tensor(
+        [[[-1.0, 0.0, 1.0, 0.0]]], dtype=torch.float16)
+
+    output = preserve_signal_scale(prediction, reference)
+
+    assert output.dtype == prediction.dtype
+    assert torch.allclose(
+        output.float().std(dim=-1, unbiased=False),
+        reference.float().std(dim=-1, unbiased=False),
+        atol=1e-3,
+        rtol=1e-3,
+    )
 
 
 def test_forward_modalities_recon_channel_cap_falls_back():

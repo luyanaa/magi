@@ -158,7 +158,7 @@ def test_diffusion_fit_and_sample_shapes():
     win = make_windows(z, Lc, Lt, stride=4)
     diff = LatentDiffusion(dim=D, context=Lc, target=Lt, t_steps=20,
                            hidden=16)
-    diff.fit(torch.tensor(win, dtype=torch.float32), epochs=2, batch=16,
+    diff.fit(win, epochs=2, batch=16,
              progress=False)
     out = diff.sample(z[:Lc], length=60, n_roll=2, progress=False)
     assert out.shape[1] == D and out.shape[0] >= 60

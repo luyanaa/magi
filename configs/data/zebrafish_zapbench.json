@@ -23,5 +23,6 @@
   ],
   "control_reduction": "resample",
   "rollout_steps": 1,
+  "rollout_horizon_weights": [1.0],
   "seed": 0
 }
