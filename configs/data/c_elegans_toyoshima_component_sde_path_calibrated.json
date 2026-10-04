@@ -1,0 +1,42 @@
+{
+  "kind": "species",
+  "root": "../../../data_ladder/c_elegans_unified",
+  "modalities": ["calcium", "stimulus"],
+  "roles": {"calcium": "signal", "stimulus": "control"},
+  "control_modalities": ["stimulus"],
+  "control_reduction": "resample",
+  "seq_seconds": 15.0,
+  "batch_size": 1,
+  "num_workers": 2,
+  "pin_memory": true,
+  "persistent_workers": true,
+  "prefetch_factor": 4,
+  "split_by": "subject",
+  "val_frac": 0.1,
+  "include_sources": ["toyoshima_salt"],
+  "align_channels": true,
+  "max_union_channels": 177,
+  "channel_order_file": "c_elegans_toyoshima_component_channel_order.txt",
+  "return_masks": true,
+  "return_next_step_targets": true,
+  "future_steps": 8,
+  "rollout_steps": 8,
+  "rollout_horizon_weights": [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3],
+  "forecast_objective": "path_calibrated",
+  "forecast_crps": 0.25,
+  "forecast_path_energy": 1.0,
+  "forecast_path_autocorr": 0.05,
+  "forecast_overdispersion": 0.1,
+  "forecast_recon_extra": {"calcium": 0.0},
+  "recon_loss_mix": {
+    "calcium": {
+      "correlation": 0.55,
+      "corr_diff": 0.20,
+      "wasserstein1": 0.25
+    }
+  },
+  "normalization": "none",
+  "control_width": 282,
+  "use_trials": false,
+  "control_note": "Path-law fine-tune, not a control-response validation: each 15-second future control window is reduced to its mean (resample with one segment); the prior run measured collapse ratio 0.016 and active fraction 0.00. Preserve subwindow control timing in a separate P0 change."
+}

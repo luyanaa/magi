@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
@@ -208,6 +209,9 @@ class FeatureConfig:
     decoder to match a filtered, non-linearly encoded observable. Driven by the
     profile's ``data.sensors`` blocks. Opt-in; the dynamics are unaffected."""
     use_generic_observation_adapter: bool = False
+    scale_anchor: str = "off"
+    """Observation scale policy: ``off`` or context anchoring; independent
+    of the latent transition law."""
     use_stochastic_noise: bool = False
     noise_mode: str = "off"
     """SDE noise policy: off | rollout | train | always (see
@@ -413,6 +417,25 @@ class ExperimentConfig:
             raise ValueError("region_count must be positive when provided")
         if self.features.noise_mode not in ("off", "rollout", "train", "always"):
             raise ValueError("noise_mode must be off|rollout|train|always")
+        if self.features.transition_mode not in {"ode", "sde"}:
+            raise ValueError("transition_mode must be 'ode' or 'sde'")
+        if self.features.scale_anchor not in {"off", "context"}:
+            raise ValueError("scale_anchor must be 'off' or 'context'")
+        if (self.features.diffusion_rank is not None
+                and not 0 < self.features.diffusion_rank <= self.latent_dim):
+            raise ValueError("diffusion_rank must be in 1..latent_dim")
+        if (not math.isfinite(self.features.diffusion_floor)
+                or self.features.diffusion_floor <= 0):
+            raise ValueError("diffusion_floor must be finite and positive")
+        if (not math.isfinite(self.features.diffusion_scale)
+                or self.features.diffusion_scale < 0):
+            raise ValueError(
+                "diffusion_scale must be finite and non-negative")
+        if self.features.stochastic_samples < 2:
+            raise ValueError("stochastic_samples must be at least 2")
+        if (self.features.transition_mode == "sde"
+                and self.features.noise_mode != "off"):
+            raise ValueError("SDE transitions require noise_mode='off'")
         if self.features.eeg_backend not in {"v1", "v2"}:
             raise ValueError("eeg_backend must be 'v1' or 'v2'")
         if self.features.eeg_backend == "v2" and not ({"eeg", "ecog"} & set(self.data.modalities)):
@@ -500,6 +523,13 @@ class ExperimentConfig:
             "use_species_conditioning": self.features.use_species_conditioning,
             "use_sensor_emission": self.features.use_sensor_emission,
             "generic_observation_only": self.features.use_generic_observation_adapter,
+            "scale_anchor": self.features.scale_anchor,
+            "noise_mode": self.features.noise_mode,
+            "transition_mode": self.features.transition_mode,
+            "diffusion_rank": self.features.diffusion_rank,
+            "diffusion_floor": self.features.diffusion_floor,
+            "diffusion_scale": self.features.diffusion_scale,
+            "stochastic_samples": self.features.stochastic_samples,
             "use_meg": self.features.use_meg,
             "use_channel_type_embed": self.features.use_channel_type_embed,
             "moe_num_shared": self.features.moe_num_shared,

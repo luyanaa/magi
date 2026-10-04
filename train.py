@@ -27,7 +27,7 @@ import hashlib
 import json
 import math
 import signal
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 import torch
@@ -46,7 +46,9 @@ from brain_moe_pinn.runtime.device_utils import pin_memory_supported
 from brain_moe_pinn.training.training_loop import BrainMoETrainer
 from brain_moe_pinn.training.training_loop import (
     apply_precision,
+    enforce_sde_forecast_contract,
     rectify_deepspeed_config,
+    resolve_recon_modalities,
     _PRECISION_DTYPES,
 )
 from brain_moe_pinn.training.training_phases import (
@@ -441,19 +443,69 @@ def apply_data_profile_rollout_contract(phases, data_profile):
 
 
 def apply_data_profile_loss_overrides(phases, data_profile):
-    """Apply bounded objective overrides declared by a data profile."""
+    """Apply a profile's bounded forecast-objective overrides."""
     if not isinstance(data_profile, dict):
         raise TypeError("data_profile must be a mapping")
+    objective = data_profile.get("forecast_objective")
+    if objective not in (None, "crps_only", "path_calibrated"):
+        raise ValueError(
+            "forecast_objective must be omitted, 'crps_only', or "
+            "'path_calibrated'")
+    scalar_fields = {
+        "forecast_center": "forecast",
+        "forecast_corr_diff": "forecast_corr_diff",
+        "forecast_variance": "forecast_variance",
+        "forecast_autocorr": "forecast_autocorr",
+        "forecast_path_energy": "forecast_path_energy",
+        "forecast_path_autocorr": "forecast_path_autocorr",
+        "forecast_overdispersion": "forecast_overdispersion",
+        "forecast_crps": "forecast_crps",
+    }
     overrides = {}
-    for name in ("forecast_autocorr", "forecast_crps"):
-        if name not in data_profile:
+    for profile_key, loss_key in scalar_fields.items():
+        if profile_key not in data_profile:
             continue
-        value = float(data_profile[name])
+        value = float(data_profile[profile_key])
         if not math.isfinite(value) or value < 0:
             raise ValueError(
-                f"data-profile {name} must be finite and non-negative")
-        overrides[name] = value
-    if not overrides:
+                f"data-profile {profile_key} must be finite and non-negative")
+        overrides[loss_key] = value
+    recon_override = data_profile.get("forecast_recon_extra")
+    if recon_override is not None:
+        if not isinstance(recon_override, dict):
+            raise TypeError("forecast_recon_extra must be a mapping")
+        recon_override = {
+            str(modality): float(weight)
+            for modality, weight in recon_override.items()
+        }
+        if any(not math.isfinite(weight) or weight < 0
+               for weight in recon_override.values()):
+            raise ValueError(
+                "forecast_recon_extra weights must be finite and non-negative")
+    if objective == "crps_only":
+        crps_weight = overrides.get("forecast_crps", 0.0)
+        if crps_weight <= 0:
+            raise ValueError(
+                "forecast_objective='crps_only' requires forecast_crps > 0")
+    if objective == "crps_only":
+        overrides["forecast"] = 1.0
+    elif objective == "path_calibrated":
+        required_weights = (
+            "forecast_crps",
+            "forecast_path_energy",
+            "forecast_path_autocorr",
+            "forecast_overdispersion",
+        )
+        missing = [
+            name for name in required_weights
+            if overrides.get(name, 0.0) <= 0
+        ]
+        if missing:
+            raise ValueError(
+                "forecast_objective='path_calibrated' requires positive "
+                + ", ".join(missing))
+        overrides["forecast"] = 1.0
+    if not overrides and recon_override is None:
         return phases
 
     resolved = []
@@ -461,22 +513,120 @@ def apply_data_profile_loss_overrides(phases, data_profile):
     for phase in phases:
         runtime_phase = dict(phase)
         loss_weights = runtime_phase.get("loss_weights")
-        if loss_weights is not None:
-            phase_overrides = dict(overrides)
-            if "forecast_crps" in phase_overrides:
-                if loss_weights.forecast > 0:
-                    crps_enabled |= phase_overrides["forecast_crps"] > 0
-                else:
-                    del phase_overrides["forecast_crps"]
-            if phase_overrides:
-                runtime_phase["loss_weights"] = replace(
-                    loss_weights, **phase_overrides)
+        if loss_weights is None or loss_weights.forecast <= 0:
+            resolved.append(runtime_phase)
+            continue
+        phase_overrides = dict(overrides)
+        if objective in ("crps_only", "path_calibrated"):
+            phase_overrides.update({
+                item.name: 0.0
+                for item in fields(loss_weights)
+                if isinstance(getattr(loss_weights, item.name), (int, float))
+                and not isinstance(getattr(loss_weights, item.name), bool)
+                and item.name != "sigreg_sketch_dim"
+            })
+            phase_overrides["forecast"] = 1.0
+            phase_overrides["forecast_crps"] = overrides["forecast_crps"]
+            if objective == "path_calibrated":
+                for name in (
+                    "forecast_path_energy",
+                    "forecast_path_autocorr",
+                    "forecast_overdispersion",
+                ):
+                    phase_overrides[name] = overrides[name]
+        if objective in ("crps_only", "path_calibrated"):
+            resolved_extra = {
+                modality: 0.0
+                for modality in (loss_weights.recon_extra or {})
+            }
+            if recon_override is not None:
+                resolved_extra.update(recon_override)
+            phase_overrides["recon_extra"] = resolved_extra
+        elif recon_override is not None:
+            phase_overrides["recon_extra"] = {
+                **(loss_weights.recon_extra or {}),
+                **recon_override,
+            }
+        runtime_phase["loss_weights"] = replace(
+            loss_weights, **phase_overrides)
+        resolved_weights = runtime_phase["loss_weights"]
+        crps_enabled = crps_enabled or (
+            resolved_weights.forecast_crps > 0
+            and resolved_weights.forecast > 0)
         resolved.append(runtime_phase)
     if overrides.get("forecast_crps", 0.0) > 0 and not crps_enabled:
         raise ValueError(
             "data-profile forecast_crps requires a selected phase with "
             "forecast loss enabled")
     return resolved
+
+
+def apply_trainable_parameter_prefixes(phases, prefixes, lr_scales=None):
+    """Apply a trainable-parameter allowlist and optional LR scales."""
+    if prefixes is None:
+        if lr_scales:
+            raise ValueError(
+                "trainable parameter LR scales require parameter prefixes")
+        return phases
+    if isinstance(prefixes, str):
+        prefixes = (prefixes,)
+    if not isinstance(prefixes, (list, tuple)):
+        raise TypeError("trainable parameter prefixes must be a list or tuple")
+    normalized = []
+    for prefix in prefixes:
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise ValueError("trainable parameter prefixes must be non-empty")
+        prefix = prefix.strip()
+        if prefix not in normalized:
+            normalized.append(prefix)
+    if not normalized:
+        if lr_scales:
+            raise ValueError(
+                "trainable parameter LR scales require parameter prefixes")
+        return phases
+    if len(phases) != 1:
+        raise ValueError(
+            "trainable parameter prefixes require exactly one selected phase")
+
+    if lr_scales is None:
+        lr_scales = ()
+    elif isinstance(lr_scales, str):
+        lr_scales = (lr_scales,)
+    elif not isinstance(lr_scales, (list, tuple)):
+        raise TypeError(
+            "trainable parameter LR scales must be a list or tuple")
+    parsed_scales = {}
+    for specification in lr_scales:
+        if not isinstance(specification, str) or "=" not in specification:
+            raise ValueError(
+                "trainable parameter LR scales must use PREFIX=FACTOR")
+        prefix, raw_scale = specification.rsplit("=", 1)
+        prefix = prefix.strip()
+        try:
+            scale = float(raw_scale)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid LR scale for parameter prefix {prefix!r}") from exc
+        if prefix not in normalized:
+            raise ValueError(
+                f"LR scale prefix {prefix!r} is not in the trainable "
+                "parameter allowlist")
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError("trainable parameter LR scales must be positive")
+        if prefix in parsed_scales:
+            raise ValueError(f"duplicate LR scale for prefix {prefix!r}")
+        parsed_scales[prefix] = scale
+
+    runtime_phase = dict(phases[0])
+    freeze_policy = {
+        "trainable_parameter_prefixes": tuple(normalized)
+    }
+    if parsed_scales:
+        freeze_policy["trainable_parameter_lr_scales"] = parsed_scales
+    runtime_phase["freeze_policy"] = freeze_policy
+    return [runtime_phase]
+
+
 
 
 def main():
@@ -495,8 +645,13 @@ def main():
                         help="Cap every selected phase's total_steps for a "
                              "bounded experiment run; the declared schedule "
                              "stays authoritative when a phase already fits")
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Resume from checkpoint path")
+    checkpoint_group = parser.add_mutually_exclusive_group()
+    checkpoint_group.add_argument(
+        "--resume", type=str, default=None,
+        help="Resume model, optimizer, step, and phase from a checkpoint")
+    checkpoint_group.add_argument(
+        "--init-checkpoint", type=str, default=None,
+        help="Initialize model weights only; start a fresh phase and optimizer")
     parser.add_argument("--log_dir", type=str, default="./logs",
                         help="Logging directory")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints",
@@ -552,6 +707,14 @@ def main():
     parser.add_argument("--use_species_conditioning", action="store_true", default=False)
     parser.add_argument("--perturbation_dim", type=int, default=None)
     parser.add_argument("--num_steps", type=int, default=1)
+    parser.add_argument(
+        "--trainable-parameter-prefix", action="append", default=None,
+        help="Keep only parameters matching this prefix trainable; repeat "
+             "for an explicit allowlist (requires one selected phase)")
+    parser.add_argument(
+        "--trainable-parameter-lr-scale", action="append", default=None,
+        help="Multiply the selected phase LR for one trainable parameter "
+             "prefix by FACTOR; repeat as PREFIX=FACTOR")
 
     args = parser.parse_args()
 
@@ -573,6 +736,11 @@ def main():
     # Parse phases
     phases = parse_phases(args.phase)
     phases = cap_phase_steps(phases, args.phase_steps)
+    phases = apply_trainable_parameter_prefixes(
+        phases,
+        args.trainable_parameter_prefix,
+        args.trainable_parameter_lr_scale,
+    )
 
     # Parse Mamba-2 kwargs
     mamba2_kwargs = None
@@ -631,7 +799,15 @@ def main():
 
     # Initialize trainer
     trainer_config = vars(args).copy()
+    trainer_config["trainable_parameter_prefixes"] = (
+        args.trainable_parameter_prefix or [])
     trainer_config["model_config"] = dict(config.__dict__)
+    trainer_config["phase_trainable_parameter_lr_scales"] = {
+        str(phase["name"]): dict(
+            phase.get("freeze_policy", {}).get(
+                "trainable_parameter_lr_scales", {}))
+        for phase in phases
+    }
     trainer_config["magi_pretraining_enabled"] = magi_pretraining_selected
     if args.config:
         trainer_config["config_path"] = str(config_path)
@@ -729,6 +905,12 @@ def main():
         if test_loader is not None:
             summary += f" / {len(test_loader.dataset)} test"
         print(f"[Data] Loaders built from {data_path} ({summary} samples)")
+    enforce_sde_forecast_contract(
+        phases,
+        model,
+        component_forecast_spec=trainer_config.get("component_forecast"),
+        recon_modalities=resolve_recon_modalities(trainer_config),
+    )
     # DeepSpeed's batch assertion is only satisfiable if the micro batch
     # equals what the loader yields and the accumulation matches the phase.
     deepspeed_config = rectify_deepspeed_config(
@@ -749,6 +931,8 @@ def main():
         val_dataloader=val_loader,
         test_dataloader=test_loader,
     )
+    if args.init_checkpoint:
+        trainer.load_model_checkpoint(args.init_checkpoint)
 
     # Install preemption handler for SLURM SIGTERM/USR1
     _install_preemption_handler(trainer)

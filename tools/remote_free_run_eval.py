@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""Run deterministic biological free-run evaluation on a GPU checkpoint.
+"""Evaluate deterministic ODE or sampled SDE free-run forecasts.
 
-The evaluator uses the production C. elegans loader, rolls the latent system
-forward without controls or observation reinjection, and compares the result
-with held-out future windows. It reports native statistics plus a TDE-RICA
-reference representation fitted only on each sample's context window. The
-per-sample context fit avoids asserting cross-source neuron identity in the
-unified federated ladder; for a fixed pre-fit motif basis, use
-``tools/tderica_free_run.py`` with that basis externally.
+The evaluator uses the production C. elegans loader and compares held-out
+future windows with autonomous rollouts. ODE reports preserve the existing
+single-path metrics. SDE reports keep the recursive transition-mean path
+separate from N sampled realizations; primary TDE-RICA W1/KL compare real
+features with the pooled projections of all sampled trajectories, never the
+transition-mean path. TDE-RICA bases are fit on each context window or loaded
+from a recording-local fixed basis, avoiding cross-source neuron identity
+assumptions.
 
-Each sample is labelled with its ladder source (``toyoshima_salt``,
-``randi_pumpprobe``, ``hf_activity``) and carries per-horizon native metrics,
-so one run yields the source x horizon breakdown without re-running the
-loader per source.
+Each sample is labelled with its ladder source and carries per-horizon
+trajectory metrics, so one run yields the source x horizon breakdown without
+re-running the loader per source.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import random
 import statistics
 import sys
 from pathlib import Path
@@ -34,7 +35,7 @@ if str(ROOT.parent) not in sys.path:
 
 from brain_moe_pinn import BrainMoEPINNConfig
 from brain_moe_pinn.diagnostics.free_run_metrics import (
-    run_free_run_suite, tderica_biological_report,
+    run_free_run_suite, sde_transition_diagnostics, tderica_biological_report,
 )
 from brain_moe_pinn.training.training_loop import partition_generic_batch
 
@@ -146,6 +147,39 @@ def _aggregate_numeric_mean(reports: Iterable[Dict[str, Any]], path: Tuple[str, 
     }
 
 
+def _mean_numeric_reports(reports: List[Any]) -> Any:
+    """Average matching numeric leaves without collapsing trajectories first."""
+    if not reports:
+        return {}
+    if all(isinstance(report, dict) for report in reports):
+        shared_keys = set.intersection(*(set(report) for report in reports))
+        return {
+            key: value
+            for key in sorted(shared_keys)
+            if (value := _mean_numeric_reports(
+                [report[key] for report in reports])) is not None
+        }
+    try:
+        arrays = [np.asarray(value, dtype=float) for value in reports]
+    except (TypeError, ValueError):
+        return None
+    if any(array.shape != arrays[0].shape for array in arrays[1:]):
+        return None
+    stacked = np.stack(arrays)
+    finite = np.isfinite(stacked)
+    if not finite.any():
+        return None
+    mean = np.divide(
+        np.where(finite, stacked, 0.0).sum(axis=0),
+        finite.sum(axis=0),
+        out=np.full(stacked.shape[1:], np.nan),
+        where=finite.sum(axis=0) > 0,
+    )
+    if not np.isfinite(mean).all():
+        return None
+    return float(mean) if mean.ndim == 0 else mean.tolist()
+
+
 
 
 _SOURCE_PREFIXES = {
@@ -172,38 +206,57 @@ def _source_label(sample_id: str, origin: str) -> str:
     return "unknown"
 
 
-def _horizon_reports(real_all: np.ndarray, generated_all: np.ndarray,
-                     rollouts: int) -> List[Dict[str, Any]]:
-    """Per-horizon native metrics for the ``K`` forecast windows.
 
-    ``real_all``/``generated_all`` are ``(K*T, C)`` in horizon order, so each
-    horizon is one contiguous ``T``-frame block. Reporting them separately is
-    what makes the stage/source/horizon table possible: a single concatenated
-    score cannot show whether horizon 3 collapsed while horizon 1 held.
-    """
+def _sampled_horizon_reports(
+    real_all: np.ndarray,
+    generated_samples_all: np.ndarray,
+    transition_mean_all: np.ndarray,
+    rollouts: int,
+) -> List[Dict[str, Any]]:
+    """Report horizon-local path statistics and native metrics."""
     frames_total = real_all.shape[0]
     if rollouts < 1 or frames_total % rollouts:
         raise ValueError(
             f"{frames_total} frames do not divide into {rollouts} horizons")
+    if generated_samples_all.ndim != 3:
+        raise ValueError("sample paths must have shape (S,T,C)")
+    if generated_samples_all.shape[1:] != real_all.shape:
+        raise ValueError("sample paths must match the real trajectory shape")
+    if transition_mean_all.shape != real_all.shape:
+        raise ValueError("transition mean must match the real trajectory shape")
     horizon_frames = frames_total // rollouts
-    entries: List[Dict[str, Any]] = []
+    entries = []
     for horizon in range(rollouts):
         start = horizon * horizon_frames
         stop = start + horizon_frames
         real = real_all[start:stop]
-        generated = generated_all[start:stop]
+        mean_path = transition_mean_all[start:stop]
+        samples = generated_samples_all[:, start:stop]
         if real.shape[0] < 3:
             continue
+        native = [
+            run_free_run_suite(real, generated)
+            for generated in samples
+        ]
         real_std = np.std(real, axis=0)
-        generated_std = np.std(generated, axis=0)
+        sample_ratios = (
+            np.std(samples, axis=1)
+            / np.maximum(real_std[None, :], 1e-12))
+        mean_std = np.std(mean_path, axis=0)
+        mean_path_std_ratio = float(
+            mean_std.mean() / max(real_std.mean(), 1e-12))
         entries.append({
             "horizon": horizon + 1,
             "frames": int(real.shape[0]),
-            "raw_std_ratio": float(
-                generated_std.mean() / max(real_std.mean(), 1e-12)),
-            "raw_std_ratio_median": float(np.median(
-                generated_std / np.maximum(real_std, 1e-12))),
-            "native": run_free_run_suite(real, generated),
+            "n_realizations": int(samples.shape[0]),
+            "r_sigma": float(np.mean(sample_ratios)),
+            "raw_std_ratio": float(np.mean(sample_ratios)),
+            "mean_path_raw_std_ratio": mean_path_std_ratio,
+            "raw_std_ratio_median": float(np.median(sample_ratios)),
+            **_path_ensemble_diagnostics(real, mean_path, samples),
+            "native": _mean_numeric_reports(native),
+            "mean_path_native": run_free_run_suite(real, mean_path),
+            "native_per_realization": native,
         })
     return entries
 
@@ -215,15 +268,37 @@ def _group_aggregate(reports: Iterable[Dict[str, Any]],
 
 
 def _horizon_aggregate(reports: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
-    """Aggregate per-horizon native metrics across samples."""
+    """Aggregate path, distribution, and dynamics metrics per horizon."""
     buckets: Dict[int, List[Dict[str, Any]]] = {}
     for report in reports:
         for entry in report.get("horizons", ()) or ():
             buckets.setdefault(int(entry["horizon"]), []).append(entry)
     paths = {
-        "raw_std_ratio": ("raw_std_ratio",),
+        "r_sigma": ("r_sigma",),
         "raw_std_ratio_median": ("raw_std_ratio_median",),
+        "between_sample_variance": ("between_sample_variance",),
+        "within_path_temporal_variance": ("within_path_temporal_variance",),
+        "real_temporal_variance": ("real_temporal_variance",),
+        "mean_path_raw_std_ratio": ("mean_path_raw_std_ratio",),
+        "realization_lag1_mean": ("realization_lag1", "mean"),
+        "mean_path_lag1": ("realization_lag1", "mean_path"),
+        "mean_path_w1": (
+            "tderica", "mean_path_distribution", "wasserstein_global"),
+        "mean_path_kl": (
+            "tderica", "mean_path_distribution", "kl_divergence"),
+        "pooled_sample_w1": (
+            "tderica", "pooled_sample_distribution", "wasserstein_global"),
+        "pooled_sample_kl": (
+            "tderica", "pooled_sample_distribution", "kl_divergence"),
+        "mean_path_kernel_transition": (
+            "tderica", "mean_path_kernel_transition"),
+        "sample_kernel_transition_mean": (
+            "tderica", "sample_kernel_transition_mean"),
         "native_corr_matrix_mse": ("native", "corr_matrix_mse"),
+        "mean_path_native_corr_matrix_mse": (
+            "mean_path_native", "corr_matrix_mse"),
+        "mean_path_native_autocorr_mse": (
+            "mean_path_native", "autocorr", "mse"),
         "native_autocorr_mse": ("native", "autocorr", "mse"),
         "native_variance_log_rmse": ("native", "variance_ratio", "log_rmse"),
     }
@@ -232,6 +307,7 @@ def _horizon_aggregate(reports: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
                        "metrics": _group_aggregate(entries, paths)}
         for horizon, entries in sorted(buckets.items())
     }
+
 
 
 def _first(value: Any, default: Any) -> Any:
@@ -251,48 +327,226 @@ def _lag1(values: np.ndarray) -> Optional[float]:
             out.append(float(np.corrcoef(a, b)[0, 1]))
     return float(np.mean(out)) if out else None
 
+def _path_ensemble_diagnostics(
+    real: np.ndarray,
+    transition_mean: np.ndarray,
+    samples: np.ndarray,
+) -> Dict[str, Any]:
+    """Separate cross-realization spread from temporal path variation."""
+    if real.ndim != 2 or transition_mean.shape != real.shape:
+        raise ValueError("real and transition-mean paths must share shape (T,C)")
+    if samples.ndim != 3 or samples.shape[1:] != real.shape:
+        raise ValueError("sample paths must have shape (S,T,C)")
+    realization_lag1 = [_lag1(path) for path in samples]
+    finite_lag1 = [
+        value for value in realization_lag1
+        if value is not None and np.isfinite(value)
+    ]
+    return {
+        "between_sample_variance": float(np.var(samples, axis=0).mean()),
+        "within_path_temporal_variance": float(np.var(samples, axis=1).mean()),
+        "real_temporal_variance": float(np.var(real, axis=0).mean()),
+        "realization_lag1": {
+            "real": _lag1(real),
+            "mean_path": _lag1(transition_mean),
+            "per_realization": realization_lag1,
+            "mean": (
+                float(np.mean(finite_lag1)) if finite_lag1 else None),
+        },
+    }
 
-def _fit_tderica_context(context, real, generated, *, dim_embed,
-                         n_components, include_d3, d3_fast, toolbox_path):
-    """Fit TDE-RICA on context only, then compare held-out trajectories."""
+
+
+
+def _fit_tderica_context_projections(
+    context: np.ndarray,
+    trajectories: List[np.ndarray],
+    *,
+    dim_embed: int,
+    n_components: int,
+    toolbox_path: Path,
+) -> Tuple[List[np.ndarray], np.ndarray]:
+    """Fit one context-only motif basis and project each held-out trajectory."""
     path = str(toolbox_path)
     if path not in sys.path:
         sys.path.insert(0, path)
-    from tderica import decompose, delayembed, project, similarity_report
+    from tderica import decompose, delayembed, project
 
     if context.shape[0] <= dim_embed + 2:
         raise ValueError(
-            f"context has {context.shape[0]} frames; dim_embed={dim_embed} leaves "
-            "too few TDE-RICA samples")
-    occurrences, motifs, _ = decompose(
-        context[:, :, None], dim_embed=dim_embed, n_components=n_components,
-        whiten=False, lambda_=0.001, max_iter=200)
-    comp_real = project(delayembed(real, dim_embed), motifs)
-    comp_generated = project(delayembed(generated, dim_embed), motifs)
-    report = similarity_report(
-        comp_real, comp_generated, include_d3=include_d3, d3_fast=d3_fast)
-    roughness = []
-    spatial = []
-    for motif in motifs:
-        if motif.shape[0] >= 3:
-            roughness.append(float(np.mean(np.var(np.diff(motif, n=2, axis=0), axis=0))))
-        if motif.shape[1] >= 2:
-            corr = np.corrcoef(motif.T)
-            upper = corr[np.triu_indices(corr.shape[0], k=1)]
-            upper = upper[np.isfinite(upper)]
-            if upper.size:
-                spatial.append(float(np.mean(upper)))
+            f"context has {context.shape[0]} frames; dim_embed={dim_embed} "
+            "leaves too few TDE-RICA samples")
+    _, motifs, _ = decompose(
+        context[:, :, None], dim_embed=dim_embed,
+        n_components=n_components, whiten=False, lambda_=0.001,
+        max_iter=200)
+    components = [
+        project(delayembed(trajectory, dim_embed), motifs)
+        for trajectory in trajectories
+    ]
+    if any(not np.isfinite(value).all() for value in components):
+        raise FloatingPointError("context-fitted TDE-RICA projection is non-finite")
+    return components, motifs
+
+
+def _pooled_tderica_distribution(
+    real_components: np.ndarray,
+    generated_components: List[np.ndarray],
+    *,
+    toolbox_path: Path,
+) -> Dict[str, Any]:
+    """Score one real feature cloud against all sampled projected paths."""
+    if not generated_components:
+        raise ValueError("pooled SDE scoring requires sampled trajectories")
+    pooled = np.concatenate(generated_components, axis=0)
+    if (real_components.ndim != 2 or pooled.ndim != 2
+            or real_components.shape[1] != pooled.shape[1]
+            or not np.isfinite(real_components).all()
+            or not np.isfinite(pooled).all()):
+        raise ValueError("TDE-RICA distribution inputs must be finite (T,K) arrays")
+    path = str(toolbox_path)
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    from tderica import kl_divergence_1d, wasserstein_distance
+
+    w1_per_component = wasserstein_distance(
+        real_components, pooled, per_component=True)
+    kl_per_component = kl_divergence_1d(real_components, pooled)
     return {
-        "native": run_free_run_suite(real, generated),
-        "similarity": report,
-        "dim_embed": int(dim_embed),
-        "n_components": int(n_components),
-        "component_shape": [int(comp_real.shape[0]), int(comp_real.shape[1])],
-        "real_occurrence_lag1": _lag1(comp_real),
-        "generated_occurrence_lag1": _lag1(comp_generated),
-        "motif_roughness_mean": float(np.mean(roughness)) if roughness else None,
-        "motif_spatial_coherence_mean": float(np.mean(spatial)) if spatial else None,
+        "wasserstein_global": float(
+            wasserstein_distance(real_components, pooled)),
+        "wasserstein_per_component": np.asarray(
+            w1_per_component, dtype=float).tolist(),
+        "kl_divergence": float(np.mean(kl_per_component)),
+        "kl_divergence_per_component": np.asarray(
+            kl_per_component, dtype=float).tolist(),
+        "n_real_features": int(real_components.shape[0]),
+        "n_sample_features": int(pooled.shape[0]),
+        "n_realizations": int(len(generated_components)),
     }
+
+
+
+def _tderica_horizon_reports(
+    real_all: np.ndarray,
+    transition_mean_all: np.ndarray,
+    sampled_paths_all: np.ndarray,
+    rollouts: int,
+    *,
+    projector,
+    toolbox_path: Path,
+    include_d3: bool,
+    minimum_input_frames: int = 3,
+) -> List[Dict[str, Any]]:
+    """Score each raw horizon independently through the same fitted basis."""
+    frames_total = real_all.shape[0]
+    if rollouts < 1 or frames_total % rollouts:
+        raise ValueError(
+            f"{frames_total} frames do not divide into {rollouts} horizons")
+    if (real_all.ndim != 2
+            or transition_mean_all.shape != real_all.shape
+            or sampled_paths_all.ndim != 3
+            or sampled_paths_all.shape[1:] != real_all.shape):
+        raise ValueError("TDE-RICA paths must share the (S,T,C) contract")
+    path = str(toolbox_path)
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    from tderica import kernel_transition_comparison
+
+    horizon_frames = frames_total // rollouts
+    minimum_input_frames = int(minimum_input_frames)
+    if minimum_input_frames < 3:
+        raise ValueError("minimum_input_frames must be at least three")
+    if horizon_frames < minimum_input_frames:
+        return [
+            {
+                "horizon": horizon + 1,
+                "frames": int(horizon_frames),
+                "tderica": None,
+                "skipped_reason": (
+                    f"requires at least {minimum_input_frames} input frames "
+                    "for three projected frames"),
+            }
+            for horizon in range(rollouts)
+        ]
+    reports = []
+    for horizon in range(rollouts):
+        start = horizon * horizon_frames
+        stop = start + horizon_frames
+        real = projector(real_all[start:stop])
+        mean_path = projector(transition_mean_all[start:stop])
+        sample_paths = [
+            projector(sample[start:stop]) for sample in sampled_paths_all
+        ]
+        if min(
+            real.shape[0], mean_path.shape[0],
+            *(sample.shape[0] for sample in sample_paths),
+        ) < 3:
+            reports.append({
+                "horizon": horizon + 1,
+                "frames": int(stop - start),
+                "tderica": None,
+                "skipped_reason": "fewer than three projected frames",
+            })
+            continue
+        mean_distribution = _pooled_tderica_distribution(
+            real, [mean_path], toolbox_path=toolbox_path)
+        pooled_distribution = _pooled_tderica_distribution(
+            real, sample_paths, toolbox_path=toolbox_path)
+        mean_kernel = (
+            float(kernel_transition_comparison(real, mean_path))
+            if include_d3 else None)
+        sample_kernels = (
+            [float(kernel_transition_comparison(real, sample))
+             for sample in sample_paths]
+            if include_d3 else [None] * len(sample_paths))
+        finite_sample_kernels = [
+            value for value in sample_kernels if value is not None
+        ]
+        reports.append({
+            "horizon": horizon + 1,
+            "frames": int(stop - start),
+            "tderica": {
+                "mean_path_distribution": mean_distribution,
+                "pooled_sample_distribution": pooled_distribution,
+                "mean_path_kernel_transition": mean_kernel,
+                "sample_kernel_transition_per_realization": sample_kernels,
+                "sample_kernel_transition_mean": (
+                    float(np.mean(finite_sample_kernels))
+                    if finite_sample_kernels else None),
+            },
+        })
+    return reports
+
+
+def _sde_tderica_reports(
+    real_components: np.ndarray,
+    mean_components: np.ndarray,
+    sample_components: List[np.ndarray],
+    *,
+    toolbox_path: Path,
+    mean_similarity: Optional[Dict[str, Any]] = None,
+    include_d3: bool = False,
+    d3_fast: bool = True,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
+    """Return mean-path alignment, per-realization reports, pooled W1/KL."""
+    path = str(toolbox_path)
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    from tderica import similarity_report
+
+    if mean_similarity is None:
+        mean_similarity = similarity_report(
+            real_components, mean_components,
+            include_d3=include_d3, d3_fast=d3_fast)
+    sample_similarities = [
+        similarity_report(
+            real_components, sample, include_d3=False, d3_fast=True)
+        for sample in sample_components
+    ]
+    distribution = _pooled_tderica_distribution(
+        real_components, sample_components, toolbox_path=toolbox_path)
+    return mean_similarity, sample_similarities, distribution
 def _load_recording_basis(
         basis_bank: Path,
         sample_id: str,
@@ -364,6 +618,59 @@ def _project_recording_basis(
 
 
 
+
+
+def _forward_free_run_paths(
+    model,
+    signals: Dict[str, torch.Tensor],
+    *,
+    masks: Dict[str, torch.Tensor],
+    rollout_steps: int,
+    dt: torch.Tensor,
+    frame_dt: torch.Tensor,
+    sample_count: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Keep the conditional-mean path distinct from SDE realizations."""
+    common = {
+        "masks": masks,
+        "perturbation": None,
+        "num_steps": rollout_steps,
+        "return_all": True,
+        "return_sequences": True,
+        "reconstruct": True,
+        "recon_max_channels": 2048,
+        "dt": dt,
+        "frame_dt": frame_dt,
+        "step_dt": dt,
+    }
+    if getattr(model, "transition_mode", "ode") != "sde":
+        return {
+            "transition_mean_path": model.forward_modalities(
+                signals, **common),
+            "sampled_paths": None,
+            "sample_count": 0,
+        }
+    count = int(
+        getattr(model, "stochastic_samples", 0)
+        if sample_count is None else sample_count)
+    if count < 2:
+        raise ValueError("SDE free-run evaluation requires at least two samples")
+
+    def reset_runtime():
+        reset = getattr(model, "reset_runtime_state", None)
+        if callable(reset):
+            reset(batch_size=next(iter(signals.values())).shape[0])
+
+    reset_runtime()
+    mean_path = model.forward_modalities(signals, **common)
+    reset_runtime()
+    sampled_paths = model.forward_modalities(
+        signals, **common, sample_transition=True, num_samples=count)
+    return {
+        "transition_mean_path": mean_path,
+        "sampled_paths": sampled_paths,
+        "sample_count": count,
+    }
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
@@ -373,7 +680,15 @@ def main() -> None:
     parser.add_argument("--split", choices=("val", "test"), default="val")
     parser.add_argument("--max-samples", type=int, default=16)
     parser.add_argument("--rollout", type=int, default=3)
+    parser.add_argument(
+        "--sde-samples", type=int, default=None,
+        help="SDE realizations; defaults to the model profile's sample count",
+    )
     parser.add_argument("--device", default="auto", choices=("auto", "cuda"))
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Seed model initialization and sampled transition paths",
+    )
     parser.add_argument(
         "--tderica-basis-bank", type=Path, default=None,
         help="recording-local fixed basis bank; bypasses per-window fitting",
@@ -386,6 +701,11 @@ def main() -> None:
     parser.add_argument("--full-d3", action="store_true")
     parser.add_argument("--save-arrays", type=Path, default=None)
     args = parser.parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     if args.max_samples < 1 or args.rollout < 1:
         raise ValueError("max-samples and rollout must be positive")
     if args.tderica_dim_embed < 2 or args.tderica_components < 1:
@@ -401,6 +721,18 @@ def main() -> None:
     checkpoint_info = _load_checkpoint(
         model, args.checkpoint, device, config_path=args.config)
 
+    is_sde = getattr(model, "transition_mode", "ode") == "sde"
+    if args.sde_samples is not None and args.sde_samples < 2:
+        raise ValueError("--sde-samples must be at least 2")
+    if args.sde_samples is not None and not is_sde:
+        raise ValueError("--sde-samples requires an SDE model")
+    if is_sde and args.no_tderica_fit and args.tderica_basis_bank is None:
+        raise ValueError(
+            "SDE pooled TDE-RICA metrics require context fitting or a "
+            "recording-local fixed basis")
+    sde_sample_count = (
+        int(args.sde_samples or model.stochastic_samples)
+        if is_sde else 0)
     from train import build_data_loaders
     loaders = build_data_loaders(args.data)
     loader = loaders[1] if args.split == "val" else (loaders[2] if len(loaders) > 2 else None)
@@ -438,16 +770,33 @@ def main() -> None:
             future_mask = future_mask.to(device)
             dt_frame = _as_per_sample_dt(batch.get("dt"), 1, device)
             window_dt = dt_frame * current.shape[-1]
-            out = model.forward_modalities(
-                {"calcium": current}, masks={"calcium": context_mask},
-                perturbation=None, num_steps=args.rollout, return_all=True,
-                return_sequences=True, reconstruct=True, recon_max_channels=2048,
-                dt=window_dt, frame_dt=dt_frame, step_dt=window_dt)
-            generated_seq = out.get("calcium_recon_sequence")
+            path_outputs = _forward_free_run_paths(
+                model,
+                {"calcium": current},
+                masks={"calcium": context_mask},
+                rollout_steps=args.rollout,
+                dt=window_dt,
+                frame_dt=dt_frame,
+                sample_count=sde_sample_count if is_sde else None,
+            )
+            mean_output = path_outputs["transition_mean_path"]
+            generated_seq = mean_output.get("calcium_recon_sequence")
             if generated_seq is None:
-                raise RuntimeError("model did not emit calcium_recon_sequence")
+                raise RuntimeError(
+                    "model did not emit calcium_recon_sequence")
             real_all = _concat_horizons(future[0])
             generated_all = _concat_horizons(generated_seq[0])
+            sampled_all_full = None
+            if is_sde:
+                sampled_recon = path_outputs["sampled_paths"].get(
+                    "calcium_recon_samples")
+                if not isinstance(sampled_recon, torch.Tensor):
+                    raise RuntimeError(
+                        "SDE model did not emit calcium_recon_samples")
+                sampled_all_full = np.stack([
+                    _concat_horizons(sampled_recon[index, 0])
+                    for index in range(path_outputs["sample_count"])
+                ])
             target_mask = _concat_masks(future_mask[0])
             valid_channels = target_mask.all(axis=0)
             if int(valid_channels.sum()) < 2:
@@ -471,25 +820,53 @@ def main() -> None:
             fit_valid_channels = valid_channels.copy()
             fit_valid_channels[fit_valid_channels] = context_valid
             real = real_all[:, fit_valid_channels]
-            generated = generated_all[:, fit_valid_channels]
+            transition_mean = generated_all[:, fit_valid_channels]
+            generated = transition_mean
             context = context_all[:, fit_valid_channels]
             persistence = np.tile(context, (args.rollout, 1))
-            if not np.isfinite(real).all() or not np.isfinite(generated).all():
-                raise FloatingPointError(f"sample {sample_index} produced non-finite free-run output")
+            sampled = (
+                sampled_all_full[:, :, fit_valid_channels]
+                if is_sde else None)
+            sampled_paths_raw = (
+                sampled if is_sde else generated[None, :, :])
+            if (not np.isfinite(real).all()
+                    or not np.isfinite(transition_mean).all()
+                    or (is_sde and not np.isfinite(sampled).all())):
+                raise FloatingPointError(
+                    f"sample {sample_index} produced non-finite free-run output")
             real_std = np.std(real, axis=0)
-            generated_std = np.std(generated, axis=0)
-            std_ratio = float(generated_std.mean() / max(real_std.mean(), 1e-12))
-            std_ratio_median = float(np.median(
-                generated_std / np.maximum(real_std, 1e-12)))
+            sample_std = np.std(sampled_paths_raw, axis=1)
+            sample_ratios = (
+                sample_std / np.maximum(real_std[None, :], 1e-12))
+            std_ratio = float(np.mean(sample_ratios))
+            std_ratio_median = float(np.median(sample_ratios))
             tail_frames = max(1, real.shape[0] // 5)
-            generated_tail_ratio = float(
-                np.std(generated[-tail_frames:], axis=0).mean()
-                / max(np.std(generated[:tail_frames], axis=0).mean(), 1e-12))
+            generated_tail_ratio = float(np.mean([
+                np.std(path[-tail_frames:], axis=0).mean()
+                / max(np.std(path[:tail_frames], axis=0).mean(), 1e-12)
+                for path in sampled_paths_raw
+            ]))
+            sampled_native_reports = [
+                run_free_run_suite(real, path) for path in sampled_paths_raw
+            ]
             frame_dt_s = float(dt_frame.item())
             sample_id = _first(batch.get("sample_id"), str(sample_index))
             origin = _first(batch.get("origin"), "")
             subject = _first(batch.get("subject"), "")
             basis_metadata = None
+            mean_similarity = None
+            sample_similarities = []
+            pooled_distribution = None
+            mean_tderica_details = None
+            mean_distribution = None
+            comp_real = None
+            comp_generated = None
+            projected_samples = []
+            tderica_projector = None
+            horizon_min_input_frames = 3
+            horizon_real = real
+            horizon_mean = transition_mean
+            horizon_samples = sampled_paths_raw
             if args.tderica_basis_bank is not None:
                 basis_path, basis_coeff, basis_indices = _load_recording_basis(
                     args.tderica_basis_bank, str(sample_id)
@@ -512,19 +889,47 @@ def main() -> None:
                         f"{basis_used}, {generated_basis_used}, "
                         f"{persistence_basis_used}"
                     )
+                projected_samples = []
+                sampled_full_paths = (
+                    sampled_all_full
+                    if is_sde else generated_all[None, :, :])
+                for index, sample_path in enumerate(sampled_full_paths):
+                    comp_sample, sample_basis_used = _project_recording_basis(
+                        sample_path, basis_coeff, basis_indices,
+                        fit_valid_channels, args.tderica)
+                    if sample_basis_used != basis_used:
+                        raise ValueError(
+                            f"sample {index} used {sample_basis_used} basis "
+                            f"channels; expected {basis_used}")
+                    projected_samples.append(comp_sample)
                 projected_model = tderica_biological_report(
                     comp_real, comp_generated, dt_s=frame_dt_s,
                     include_d3=not args.no_d3, d3_fast=not args.full_d3,
                     tderica_path=str(args.tderica),
                 )
-                projected_persistence = tderica_biological_report(
-                    comp_real, comp_persistence, dt_s=frame_dt_s,
-                    include_d3=False, tderica_path=str(args.tderica),
-                )
+                mean_similarity, sample_similarities, pooled_distribution = (
+                    _sde_tderica_reports(
+                        comp_real, comp_generated, projected_samples,
+                        toolbox_path=args.tderica,
+                        mean_similarity=projected_model.get("tderica"),
+                        include_d3=not args.no_d3,
+                        d3_fast=not args.full_d3))
+                mean_tderica_details = projected_model
+                def tderica_projector(signal):
+                    return _project_recording_basis(
+                        signal, basis_coeff, basis_indices, fit_valid_channels,
+                        args.tderica)[0]
+                horizon_real = real_all
+                horizon_mean = generated_all
+                horizon_samples = sampled_full_paths
                 tderica_report = {
                     **projected_model,
                     "native": run_free_run_suite(real, generated),
                 }
+                projected_persistence = tderica_biological_report(
+                    comp_real, comp_persistence, dt_s=frame_dt_s,
+                    include_d3=False, tderica_path=str(args.tderica),
+                )
                 persistence_report = {
                     **projected_persistence,
                     "native": run_free_run_suite(real, persistence),
@@ -536,43 +941,229 @@ def main() -> None:
                     "basis_channels": int(basis_coeff.shape[2]),
                     "basis_channels_used": int(basis_used),
                 }
+                horizon_min_input_frames = int(basis_coeff.shape[1]) + 2
             elif args.no_tderica_fit:
+                comp_real = real
+                comp_generated = generated
+                projected_samples = [path for path in sampled_paths_raw]
                 tderica_report = tderica_biological_report(
                     real, generated, dt_s=frame_dt_s, include_d3=not args.no_d3,
                     d3_fast=not args.full_d3, tderica_path=str(args.tderica))
+                mean_similarity = tderica_report.get("tderica")
+                pooled_distribution = _pooled_tderica_distribution(
+                    comp_real, projected_samples, toolbox_path=args.tderica)
+                def tderica_projector(signal):
+                    return signal
                 persistence_report = tderica_biological_report(
                     real, persistence, dt_s=frame_dt_s, include_d3=False,
                     tderica_path=str(args.tderica))
             else:
-                fit_dim = min(args.tderica_dim_embed, max(2, context.shape[0] - 3))
+                fit_dim = min(
+                    args.tderica_dim_embed, max(2, context.shape[0] - 3))
+                horizon_min_input_frames = int(fit_dim) + 2
                 fit_points = context.shape[0] - fit_dim + 1
-                fit_components = min(args.tderica_components, fit_points,
-                                     fit_dim * context.shape[1])
-                tderica_report = _fit_tderica_context(
-                    context, real, generated, dim_embed=fit_dim,
-                    n_components=max(1, fit_components), include_d3=not args.no_d3,
-                    d3_fast=not args.full_d3, toolbox_path=args.tderica)
+                fit_components = min(
+                    args.tderica_components, fit_points,
+                    fit_dim * context.shape[1])
+                fit_components = max(1, fit_components)
+                projected, motifs = _fit_tderica_context_projections(
+                    context,
+                    [real, generated, *list(sampled_paths_raw)],
+                    dim_embed=fit_dim,
+                    n_components=fit_components,
+                    toolbox_path=args.tderica,
+                )
+                comp_real, comp_generated, *projected_samples = projected
+                mean_similarity, sample_similarities, pooled_distribution = (
+                    _sde_tderica_reports(
+                        comp_real, comp_generated, projected_samples,
+                        toolbox_path=args.tderica,
+                        include_d3=not args.no_d3,
+                        d3_fast=not args.full_d3))
+                roughness = []
+                spatial = []
+                for motif in motifs:
+                    if motif.shape[0] >= 3:
+                        roughness.append(float(np.mean(np.var(
+                            np.diff(motif, n=2, axis=0), axis=0))))
+                    if motif.shape[1] >= 2:
+                        corr = np.corrcoef(motif.T)
+                        upper = corr[np.triu_indices(corr.shape[0], k=1)]
+                        upper = upper[np.isfinite(upper)]
+                        if upper.size:
+                            spatial.append(float(np.mean(upper)))
+                mean_tderica_details = {
+                    "dim_embed": int(fit_dim),
+                    "n_components": int(motifs.shape[0]),
+                    "component_shape": [
+                        int(comp_real.shape[0]), int(comp_real.shape[1])],
+                    "similarity": mean_similarity,
+                    "real_occurrence_lag1": _lag1(comp_real),
+                    "generated_occurrence_lag1": _lag1(comp_generated),
+                    "motif_roughness_mean": (
+                        float(np.mean(roughness)) if roughness else None),
+                    "motif_spatial_coherence_mean": (
+                        float(np.mean(spatial)) if spatial else None),
+                }
+                tderica_report = {
+                    "native": run_free_run_suite(real, generated),
+                    **mean_tderica_details,
+                }
+                if str(args.tderica) not in sys.path:
+                    sys.path.insert(0, str(args.tderica))
+                from tderica import delayembed, project
+
+                def tderica_projector(signal):
+                    return project(delayembed(signal, fit_dim), motifs)
+
+                basis_metadata = {
+                    "mode": "context_fitted",
+                    "dim_embed": int(fit_dim),
+                    "components": int(motifs.shape[0]),
+                }
                 persistence_report = tderica_biological_report(
                     real, persistence, dt_s=frame_dt_s, include_d3=False,
                     tderica_path=str(args.tderica))
-            reports.append({
+            if (comp_real is None or comp_generated is None
+                    or not projected_samples
+                    or not callable(tderica_projector)):
+                raise RuntimeError("TDE-RICA projection setup is incomplete")
+            mean_distribution = _pooled_tderica_distribution(
+                comp_real, [comp_generated], toolbox_path=args.tderica)
+            tderica_horizons = _tderica_horizon_reports(
+                horizon_real, horizon_mean, horizon_samples, args.rollout,
+                projector=tderica_projector,
+                toolbox_path=args.tderica,
+                include_d3=not args.no_d3,
+                minimum_input_frames=horizon_min_input_frames,
+            )
+            mean_kernel_transition = None
+            sample_kernel_transitions = [None] * len(projected_samples)
+            if not args.no_d3:
+                if str(args.tderica) not in sys.path:
+                    sys.path.insert(0, str(args.tderica))
+                from tderica import kernel_transition_comparison
+
+                mean_kernel_transition = float(kernel_transition_comparison(
+                    comp_real, comp_generated))
+                sample_kernel_transitions = [
+                    float(kernel_transition_comparison(comp_real, sample))
+                    for sample in projected_samples
+                ]
+            path_diagnostics = _path_ensemble_diagnostics(
+                real, transition_mean, sampled_paths_raw)
+            if is_sde:
+                if pooled_distribution is None or not sample_similarities:
+                    raise RuntimeError(
+                        "SDE evaluation did not produce pooled TDE-RICA metrics")
+                tderica_report = {
+                    "native": _mean_numeric_reports(sampled_native_reports),
+                    "trajectory_similarity": _mean_numeric_reports(
+                        sample_similarities),
+                    "pooled_distribution": pooled_distribution,
+                    "distribution_source": "pooled_sampled_realizations",
+                    "n_realizations": path_outputs["sample_count"],
+                    "realizations": [
+                        {
+                            "index": index,
+                            "native": sampled_native_reports[index],
+                            "trajectory_similarity": sample_similarities[index],
+                            "kernel_transition": sample_kernel_transitions[index],
+                        }
+                        for index in range(path_outputs["sample_count"])
+                    ],
+                }
+            else:
+                tderica_report["pooled_distribution"] = pooled_distribution
+                tderica_report["distribution_source"] = (
+                    "single_deterministic_path")
+                tderica_report["n_realizations"] = 1
+            finite_sample_kernels = [
+                value for value in sample_kernel_transitions
+                if value is not None
+            ]
+            tderica_report["sample_kernel_transition_per_realization"] = (
+                sample_kernel_transitions)
+            tderica_report["sample_kernel_transition_mean"] = (
+                float(np.mean(finite_sample_kernels))
+                if finite_sample_kernels else None)
+            transition_mean_report = {
+                "native": run_free_run_suite(real, transition_mean),
+                "similarity": mean_similarity,
+                "distribution": mean_distribution,
+                "kernel_transition": mean_kernel_transition,
+                "horizons": tderica_horizons,
+                "tderica_report": mean_tderica_details,
+            }
+            if is_sde:
+                sampled_output = path_outputs["sampled_paths"]
+                transition_diagnostics = sde_transition_diagnostics(
+                    sampled_output["z_global"].detach().float().cpu().numpy(),
+                    sampled_output[
+                        "z_next_sequence_samples"
+                    ].detach().float().cpu().numpy(),
+                    sampled_output[
+                        "transition_mean_sequence_samples"
+                    ].detach().float().cpu().numpy(),
+                    sampled_output[
+                        "transition_factor_sequence_samples"
+                    ].detach().float().cpu().numpy(),
+                    sampled_output[
+                        "transition_diag_std_sequence_samples"
+                    ].detach().float().cpu().numpy(),
+                    model.transition_diffusion.factor_basis
+                    .detach().float().cpu().numpy(),
+                    dt=window_dt.detach().float().cpu().numpy(),
+                )
+            horizon_reports = _sampled_horizon_reports(
+                real, sampled_paths_raw, transition_mean, args.rollout)
+            tderica_by_horizon = {
+                entry["horizon"]: entry["tderica"]
+                for entry in tderica_horizons
+            }
+            for entry in horizon_reports:
+                if entry["horizon"] in tderica_by_horizon:
+                    entry["tderica"] = tderica_by_horizon[entry["horizon"]]
+            report = {
                 "index": sample_index, "sample_id": str(sample_id),
                 "origin": str(origin), "subject": str(subject),
                 "source": _source_label(str(sample_id), str(origin)),
+                "transition_mode": "sde" if is_sde else "ode",
                 "channels_scored": int(real.shape[1]),
                 "channels_available": int(real_all.shape[1]),
                 "frames": int(real.shape[0]), "frame_dt_s": frame_dt_s,
                 "target_valid_channel_fraction": float(valid_channels.mean()),
+                "r_sigma": std_ratio,
                 "raw_std_ratio": std_ratio,
                 "raw_std_ratio_median": std_ratio_median,
                 "generated_tail_std_ratio": generated_tail_ratio,
-                "horizons": _horizon_reports(real_all, generated_all, args.rollout),
+                "path_diagnostics": path_diagnostics,
+                "horizons": horizon_reports,
                 "model": tderica_report, "persistence": persistence_report,
                 "tderica_basis": basis_metadata,
-            })
+                "n_realizations": len(sampled_paths_raw),
+                "transition_mean_path": transition_mean_report,
+            }
+            if is_sde:
+                report["transition_diagnostics"] = transition_diagnostics
+            reports.append(report)
             if args.save_arrays is not None:
-                np.save(args.save_arrays / f"{sample_index:04d}_real.npy", real.astype("float32"))
-                np.save(args.save_arrays / f"{sample_index:04d}_generated.npy", generated.astype("float32"))
+                np.save(
+                    args.save_arrays / f"{sample_index:04d}_real.npy",
+                    real.astype("float32"))
+                if is_sde:
+                    np.save(
+                        args.save_arrays
+                        / f"{sample_index:04d}_transition_mean_path.npy",
+                        transition_mean.astype("float32"))
+                    np.save(
+                        args.save_arrays
+                        / f"{sample_index:04d}_sampled_realizations.npy",
+                        sampled.astype("float32"))
+                else:
+                    np.save(
+                        args.save_arrays / f"{sample_index:04d}_generated.npy",
+                        generated.astype("float32"))
 
     if not reports:
         raise RuntimeError("no evaluable calcium future samples found")
@@ -580,12 +1171,106 @@ def main() -> None:
         "native_corr_matrix_mse": ("model", "native", "corr_matrix_mse"),
         "native_autocorr_mse": ("model", "native", "autocorr", "mse"),
         "native_variance_log_rmse": ("model", "native", "variance_ratio", "log_rmse"),
+        "r_sigma": ("r_sigma",),
         "raw_std_ratio": ("raw_std_ratio",),
         "raw_std_ratio_median": ("raw_std_ratio_median",),
         "generated_tail_std_ratio": ("generated_tail_std_ratio",),
-        "persistence_native_corr_matrix_mse": ("persistence", "native", "corr_matrix_mse"),
+        "between_sample_variance": (
+            "path_diagnostics", "between_sample_variance"),
+        "within_path_temporal_variance": (
+            "path_diagnostics", "within_path_temporal_variance"),
+        "real_temporal_variance": (
+            "path_diagnostics", "real_temporal_variance"),
+        "realization_lag1_mean": (
+            "path_diagnostics", "realization_lag1", "mean"),
+        "mean_path_lag1": (
+            "path_diagnostics", "realization_lag1", "mean_path"),
+        "mean_path_w1": (
+            "transition_mean_path", "distribution", "wasserstein_global"),
+        "mean_path_kl": (
+            "transition_mean_path", "distribution", "kl_divergence"),
+        "mean_path_kernel_transition": (
+            "transition_mean_path", "kernel_transition"),
+        "pooled_sample_w1": (
+            "model", "pooled_distribution", "wasserstein_global"),
+        "pooled_sample_kl": (
+            "model", "pooled_distribution", "kl_divergence"),
+        "sample_kernel_transition_mean": (
+            "model", "sample_kernel_transition_mean"),
+        "persistence_native_corr_matrix_mse": (
+            "persistence", "native", "corr_matrix_mse"),
     }
-    if args.no_tderica_fit or args.tderica_basis_bank is not None:
+    if is_sde:
+        aggregate_paths.update({
+            "sde_drift_increment_rms": (
+                "transition_diagnostics", "sde_drift_increment_rms"),
+            "sde_diffusion_rms": (
+                "transition_diagnostics", "sde_diffusion_rms"),
+            "sde_noise_increment_rms": (
+                "transition_diagnostics", "sde_noise_increment_rms"),
+            "sde_noise_drift_ratio": (
+                "transition_diagnostics", "sde_noise_drift_ratio"),
+            "sde_trace_q": ("transition_diagnostics", "sde_trace_q"),
+            "sde_standardized_innovation_rms": (
+                "transition_diagnostics",
+                "sde_standardized_innovation_rms"),
+            "sde_innovation_lag_autocorr_rms_1": (
+                "transition_diagnostics",
+                "sde_innovation_lag_autocorr_rms_1"),
+            "sde_innovation_lag_autocorr_rms_2": (
+                "transition_diagnostics",
+                "sde_innovation_lag_autocorr_rms_2"),
+            "sde_innovation_lag_autocorr_rms_4": (
+                "transition_diagnostics",
+                "sde_innovation_lag_autocorr_rms_4"),
+            "tderica_dtw": (
+                "model", "trajectory_similarity", "time_alignment",
+                "dtw_distance"),
+            "tderica_frechet": (
+                "model", "trajectory_similarity", "time_alignment",
+                "frechet_distance"),
+            "tderica_w1": (
+                "model", "pooled_distribution", "wasserstein_global"),
+            "tderica_w1_component_mean": (
+                "model", "pooled_distribution", "wasserstein_per_component"),
+            "tderica_kl_mean": (
+                "model", "pooled_distribution", "kl_divergence"),
+            "tderica_cosine_diagonal_mean": (
+                "model", "trajectory_similarity", "time_alignment",
+                "cosine_diagonal_mean"),
+            "tderica_cosine_global_mean": (
+                "model", "trajectory_similarity", "time_alignment",
+                "cosine_global_mean"),
+            "transition_mean_native_corr_matrix_mse": (
+                "transition_mean_path", "native", "corr_matrix_mse"),
+            "transition_mean_native_autocorr_mse": (
+                "transition_mean_path", "native", "autocorr", "mse"),
+            "transition_mean_native_variance_log_rmse": (
+                "transition_mean_path", "native", "variance_ratio",
+                "log_rmse"),
+            "transition_mean_tderica_dtw": (
+                "transition_mean_path", "similarity", "time_alignment",
+                "dtw_distance"),
+            "transition_mean_tderica_frechet": (
+                "transition_mean_path", "similarity", "time_alignment",
+                "frechet_distance"),
+            "transition_mean_tderica_w1": (
+                "transition_mean_path", "similarity", "distribution",
+                "wasserstein_global"),
+            "transition_mean_tderica_kl": (
+                "transition_mean_path", "similarity", "distribution",
+                "kl_divergence"),
+            "transition_mean_tderica_kernel_transition": (
+                "transition_mean_path", "similarity", "dynamics",
+                "kernel_transition"),
+            "transition_mean_tderica_transfer_entropy_a_to_b": (
+                "transition_mean_path", "similarity", "dynamics",
+                "transfer_entropy_a_to_b"),
+            "transition_mean_tderica_transfer_entropy_b_to_a": (
+                "transition_mean_path", "similarity", "dynamics",
+                "transfer_entropy_b_to_a"),
+        })
+    elif args.no_tderica_fit or args.tderica_basis_bank is not None:
         aggregate_paths.update({
             "tderica_dtw": ("model", "tderica", "time_alignment", "dtw_distance"),
             "tderica_frechet": ("model", "tderica", "time_alignment", "frechet_distance"),
@@ -645,7 +1330,20 @@ def main() -> None:
     output = {
         "checkpoint": str(args.checkpoint), "split": args.split,
         "device": str(device), "rollout_windows": args.rollout,
-        "n_samples": len(reports),
+        "transition_mode": "sde" if is_sde else "ode",
+        "sde_samples": sde_sample_count if is_sde else None,
+        "seed": args.seed,
+        "max_samples": args.max_samples,
+        "tderica": str(args.tderica),
+        "tderica_dim_embed": args.tderica_dim_embed,
+        "tderica_components": args.tderica_components,
+        "transition_mean_semantics": (
+            "recursive conditional transition means; not the exact "
+            "multi-step expectation of the nonlinear SDE"
+            if is_sde else None),
+        "sde_distribution_metric_source": (
+            "pooled sampled trajectories projected through one TDE-RICA basis"
+            if is_sde else None),
         "tderica_context_fit": (
             not args.no_tderica_fit and args.tderica_basis_bank is None
         ),

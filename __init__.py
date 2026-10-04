@@ -196,6 +196,7 @@ class BrainMoEPINN(nn.Module):
         use_sensor_emission: bool = False,
         sensor_specs: Optional[Dict[str, object]] = None,
         generic_observation_only: bool = False,
+        scale_anchor: str = "off",
         initial_context_length: int = 256,
         max_context_length: int = 1024,
         context_expansion_steps: int = 10000,
@@ -218,6 +219,11 @@ class BrainMoEPINN(nn.Module):
         self.noise_mode = noise_mode
         if transition_mode not in ("ode", "sde"):
             raise ValueError("transition_mode must be 'ode' or 'sde'")
+        if transition_mode == "sde" and noise_mode != "off":
+            raise ValueError("SDE transitions require noise_mode='off'")
+        if scale_anchor not in ("off", "context"):
+            raise ValueError("scale_anchor must be 'off' or 'context'")
+        self.scale_anchor = scale_anchor
         diffusion_rank = (
             min(16, latent_dim) if diffusion_rank is None
             else int(diffusion_rank))
@@ -1052,11 +1058,13 @@ class BrainMoEPINN(nn.Module):
                         decoded,
                         dt=(frame_dt if frame_dt is not None
                             else self.latent_dt))
-                if self.transition_mode == "ode":
-                    # The deterministic observation scale anchor is retained
-                    # for compatibility, but would suppress SDE sample spread.
+                if self.scale_anchor == "context":
+                    anchor_reference = self._repeat_batch_value(
+                        signals[modality], batch_size, num_samples)
+                    anchor_mask = self._repeat_batch_value(
+                        masks.get(modality), batch_size, num_samples)
                     decoded = preserve_signal_scale(
-                        decoded, signals[modality], masks.get(modality))
+                        decoded, anchor_reference, anchor_mask)
                 decoded_steps.append(decoded)
             if emission is not None:
                 result[f"{modality}_emission"] = emission.parameter_summary(
@@ -1615,6 +1623,7 @@ class BrainMoEPINNConfig:
         latent_dim: int = 1024,
         latent_dt: Optional[float] = None,
         noise_mode: str = "off",
+        scale_anchor: str = "off",
         control_gating: bool = True,
         use_neurostorm: bool = True,
         use_kda_decoder: bool = True,
@@ -1662,6 +1671,7 @@ class BrainMoEPINNConfig:
         self.latent_dim = latent_dim
         self.latent_dt = latent_dt
         self.noise_mode = noise_mode
+        self.scale_anchor = scale_anchor
         self.transition_mode = transition_mode
         self.diffusion_rank = (
             None if diffusion_rank is None else int(diffusion_rank))
@@ -1714,6 +1724,7 @@ class BrainMoEPINNConfig:
             latent_dim=config.latent_dim,
             latent_dt=1.0 / config.data.sample_rate_hz,
             noise_mode=getattr(features, "noise_mode", "off"),
+            scale_anchor=getattr(features, "scale_anchor", "off"),
             transition_mode=getattr(features, "transition_mode", "ode"),
             diffusion_rank=getattr(features, "diffusion_rank", None),
             diffusion_floor=getattr(features, "diffusion_floor", 1e-4),
@@ -1762,6 +1773,7 @@ class BrainMoEPINNConfig:
             latent_dim=self.latent_dim,
             latent_dt=self.latent_dt,
             noise_mode=self.noise_mode,
+            scale_anchor=self.scale_anchor,
             transition_mode=self.transition_mode,
             diffusion_rank=self.diffusion_rank,
             diffusion_floor=self.diffusion_floor,

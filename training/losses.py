@@ -493,6 +493,306 @@ class EmpiricalCRPSLoss(nn.Module):
             / horizon_counts.clamp_min(1).to(elementwise.dtype))
         return (weights * horizon_loss).sum()
 
+class ProjectedPathEnergyScore(nn.Module):
+    """Energy score on a fixed projected path and its multi-lag increments."""
+
+    def __init__(
+        self,
+        projection_dim: int = 32,
+        lags: Tuple[int, ...] = (1, 2, 4, 8),
+        seed: int = 42,
+    ):
+        super().__init__()
+        if projection_dim <= 0:
+            raise ValueError("projection_dim must be positive")
+        if not lags or any(int(lag) <= 0 for lag in lags):
+            raise ValueError("lags must contain positive integers")
+        self.projection_dim = int(projection_dim)
+        self.lags = tuple(int(lag) for lag in lags)
+        self.seed = int(seed)
+        self.register_buffer("projection_matrix", None, persistent=False)
+
+    def _projection(self, channels: int, device: torch.device) -> torch.Tensor:
+        matrix = self.projection_matrix
+        if (matrix is None or matrix.shape[0] != channels
+                or matrix.device != device):
+            width = min(self.projection_dim, channels)
+            generator = torch.Generator(device="cpu").manual_seed(
+                self.seed + channels)
+            random = torch.randn(
+                channels, width, generator=generator, dtype=torch.float64)
+            orthogonal, triangular = torch.linalg.qr(
+                random, mode="reduced")
+            signs = torch.where(
+                torch.diagonal(triangular) < 0.0,
+                -torch.ones(width, dtype=orthogonal.dtype),
+                torch.ones(width, dtype=orthogonal.dtype),
+            )
+            matrix = (orthogonal * signs.unsqueeze(0)).to(
+                device=device, dtype=torch.float32)
+            self.projection_matrix = matrix
+        return matrix
+
+    def forward(
+        self,
+        samples: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if samples.dim() != 5 or target.dim() != 4:
+            raise ValueError(
+                "path energy samples and target must have shapes "
+                "(S,B,K,C,T) and (B,K,C,T)")
+        sample_count, batch_size, horizons, channels, frames = samples.shape
+        if sample_count < 2:
+            raise ValueError("path energy score requires at least two samples")
+        if tuple(samples.shape[1:]) != tuple(target.shape):
+            raise ValueError("path energy sample and target shapes do not match")
+        if mask is not None and mask.shape != target.shape:
+            raise ValueError("path energy mask must match target shape")
+
+        sample_path = samples.float().permute(0, 1, 2, 4, 3).reshape(
+            sample_count, batch_size, horizons * frames, channels)
+        target_path = target.float().permute(0, 1, 3, 2).reshape(
+            batch_size, horizons * frames, channels)
+        valid = (torch.isfinite(target_path)
+                 & torch.isfinite(sample_path).all(dim=0))
+        if mask is not None:
+            valid = valid & mask.bool().permute(0, 1, 3, 2).reshape(
+                batch_size, horizons * frames, channels)
+        target_path = torch.where(valid, target_path, 0.0)
+        sample_path = torch.where(valid.unsqueeze(0), sample_path, 0.0)
+
+        valid_counts = valid.sum(dim=-1)
+        time_valid = valid_counts > 0
+        channel_scale = torch.sqrt(
+            channels / valid_counts.clamp_min(1).to(target_path.dtype))
+        target_path = target_path * channel_scale.unsqueeze(-1)
+        sample_path = sample_path * channel_scale.unsqueeze(0).unsqueeze(-1)
+
+        projection = self._projection(channels, target_path.device)
+        projected_target = target_path @ projection
+        projected_samples = sample_path @ projection
+        projection_width = projection.shape[-1]
+        sample_blocks = [
+            projected_samples * time_valid.unsqueeze(0).unsqueeze(-1)]
+        target_blocks = [projected_target * time_valid.unsqueeze(-1)]
+        feature_counts = time_valid.sum(dim=-1) * projection_width
+        for lag in self.lags:
+            if lag >= horizons * frames:
+                continue
+            pair_valid = time_valid[:, lag:] & time_valid[:, :-lag]
+            sample_blocks.append(
+                (projected_samples[:, :, lag:]
+                 - projected_samples[:, :, :-lag])
+                * pair_valid.unsqueeze(0).unsqueeze(-1))
+            target_blocks.append(
+                (projected_target[:, lag:] - projected_target[:, :-lag])
+                * pair_valid.unsqueeze(-1))
+            feature_counts = (
+                feature_counts + pair_valid.sum(dim=-1) * projection_width)
+
+        normalizer = feature_counts.clamp_min(1).to(
+            target_path.dtype).sqrt()
+        target_features = torch.cat(target_blocks, dim=1).flatten(1)
+        sample_features = torch.cat(sample_blocks, dim=2).flatten(2)
+        target_features = target_features / normalizer.unsqueeze(-1)
+        sample_features = sample_features / normalizer.unsqueeze(0).unsqueeze(-1)
+
+        first_term = torch.linalg.vector_norm(
+            sample_features - target_features.unsqueeze(0), dim=-1).mean(0)
+        pairwise = torch.cdist(
+            sample_features.transpose(0, 1),
+            sample_features.transpose(0, 1),
+            p=2,
+        )
+        pair_term = pairwise.sum(dim=(1, 2)) / (
+            2.0 * sample_count * (sample_count - 1))
+        scores = first_term - pair_term
+        score_valid = feature_counts > 0
+        return (scores * score_valid).sum() / score_valid.sum().clamp_min(1)
+
+
+class SampledPathAutocorrelationLoss(nn.Module):
+    """Match each sampled observation path's masked autocorrelation profile."""
+
+    def __init__(self, lags: Tuple[int, ...] = (1, 2, 4, 8)):
+        super().__init__()
+        if not lags or any(int(lag) <= 0 for lag in lags):
+            raise ValueError("lags must contain positive integers")
+        self.lags = tuple(int(lag) for lag in lags)
+
+    def forward(
+        self,
+        samples: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if samples.dim() != 5 or target.dim() != 4:
+            raise ValueError(
+                "path autocorrelation samples and target must have shapes "
+                "(S,B,K,C,T) and (B,K,C,T)")
+        sample_count, batch_size, horizons, channels, frames = samples.shape
+        if tuple(samples.shape[1:]) != tuple(target.shape):
+            raise ValueError(
+                "path autocorrelation sample and target shapes do not match")
+        if mask is not None and mask.shape != target.shape:
+            raise ValueError("path autocorrelation mask must match target shape")
+
+        sample_path = samples.float().permute(0, 1, 2, 4, 3).reshape(
+            sample_count, batch_size, horizons * frames, channels)
+        target_path = target.float().permute(0, 1, 3, 2).reshape(
+            batch_size, horizons * frames, channels)
+        valid = (torch.isfinite(target_path)
+                 & torch.isfinite(sample_path).all(dim=0))
+        if mask is not None:
+            valid = valid & mask.bool().permute(0, 1, 3, 2).reshape(
+                batch_size, horizons * frames, channels)
+        counts = valid.sum(dim=1).clamp_min(1).to(target_path.dtype)
+        target_clean = torch.where(valid, target_path, 0.0)
+        sample_clean = torch.where(valid.unsqueeze(0), sample_path, 0.0)
+        target_mean = target_clean.sum(dim=1) / counts
+        sample_mean = sample_clean.sum(dim=2) / counts.unsqueeze(0)
+        target_centered = torch.where(
+            valid, target_path - target_mean.unsqueeze(1), 0.0)
+        sample_centered = torch.where(
+            valid.unsqueeze(0),
+            sample_path - sample_mean.unsqueeze(2),
+            0.0,
+        )
+
+        lag_losses = []
+        lag_valid_counts = []
+        time_count = horizons * frames
+        for lag in self.lags:
+            if lag >= time_count:
+                continue
+            pair_valid = valid[:, lag:] & valid[:, :-lag]
+            pair_counts = pair_valid.sum(dim=1)
+            pair_weight = pair_valid.to(target_path.dtype)
+            safe_counts = pair_counts.clamp_min(1).to(target_path.dtype)
+
+            target_left = target_centered[:, :-lag]
+            target_right = target_centered[:, lag:]
+            target_covariance = (
+                target_left * target_right * pair_weight).sum(dim=1)
+            target_var_left = (
+                target_left.square() * pair_weight).sum(dim=1)
+            target_var_right = (
+                target_right.square() * pair_weight).sum(dim=1)
+            target_covariance = target_covariance / safe_counts
+            target_var_left = target_var_left / safe_counts
+            target_var_right = target_var_right / safe_counts
+            target_denominator = torch.sqrt(
+                target_var_left * target_var_right)
+            target_corr = torch.where(
+                target_denominator > 1e-8,
+                target_covariance / target_denominator.clamp_min(1e-8),
+                0.0,
+            ).clamp(-1.0, 1.0)
+
+            sample_left = sample_centered[:, :, :-lag]
+            sample_right = sample_centered[:, :, lag:]
+            sample_weight = pair_weight.unsqueeze(0)
+            sample_covariance = (
+                sample_left * sample_right * sample_weight).sum(dim=2)
+            sample_var_left = (
+                sample_left.square() * sample_weight).sum(dim=2)
+            sample_var_right = (
+                sample_right.square() * sample_weight).sum(dim=2)
+            sample_covariance = sample_covariance / safe_counts.unsqueeze(0)
+            sample_var_left = sample_var_left / safe_counts.unsqueeze(0)
+            sample_var_right = sample_var_right / safe_counts.unsqueeze(0)
+            sample_denominator = torch.sqrt(
+                sample_var_left * sample_var_right)
+            sample_corr = torch.where(
+                sample_denominator > 1e-8,
+                sample_covariance / sample_denominator.clamp_min(1e-8),
+                0.0,
+            ).clamp(-1.0, 1.0)
+
+            channel_valid = (
+                (pair_counts >= 2) & (target_denominator > 1e-8))
+            expanded_valid = channel_valid.unsqueeze(0).expand_as(sample_corr)
+            valid_count = expanded_valid.sum()
+            squared_error = (sample_corr - target_corr.unsqueeze(0)).square()
+            lag_losses.append(
+                (squared_error * expanded_valid).sum()
+                / valid_count.clamp_min(1).to(squared_error.dtype))
+            lag_valid_counts.append(valid_count)
+
+        if not lag_losses:
+            return samples.sum() * 0.0
+        lag_losses = torch.stack(lag_losses)
+        lag_valid = torch.stack(lag_valid_counts) > 0
+        return ((lag_losses * lag_valid).sum()
+                / lag_valid.sum().clamp_min(1))
+
+
+class SampledHorizonOverdispersionLoss(nn.Module):
+    """Penalize pathwise temporal spread above the target at late horizons."""
+
+    def __init__(self, start_horizon: int = 5, eps: float = 1e-12):
+        super().__init__()
+        if start_horizon < 1:
+            raise ValueError("start_horizon must be positive")
+        self.start_horizon = int(start_horizon)
+        self.eps = float(eps)
+
+    def forward(
+        self,
+        samples: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if samples.dim() != 5 or target.dim() != 4:
+            raise ValueError(
+                "over-dispersion samples and target must have shapes "
+                "(S,B,K,C,T) and (B,K,C,T)")
+        sample_count, batch_size, horizons, channels, frames = samples.shape
+        if tuple(samples.shape[1:]) != tuple(target.shape):
+            raise ValueError(
+                "over-dispersion sample and target shapes do not match")
+        if mask is not None and mask.shape != target.shape:
+            raise ValueError("over-dispersion mask must match target shape")
+        if self.start_horizon > horizons:
+            return samples.sum() * 0.0
+
+        target = target.float()
+        samples = samples.float()
+        valid = torch.isfinite(target) & torch.isfinite(samples).all(dim=0)
+        if mask is not None:
+            valid = valid & mask.bool()
+        counts = valid.sum(dim=-1)
+        safe_counts = counts.clamp_min(1).to(target.dtype)
+        target_clean = torch.where(valid, target, 0.0)
+        sample_clean = torch.where(valid.unsqueeze(0), samples, 0.0)
+        target_mean = target_clean.sum(dim=-1) / safe_counts
+        sample_mean = sample_clean.sum(dim=-1) / safe_counts.unsqueeze(0)
+        target_centered = torch.where(
+            valid, target - target_mean.unsqueeze(-1), 0.0)
+        sample_centered = torch.where(
+            valid.unsqueeze(0),
+            samples - sample_mean.unsqueeze(-1),
+            0.0,
+        )
+        target_std = torch.sqrt(
+            target_centered.square().sum(dim=-1) / safe_counts)
+        sample_std = torch.sqrt(
+            sample_centered.square().sum(dim=-1)
+            / safe_counts.unsqueeze(0))
+        ratio = sample_std / target_std.unsqueeze(0).clamp_min(self.eps)
+        selected_horizons = (
+            torch.arange(horizons, device=samples.device)
+            >= self.start_horizon - 1)
+        selected = (
+            (counts >= 2).unsqueeze(0)
+            & selected_horizons.reshape(1, 1, horizons, 1)
+        ).expand(sample_count, -1, -1, -1)
+        selected_count = selected.sum()
+        excess = torch.relu(ratio - 1.0).square()
+        return (excess * selected).sum() / selected_count.clamp_min(1)
+
 
 class FixedComponentProjector(nn.Module):
     """Differentiable projection through a frozen TDE-RICA basis.
@@ -2069,6 +2369,10 @@ class TotalLoss(nn.Module):
         self.replay = ReplayLoss(weight=1.0)
         self.intervention_response = InterventionResponseLoss(weight=1.0)
         self.rollout_autocorr = RolloutAutocorrelationLoss(max_lag=16)
+        self.forecast_path_energy = ProjectedPathEnergyScore()
+        self.forecast_path_autocorr = SampledPathAutocorrelationLoss()
+        self.forecast_overdispersion = SampledHorizonOverdispersionLoss(
+            start_horizon=5)
         self.bandpower = BandPowerLoss(weight=1.0)
         self.sigreg = WeakSIGRegLoss(
             sketch_dim=getattr(loss_weights, "sigreg_sketch_dim", 64),
@@ -2136,14 +2440,20 @@ class TotalLoss(nn.Module):
                     f"{requested_count} values for runtime rollout "
                     f"{int(rollout_steps)}; resolve the data-profile "
                     "rollout contract before training")
-        self.forecast = CompositeForecastLoss(
-            huber_weight=getattr(loss_weights, "forecast_huber", 1.0),
-            corr_diff_weight=getattr(
-                loss_weights, "forecast_corr_diff", 1.0),
-            variance_weight=getattr(
-                loss_weights, "forecast_variance", 0.0),
-            horizon_weights=effective,
-        )
+        huber_weight = getattr(loss_weights, "forecast_huber", 1.0)
+        corr_diff_weight = getattr(loss_weights, "forecast_corr_diff", 1.0)
+        variance_weight = getattr(loss_weights, "forecast_variance", 0.0)
+        crps_weight = float(getattr(loss_weights, "forecast_crps", 0.0))
+        if (huber_weight == 0 and corr_diff_weight == 0
+                and variance_weight == 0 and crps_weight > 0):
+            self.forecast = None
+        else:
+            self.forecast = CompositeForecastLoss(
+                huber_weight=huber_weight,
+                corr_diff_weight=corr_diff_weight,
+                variance_weight=variance_weight,
+                horizon_weights=effective,
+            )
         self.forecast_crps = EmpiricalCRPSLoss(
             horizon_weights=effective)
         return None
@@ -2226,18 +2536,62 @@ class TotalLoss(nn.Module):
             getattr(self.loss_weights, "forecast_crps", 0.0))
         if forecast_crps_weight < 0:
             raise ValueError("forecast_crps weight must be non-negative")
+        sample_path_weights = {
+            "forecast_path_energy": float(getattr(
+                self.loss_weights, "forecast_path_energy", 0.0)),
+            "forecast_path_autocorr": float(getattr(
+                self.loss_weights, "forecast_path_autocorr", 0.0)),
+            "forecast_overdispersion": float(getattr(
+                self.loss_weights, "forecast_overdispersion", 0.0)),
+        }
+        if any(weight < 0 for weight in sample_path_weights.values()):
+            raise ValueError("sampled path loss weights must be non-negative")
+        crps_scored_modalities = 0
         recon_weights = dict(self._iter_recon_weights())
         sample_modalities = {
             key[:-len("_recon_samples")]
             for key in predictions
             if key.endswith("_recon_samples")
         }
+        if any(weight > 0 for weight in sample_path_weights.values()):
+            if not sample_modalities:
+                raise ValueError("sampled path losses require sampled forecasts")
+            if forecast_crps_weight <= 0:
+                raise ValueError(
+                    "sampled path losses require positive forecast_crps")
         if forecast_crps_weight > 0 and not sample_modalities:
             raise ValueError(
                 "forecast CRPS requires at least one "
                 "*_recon_samples prediction")
         for modality in sample_modalities:
             recon_weights.setdefault(modality, 0.0)
+        if sample_modalities and forecast_crps_weight <= 0:
+            raise ValueError(
+                "sampled forecast outputs require positive forecast_crps")
+        if sample_modalities:
+            mean_path_terms = {
+                "forecast_component": float(getattr(
+                    self.loss_weights, "forecast_component", 0.0)),
+                "forecast_variance": float(getattr(
+                    self.loss_weights, "forecast_variance", 0.0)),
+                "forecast_autocorr": float(getattr(
+                    self.loss_weights, "forecast_autocorr", 0.0)),
+                "forecast_corr_diff": float(getattr(
+                    self.loss_weights, "forecast_corr_diff", 0.0)),
+            }
+            enabled = [
+                name for name, weight in mean_path_terms.items()
+                if weight > 0
+            ]
+            enabled.extend(
+                f"recon_{modality}"
+                for modality in sample_modalities
+                if recon_weights.get(modality, 0.0) > 0)
+            if enabled:
+                raise ValueError(
+                    "sampled forecast outputs cannot use ensemble-mean "
+                    f"losses {sorted(set(enabled))}; use forecast center "
+                    "and CRPS only")
 
         for modality, weight in recon_weights.items():
             if weight <= 0 and forecast_crps_weight <= 0:
@@ -2269,10 +2623,46 @@ class TotalLoss(nn.Module):
                 total_loss = self._add_loss(
                     total_loss, crps_value, forecast_crps_weight,
                     f"forecast_crps_{modality}", metrics)
-                metrics[f"forecast_crps_{modality}"] = (
-                    crps_value.item())
-            if weight <= 0:
-                continue
+                crps_scored_modalities += 1
+                metrics[f"forecast_crps_{modality}"] = crps_value.item()
+                path_energy_weight = sample_path_weights[
+                    "forecast_path_energy"]
+                if path_energy_weight > 0:
+                    path_energy_value = self.forecast_path_energy(
+                        samples, target_value,
+                        mask=targets.get(f"{modality}_mask"))
+                    total_loss = self._add_loss(
+                        total_loss, path_energy_value, path_energy_weight,
+                        f"forecast_path_energy_{modality}", metrics)
+                    metrics[
+                        f"forecast_path_energy_{modality}"] = (
+                            path_energy_value.item())
+                path_autocorr_weight = sample_path_weights[
+                    "forecast_path_autocorr"]
+                if path_autocorr_weight > 0:
+                    path_autocorr_value = self.forecast_path_autocorr(
+                        samples, target_value,
+                        mask=targets.get(f"{modality}_mask"))
+                    total_loss = self._add_loss(
+                        total_loss, path_autocorr_value,
+                        path_autocorr_weight,
+                        f"forecast_path_autocorr_{modality}", metrics)
+                    metrics[
+                        f"forecast_path_autocorr_{modality}"] = (
+                            path_autocorr_value.item())
+                overdispersion_weight = sample_path_weights[
+                    "forecast_overdispersion"]
+                if overdispersion_weight > 0:
+                    overdispersion_value = self.forecast_overdispersion(
+                        samples, target_value,
+                        mask=targets.get(f"{modality}_mask"))
+                    total_loss = self._add_loss(
+                        total_loss, overdispersion_value,
+                        overdispersion_weight,
+                        f"forecast_overdispersion_{modality}", metrics)
+                    metrics[
+                        f"forecast_overdispersion_{modality}"] = (
+                            overdispersion_value.item())
             sequence_prediction = predictions.get(
                 f"{modality}_recon_sequence")
             criteria = (getattr(self.loss_weights, "recon_loss_types", None)
@@ -2283,7 +2673,7 @@ class TotalLoss(nn.Module):
                     and sequence_prediction is not None):
                 forecast_weight = float(
                     getattr(self.loss_weights, "forecast", 0.0))
-                if forecast_weight > 0:
+                if forecast_weight > 0 and self.forecast is not None:
                     forecast_value = self.forecast(
                         sequence_prediction, target_value,
                         mask=targets.get(f"{modality}_mask"))
@@ -2323,11 +2713,13 @@ class TotalLoss(nn.Module):
                             metrics[
                                 f"forecast_component_{modality}_{name}"] = (
                                     value.item())
-                    # An explicit reconstruction mix is the scale anchor for
-                    # generic signals. Keep it alongside forecast supervision;
-                    # modalities without a mix retain forecast-only behavior.
-                    if not mix:
+                    # A sampled forecast has no independent reconstruction
+                    # objective. Deterministic ODE forecasts retain the
+                    # configured last-window reconstruction term.
+                    if sample_modalities and not mix:
                         continue
+            if weight <= 0:
+                continue
             if target_value.dim() == 4:
                 target_value = target_value[:, -1]
             mask = targets.get(f"{modality}_mask")
@@ -2343,6 +2735,10 @@ class TotalLoss(nn.Module):
             total_loss = self._add_loss(
                 total_loss, recon_value, weight, f"recon_{modality}", metrics)
             metrics[f"recon_{modality}"] = recon_value.item()
+        if (forecast_crps_weight > 0 and sample_modalities
+                and crps_scored_modalities == 0):
+            raise ValueError(
+                "forecast CRPS requires a sampled modality with a target")
 
         if self.loss_weights.velocity_smooth > 0:
             # Temporal TV needs the rollout sequence; single-step "delta_z"

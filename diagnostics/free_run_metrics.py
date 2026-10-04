@@ -39,6 +39,110 @@ def _as_2d(x: np.ndarray, name: str) -> np.ndarray:
         raise ValueError(f"{name} needs >= 3 time steps; got {a.shape[0]}")
     return a
 
+def sde_transition_diagnostics(
+    initial_state: np.ndarray,
+    z_next_samples: np.ndarray,
+    transition_mean_samples: np.ndarray,
+    factor_samples: np.ndarray,
+    diagonal_std_samples: np.ndarray,
+    factor_basis: np.ndarray,
+    dt=1.0,
+) -> Dict[str, float]:
+    """Summarize sampled latent increments and low-rank covariance health.
+
+    Sampled transition arrays are ``(S, B, K, D)`` except factors, which are
+    ``(S, B, K, D, R)``. The drift increment is the conditional mean minus
+    the previous sampled state; the realized noise increment is sample minus
+    conditional mean. ``trace_Q`` reports covariance rate, before ``dt``.
+    Innovation autocorrelation uses coordinate-wise marginal standardization
+    by ``sqrt(dt * diag(Q))``; it does not whiten cross-dimensional covariance.
+    """
+    initial = np.asarray(initial_state, dtype=float)
+    z_next = np.asarray(z_next_samples, dtype=float)
+    mean = np.asarray(transition_mean_samples, dtype=float)
+    factor = np.asarray(factor_samples, dtype=float)
+    diagonal_std = np.asarray(diagonal_std_samples, dtype=float)
+    basis = np.asarray(factor_basis, dtype=float)
+    if z_next.ndim != 4 or mean.shape != z_next.shape:
+        raise ValueError("SDE state and mean samples must share shape (S,B,K,D)")
+    if z_next.shape[0] < 1 or z_next.shape[2] < 1:
+        raise ValueError("SDE diagnostics require samples and rollout steps")
+    _, batch_size, steps, latent_dim = z_next.shape
+    if initial.shape != (batch_size, latent_dim):
+        raise ValueError("initial_state must have shape (B,D)")
+    if diagonal_std.shape != z_next.shape:
+        raise ValueError("diagonal_std_samples must match state samples")
+    if (factor.ndim != 5 or factor.shape[:4] != z_next.shape
+            or factor.shape[-1] < 1):
+        raise ValueError("factor_samples must have shape (S,B,K,D,R)")
+    rank = factor.shape[-1]
+    if basis.shape != (latent_dim, rank):
+        raise ValueError("factor_basis must have shape (D,R)")
+    step_dt = np.asarray(dt, dtype=float)
+    if step_dt.ndim == 0:
+        step_dt = np.full(batch_size, float(step_dt))
+    elif step_dt.shape == (batch_size, 1):
+        step_dt = step_dt[:, 0]
+    if (step_dt.shape != (batch_size,)
+            or not np.isfinite(step_dt).all()
+            or np.any(step_dt <= 0.0)):
+        raise ValueError("dt must be positive and scalar or shaped (B,)")
+    previous = np.empty_like(z_next)
+    previous[:, :, 0, :] = initial[None, :, :]
+    if steps > 1:
+        previous[:, :, 1:, :] = z_next[:, :, :-1, :]
+    drift_increment = mean - previous
+    noise_increment = z_next - mean
+    drift_rms = float(np.sqrt(np.mean(np.square(drift_increment))))
+    noise_rms = float(np.sqrt(np.mean(np.square(noise_increment))))
+    gram_error = basis.T @ basis - np.eye(rank)
+    q_diagonal = np.square(factor).sum(axis=-1) + np.square(diagonal_std)
+    trace_q = q_diagonal.sum(axis=-1)
+    innovation_scale = np.sqrt(
+        q_diagonal * step_dt[None, :, None, None])
+    standardized_innovations = noise_increment / np.maximum(
+        innovation_scale, 1e-12)
+    innovation_metrics = {
+        "sde_standardized_innovation_rms": float(
+            np.sqrt(np.mean(np.square(standardized_innovations))),
+        ),
+    }
+    available_innovation_lags = []
+    for lag in (1, 2, 4, 8):
+        if lag >= steps:
+            continue
+        available_innovation_lags.append(lag)
+        left = standardized_innovations[:, :, :-lag].reshape(-1, latent_dim)
+        right = standardized_innovations[:, :, lag:].reshape(-1, latent_dim)
+        left = left - left.mean(axis=0, keepdims=True)
+        right = right - right.mean(axis=0, keepdims=True)
+        denominator = left.std(axis=0) * right.std(axis=0)
+        covariance = np.mean(left * right, axis=0)
+        correlations = np.divide(
+            covariance,
+            denominator,
+            out=np.zeros_like(covariance),
+            where=denominator > 1e-12,
+        )
+        innovation_metrics[
+            f"sde_innovation_lag_autocorr_rms_{lag}"] = float(
+                np.sqrt(np.mean(np.square(correlations))))
+    innovation_metrics[
+        "sde_innovation_autocorrelation_available_lags"
+    ] = available_innovation_lags
+    return {
+        "sde_factor_basis_gram_drift": float(
+            np.linalg.norm(gram_error, ord="fro") / np.sqrt(rank)),
+        "sde_drift_increment_rms": drift_rms,
+        "sde_noise_increment_rms": noise_rms,
+        "sde_noise_drift_ratio": float(
+            noise_rms / max(drift_rms, 1e-12)),
+        "sde_trace_q": float(np.mean(trace_q)),
+        "sde_diffusion_rms": float(
+            np.sqrt(np.mean(trace_q / latent_dim))),
+        **innovation_metrics,
+    }
+
 
 def _corr_matrix(a: np.ndarray) -> np.ndarray:
     """Pairwise Pearson correlation with NaN (constant column) -> 0.0."""

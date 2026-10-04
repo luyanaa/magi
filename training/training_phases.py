@@ -57,12 +57,14 @@ class LossWeights:
     plus arbitrary generic modalities through ``recon_extra``.  The forecast
     weight is separate: it is enabled only when the loader supplies an
     explicit ``(B, K, C, T)`` future target and the phase rolls out K states.
-    The composite forecast combines robust signal error with first-difference
-    correlation, when enabled an explicit log-variance criterion, and an
-    optional rollout autocorrelation criterion that compares the concatenated
-    temporal horizons. Runtime horizon-count mismatches are configuration
-    errors. Data profiles resolve the rollout count and explicit horizon
-    weights before training.
+    The composite deterministic forecast combines robust signal error with
+    first-difference correlation and optional log-variance/autocorrelation
+    criteria. Sampled SDE paths have separate empirical CRPS, projected whole-
+    path energy, per-path lag-autocorrelation, and late-horizon
+    overdispersion weights; these terms score samples rather than the
+    ensemble-mean forecast. Runtime horizon-count mismatches are configuration
+    errors. Data profiles resolve rollout count and explicit horizon weights
+    before training.
 
     Structural terms are only steering terms when their inputs are observable:
     ``cross_modal`` and ``cross`` need explicit synchronized/async pair labels,
@@ -96,6 +98,9 @@ class LossWeights:
     forecast_variance: float = 0.0      # per-channel log-variance RMSE
     forecast_crps: float = 0.0      # empirical CRPS over sampled forecasts
     forecast_autocorr: float = 0.0      # concatenated rollout autocorrelation
+    forecast_path_energy: float = 0.0  # projected whole-path energy score
+    forecast_path_autocorr: float = 0.0  # sampled-path lag correlation
+    forecast_overdispersion: float = 0.0  # late-horizon pathwise scale excess
     forecast_horizon_weights: Optional[Tuple[float, ...]] = None
     forecast_component: float = 0.0     # fixed TDE-RICA component forecast
     forecast_component_wasserstein: float = 1.0

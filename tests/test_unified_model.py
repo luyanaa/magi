@@ -1,5 +1,6 @@
 """Regression checks for the unified species/model contract."""
 
+import json
 import pytest
 from pathlib import Path
 
@@ -7,7 +8,7 @@ torch = pytest.importorskip("torch")
 
 ROOT = Path(__file__).resolve().parents[1]
 
-from brain_moe_pinn import BrainMoEPINN
+from brain_moe_pinn import BrainMoEPINN, BrainMoEPINNConfig
 from brain_moe_pinn.config import ExperimentConfig
 
 
@@ -60,6 +61,82 @@ def test_feature_gates_reject_incompatible_profiles():
             "data": {"modalities": ["calcium"]},
         })
 
+
+
+def test_sde_species_profile_reaches_model_and_crps_pilot():
+    sde_config = ExperimentConfig.from_file(
+        ROOT / "configs/species/c_elegans_unified_sde.json")
+    model = BrainMoEPINN(
+        use_neurostorm=False, **sde_config.model_kwargs()).eval()
+
+    assert model.transition_mode == "sde"
+    assert model.diffusion_rank == 16
+    assert model.transition_diffusion.factor_basis.shape == (192, 16)
+    assert model.diffusion_floor == pytest.approx(1e-4)
+    assert model.diffusion_scale == pytest.approx(1e-2)
+    assert model.stochastic_samples == 8
+    assert model.noise_mode == "off"
+    assert model.scale_anchor == "off"
+    adapter_config = BrainMoEPINNConfig.from_experiment(sde_config)
+    assert adapter_config.scale_anchor == "off"
+
+    with (ROOT / "configs/data/"
+          "c_elegans_toyoshima_component_sde_pilot.json").open() as handle:
+        pilot = json.load(handle)
+    assert pilot["forecast_crps"] == 1.0
+    assert pilot["forecast_center"] == 0.1
+    assert pilot["forecast_recon_extra"] == {"calcium": 0.0}
+    assert pilot["component_forecast"]["loss_weight"] == 0.0
+
+    nearzero_config = ExperimentConfig.from_file(
+        ROOT / "configs/species/c_elegans_unified_sde_nearzero.json")
+    nearzero = BrainMoEPINNConfig.from_experiment(nearzero_config)
+    assert nearzero.transition_mode == "sde"
+    assert nearzero.diffusion_rank == 16
+    assert nearzero.diffusion_floor == pytest.approx(1e-8)
+    assert nearzero.diffusion_scale == 0.0
+    assert nearzero.stochastic_samples == 8
+    assert nearzero.scale_anchor == "off"
+
+    with (ROOT / "configs/species/c_elegans_unified_sde.json").open() as handle:
+        reference_profile = json.load(handle)
+    with (ROOT / "configs/species/c_elegans_unified_sde_nearzero.json").open() as handle:
+        nearzero_profile = json.load(handle)
+    assert reference_profile["data"] == nearzero_profile["data"]
+    assert reference_profile["training"] == nearzero_profile["training"]
+    reference_features = dict(reference_profile["features"])
+    nearzero_features = dict(nearzero_profile["features"])
+    reference_features.pop("diffusion_floor")
+    reference_features.pop("diffusion_scale")
+    nearzero_features.pop("diffusion_floor")
+    nearzero_features.pop("diffusion_scale")
+    assert reference_features == nearzero_features
+
+
+    with (ROOT / "configs/data/"
+          "c_elegans_toyoshima_component_sde_diffusion_only.json").open() as handle:
+        diffusion_only = json.load(handle)
+    assert diffusion_only["forecast_objective"] == "crps_only"
+    assert diffusion_only["forecast_crps"] == 1.0
+    assert "component_forecast" not in diffusion_only
+    with (ROOT / "configs/data/"
+          "c_elegans_toyoshima_component_sde_pilot.json").open() as handle:
+        baseline_data = json.load(handle)
+    compared_data_keys = {
+        "root", "modalities", "roles", "control_modalities", "seq_seconds",
+        "batch_size", "num_workers", "pin_memory", "persistent_workers",
+        "prefetch_factor", "split_by", "val_frac", "include_sources",
+        "align_channels", "max_union_channels", "channel_order_file",
+        "return_masks", "return_next_step_targets", "future_steps",
+        "recon_loss_mix",
+        "rollout_steps", "rollout_horizon_weights", "normalization",
+        "control_width", "use_trials",
+    }
+    assert {
+        key: baseline_data[key] for key in compared_data_keys
+    } == {
+        key: diffusion_only[key] for key in compared_data_keys
+    }
 
 def test_forward_modalities_uses_shared_dynamics_and_species_metadata():
     torch.manual_seed(0)

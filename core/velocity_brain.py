@@ -843,9 +843,14 @@ class MultiTimeScaleKDA(nn.Module):
         self.stateful = bool(stateful)
         self.hidden_dim = hidden_dim
 
-        self.register_buffer("state_a", torch.zeros(1, hidden_dim))
-        self.register_buffer("state_b", torch.zeros(1, hidden_dim))
-        self.register_buffer("state_c", torch.zeros(1, hidden_dim))
+        # These batch-sized recurrent states are sequence runtime, not
+        # checkpoint state; SDE sampling can resize them to S * B.
+        self.register_buffer(
+            "state_a", torch.zeros(1, hidden_dim), persistent=False)
+        self.register_buffer(
+            "state_b", torch.zeros(1, hidden_dim), persistent=False)
+        self.register_buffer(
+            "state_c", torch.zeros(1, hidden_dim), persistent=False)
 
         self.mix_weights = nn.Sequential(
             nn.Linear(hidden_dim * 3, 3),

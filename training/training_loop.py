@@ -63,6 +63,29 @@ except ImportError:  # pragma: no cover - config is always importable in-repo
     SPECIES_PROFILES = {}
 
 
+def resolve_recon_modalities(config: Mapping[str, Any]) -> Tuple[str, ...]:
+    """Resolve signal modalities whose generic reconstruction terms are active."""
+    model_config = config.get("model_config") or {}
+    species = model_config.get("species") or "human"
+    profile = SPECIES_PROFILES.get(species) if SPECIES_PROFILES else None
+    experiment = config.get("experiment_data") or {}
+    profile_modalities = profile.modalities if profile else ()
+    modalities = tuple(
+        experiment.get("modalities") or profile_modalities
+    ) or ("calcium", "voltage")
+    roles = (
+        experiment.get("roles")
+        or config.get("modality_roles")
+        or {}
+    )
+    return tuple(
+        modality for modality in modalities
+        if modality in SUPPORTED_MODALITIES
+        and roles.get(modality, "signal") == "signal"
+        and modality != "behavior"
+    )
+
+
 def make_dummy_generic_signals(
     modalities,
     batch_size: int,
@@ -621,12 +644,11 @@ def augment_phase_loss_weights(
     recon_loss_types: Optional[Dict[str, str]] = None,
     recon_loss_mix: Optional[Dict[str, Dict[str, float]]] = None,
 ):
-    """Enable supported generic terms without hiding unsupported objectives.
+    """Enable generic objectives only for configured modalities.
 
-    Generic species models do not emit standard EEG/fMRI hubs or the latent
-    HRF bridge, so cross-modal objectives are explicitly disabled rather than
-    silently skipped. Policy terms remain user-controlled and are validated
-    per batch by ``TotalLoss``.
+    Missing EEG/fMRI/MEG heads and the latent HRF bridge cannot contribute to
+    generic-species batches; their weights are disabled instead of surfacing
+    as absent-target errors. Policy terms remain user-controlled.
     """
     from dataclasses import replace
     extras = dict(getattr(weights, "recon_extra", {}) or {})
@@ -638,6 +660,13 @@ def augment_phase_loss_weights(
     }
     changed = False
     dedicated = {"eeg", "fmri", "meg"}
+    unused_reconstruction = {}
+    for modality in ("eeg", "fmri", "meg"):
+        field = f"recon_{modality}"
+        if (modality not in recon_modalities
+                and float(getattr(weights, field, 0.0)) > 0):
+            unused_reconstruction[field] = 0.0
+            changed = True
     for modality in recon_modalities:
         if modality in dedicated:
             continue
@@ -663,8 +692,13 @@ def augment_phase_loss_weights(
             weights, cross_modal=0.0, cross=0.0, cross_soft=0.0)
     if not changed:
         return weights
-    return replace(weights, recon_extra=extras, recon_loss_types=types,
-                   recon_loss_mix=mixes)
+    return replace(
+        weights,
+        recon_extra=extras,
+        recon_loss_types=types,
+        recon_loss_mix=mixes,
+        **unused_reconstruction,
+    )
 
 def apply_component_forecast_spec(weights, spec):
     """Apply a data-profile component objective only to forecast phases."""
@@ -690,6 +724,79 @@ def apply_component_forecast_spec(weights, spec):
         forecast_component_wasserstein=wasserstein_weight,
         forecast_component_variance=variance_weight,
     )
+
+
+def enforce_sde_forecast_contract(
+    phases: List[Mapping[str, Any]],
+    model,
+    *,
+    generic_model: Optional[bool] = None,
+    component_forecast_spec: Optional[Mapping[str, Any]] = None,
+    recon_modalities: Optional[Tuple[str, ...]] = None,
+) -> None:
+    """Reject SDE forecast schedules without CRPS or with other losses."""
+    target_model = model.module if hasattr(model, "module") else model
+    if getattr(target_model, "transition_mode", "ode") != "sde":
+        return
+    sampled_forecast_enabled = False
+    for phase in phases:
+        loss_weights = phase.get("loss_weights")
+        if loss_weights is None:
+            continue
+        forecast_weight = float(getattr(loss_weights, "forecast", 0.0))
+        crps_weight = float(getattr(loss_weights, "forecast_crps", 0.0))
+        if forecast_weight > 0 and crps_weight <= 0:
+            raise ValueError(
+                f"SDE forecast phase {phase.get('name', '<unnamed>')!r} "
+                "requires forecast_crps > 0")
+        if forecast_weight <= 0 and crps_weight <= 0:
+            continue
+        if recon_modalities is None:
+            raise ValueError(
+                "SDE forecast preflight requires configured "
+                "recon_modalities")
+        sampled_forecast_enabled = True
+        effective_weights = augment_phase_loss_weights(
+            loss_weights, recon_modalities)
+        effective_weights = apply_component_forecast_spec(
+            effective_weights, component_forecast_spec)
+        mean_path_terms = {
+            "forecast_component": float(getattr(
+                effective_weights, "forecast_component", 0.0)),
+            "forecast_variance": float(getattr(
+                effective_weights, "forecast_variance", 0.0)),
+            "forecast_autocorr": float(getattr(
+                effective_weights, "forecast_autocorr", 0.0)),
+            "forecast_corr_diff": float(getattr(
+                effective_weights, "forecast_corr_diff", 0.0)),
+        }
+        enabled = [
+            name for name, weight in mean_path_terms.items()
+            if weight > 0
+        ]
+        enabled.extend(
+            f"recon_{modality}"
+            for modality in ("eeg", "fmri", "meg")
+            if modality in recon_modalities
+            and float(getattr(
+                effective_weights, f"recon_{modality}", 0.0)) > 0)
+        recon_extra = getattr(effective_weights, "recon_extra", None) or {}
+        enabled.extend(
+            f"recon_extra[{modality}]"
+            for modality, weight in recon_extra.items()
+            if float(weight) > 0)
+        if enabled:
+            raise ValueError(
+                f"SDE forecast phase {phase.get('name', '<unnamed>')!r} "
+                "cannot use ensemble-mean losses "
+                f"{sorted(set(enabled))}; only forecast center and "
+                "sampled CRPS are supported")
+    is_generic = (
+        bool(getattr(target_model, "generic_observation_only", False))
+        or bool(generic_model))
+    if sampled_forecast_enabled and not is_generic:
+        raise ValueError(
+            "SDE sampled forecasts require generic_observation_only=True")
 
 
 class MetricsLogger:
@@ -865,6 +972,8 @@ class BrainMoETrainer:
     ):
         self.model = model
         self.config = config
+        self._phase_trainable_parameter_lr_scales = config.get(
+            "phase_trainable_parameter_lr_scales", {})
         # Opening steps produce the largest gradients of the run; PyTorch's
         # default 2**16 scale overflows fp16 there and burns skipped optimizer
         # steps.  See grad_scaler() for the reasoning.
@@ -878,6 +987,11 @@ class BrainMoETrainer:
 
         self.device = get_device(index=self.local_rank)
         self.model = move_to_device(self.model, self.device)
+        self.trainable_parameter_prefixes = tuple(
+            config.get("trainable_parameter_prefixes") or ())
+        if self.trainable_parameter_prefixes:
+            self._set_trainable_parameter_prefixes(
+                self.model, self.trainable_parameter_prefixes)
 
         # Generic (non-EEG) species route: detect before DDP wrapping so the
         # flag survives module wrappers. Experiment data (modalities) comes
@@ -925,8 +1039,8 @@ class BrainMoETrainer:
         # 'behavior' is not auto-reconstructed (its contract may be
         # categorical); controls/auxiliary/graph modalities are not neural
         # reconstruction targets.
-        self.recon_modalities = tuple(
-            m for m in self.signal_modalities if m != "behavior")
+        self.recon_modalities = resolve_recon_modalities(config)
+
         self.recon_loss_types = dict(
             (profile.recon_loss_types if profile else {}) or {})
         self.recon_loss_mix = dict(
@@ -996,9 +1110,11 @@ class BrainMoETrainer:
         if deepspeed_config and DEEPSPEED_AVAILABLE:
             self.ds_config = deepspeed_config
             # DeepSpeed handles optimizer, scaler, and DDP internally
+            ds_parameter_groups = self._deepspeed_parameter_groups(
+                self.model, self._phase_trainable_parameter_lr_scales)
             self.ds_engine, self.optimizer, _, _ = deepspeed.initialize(
                 model=self.model,
-                model_parameters=self.model.parameters(),
+                model_parameters=ds_parameter_groups,
                 config=deepspeed_config,
             )
             self._deepspeed_overflow_guard = (
@@ -1179,6 +1295,118 @@ class BrainMoETrainer:
         if dist.is_initialized():
             dist.barrier()
 
+    @staticmethod
+    def _set_optimizer_learning_rate(optimizer, learning_rate: float) -> None:
+        """Apply the phase schedule while preserving per-group LR scales."""
+        for group in optimizer.param_groups:
+            group["lr"] = learning_rate * group.get("_lr_multiplier", 1.0)
+
+    @staticmethod
+    def _deepspeed_parameter_groups(model, phase_lr_scales):
+        """Group DeepSpeed parameters by their per-phase LR scale signature."""
+        if not isinstance(phase_lr_scales, Mapping):
+            raise TypeError(
+                "phase trainable parameter LR scales must be a mapping")
+        normalized = {}
+        for phase_name, configured_scales in phase_lr_scales.items():
+            if not isinstance(configured_scales, Mapping):
+                raise TypeError(
+                    f"LR scales for phase {phase_name!r} must be a mapping")
+            phase_scales = {}
+            for prefix, scale in configured_scales.items():
+                if not isinstance(prefix, str) or not prefix:
+                    raise ValueError(
+                        "LR scale prefixes must be non-empty strings")
+                scale = float(scale)
+                if not math.isfinite(scale) or scale <= 0:
+                    raise ValueError(
+                        "trainable parameter LR scales must be positive")
+                phase_scales[prefix] = scale
+            normalized[str(phase_name)] = phase_scales
+
+        if not any(normalized.values()):
+            return [
+                parameter for parameter in model.parameters()
+                if parameter.requires_grad
+            ]
+
+        phase_names = tuple(normalized)
+        matched_prefixes = {
+            phase_name: set() for phase_name in phase_names
+        }
+        parameters_by_signature = {}
+        for name, parameter in model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            signature = []
+            for phase_name in phase_names:
+                scales = normalized[phase_name]
+                matching_prefix = max(
+                    (prefix for prefix in scales if name.startswith(prefix)),
+                    key=len,
+                    default=None,
+                )
+                if matching_prefix is None:
+                    signature.append(1.0)
+                else:
+                    matched_prefixes[phase_name].add(matching_prefix)
+                    signature.append(scales[matching_prefix])
+            parameters_by_signature.setdefault(
+                tuple(signature), []).append(parameter)
+
+        for phase_name, scales in normalized.items():
+            unmatched = set(scales) - matched_prefixes[phase_name]
+            if unmatched:
+                raise ValueError(
+                    f"LR scale prefixes for phase {phase_name!r} match no "
+                    f"trainable parameters: {sorted(unmatched)}")
+
+        return [
+            {
+                "params": parameters,
+                "_lr_multiplier": signature[0],
+                "_lr_multipliers_by_phase": dict(
+                    zip(phase_names, signature)),
+            }
+            for signature, parameters in parameters_by_signature.items()
+        ]
+
+    def _apply_deepspeed_phase_lr_multipliers(
+        self, phase_name: str, freeze_policy: Mapping[str, Any]
+    ) -> None:
+        """Select the prebuilt DeepSpeed LR scale groups for one phase."""
+        expected = self._phase_trainable_parameter_lr_scales.get(
+            phase_name, {})
+        configured = freeze_policy.get(
+            "trainable_parameter_lr_scales", {})
+        if (not isinstance(expected, Mapping)
+                or not isinstance(configured, Mapping)):
+            raise TypeError("DeepSpeed phase LR scales must be mappings")
+        if dict(configured) != dict(expected):
+            raise ValueError(
+                f"DeepSpeed LR scales for phase {phase_name!r} must be "
+                "provided before engine initialization")
+        for group in self.optimizer.param_groups:
+            scales_by_phase = group.get("_lr_multipliers_by_phase")
+            if scales_by_phase is None:
+                if configured:
+                    raise RuntimeError(
+                        "DeepSpeed optimizer discarded parameter LR scales")
+                group["_lr_multiplier"] = 1.0
+                continue
+            if phase_name not in scales_by_phase:
+                raise ValueError(
+                    f"DeepSpeed optimizer has no LR scale group for phase "
+                    f"{phase_name!r}")
+            group["_lr_multiplier"] = scales_by_phase[phase_name]
+        if configured and self.is_main_process:
+            multipliers = sorted({
+                group["_lr_multiplier"] for group in self.optimizer.param_groups
+            })
+            print(
+                f"[OPTIMIZER] DeepSpeed LR multipliers for {phase_name}: "
+                f"{multipliers}")
+
     def create_optimizer(self, phase_config: Dict):
         """Create optimizer for current phase with proper parameter grouping."""
         lr = phase_config.get("learning_rate", 3e-5)
@@ -1190,6 +1418,21 @@ class BrainMoETrainer:
         # Adafactor factorization is unstable for 1D params (bias, LayerNorm,
         # embeddings), which should use standard AdamW even under Adafactor.
         # Also: encoder params get reduced LR (×0.1) to protect pretrained weights.
+        freeze_policy = getattr(self, "_active_freeze_policy", {}) or {}
+        configured_lr_scales = freeze_policy.get(
+            "trainable_parameter_lr_scales", {})
+        if not isinstance(configured_lr_scales, Mapping):
+            raise TypeError("trainable parameter LR scales must be a mapping")
+        lr_scales = {}
+        for prefix, scale in configured_lr_scales.items():
+            if not isinstance(prefix, str) or not prefix:
+                raise ValueError("LR scale prefixes must be non-empty strings")
+            scale = float(scale)
+            if not math.isfinite(scale) or scale <= 0:
+                raise ValueError("trainable parameter LR scales must be positive")
+            lr_scales[prefix] = scale
+        matched_lr_scale_prefixes = set()
+        parameter_lr_multipliers = {}
         adafactor_params = []
         no_factor_params = []
         encoder_adafactor = []
@@ -1201,12 +1444,24 @@ class BrainMoETrainer:
             if not param.requires_grad:
                 continue
 
+            matching_prefix = max(
+                (prefix for prefix in lr_scales
+                 if name.startswith(prefix)),
+                key=len,
+                default=None,
+            )
+            lr_multiplier = (
+                lr_scales[matching_prefix]
+                if matching_prefix is not None else 1.0)
+            if matching_prefix is not None:
+                matched_lr_scale_prefixes.add(matching_prefix)
+            parameter_lr_multipliers[id(param)] = lr_multiplier
+
             is_1d = param.ndim <= 1
             is_embed = "embed" in name or "token" in name
             is_norm = "norm" in name or "ln" in name or "layernorm" in name.lower()
             is_bias = "bias" in name
             no_factor = is_1d or is_embed or is_norm or is_bias
-
             is_encoder = "encoder" in name
 
             if optimizer_type.lower() == "adafactor":
@@ -1217,37 +1472,50 @@ class BrainMoETrainer:
             else:
                 (adam_encoder if is_encoder else adam_other).append(param)
 
+        unmatched_lr_scales = set(lr_scales) - matched_lr_scale_prefixes
+        if unmatched_lr_scales:
+            raise ValueError(
+                "LR scale prefixes match no trainable parameters: "
+                f"{sorted(unmatched_lr_scales)}")
+
         param_groups = []
+
+        def append_scaled_groups(
+            parameters, *, encoder=False, factorize_second_moments=None
+        ):
+            by_scale = {}
+            for parameter in parameters:
+                scale = parameter_lr_multipliers[id(parameter)]
+                by_scale.setdefault(scale, []).append(parameter)
+            encoder_scale = 0.1 if encoder else 1.0
+            for scale, grouped_parameters in by_scale.items():
+                effective_scale = scale * encoder_scale
+                group = {
+                    "params": grouped_parameters,
+                    "lr": lr * effective_scale,
+                    "weight_decay": weight_decay * encoder_scale,
+                    "_lr_multiplier": effective_scale,
+                }
+                if factorize_second_moments is not None:
+                    group["factorize_second_moments"] = (
+                        factorize_second_moments)
+                param_groups.append(group)
+
         if optimizer_type.lower() == "adafactor":
-            if adafactor_params:
-                param_groups.append({
-                    "params": adafactor_params,
-                    "lr": lr, "weight_decay": weight_decay,
-                    "factorize_second_moments": True,
-                })
-            if no_factor_params:
-                param_groups.append({
-                    "params": no_factor_params,
-                    "lr": lr, "weight_decay": weight_decay,
-                    "factorize_second_moments": False,
-                })
-            if encoder_adafactor:
-                param_groups.append({
-                    "params": encoder_adafactor,
-                    "lr": lr * 0.1, "weight_decay": weight_decay * 0.1,
-                    "factorize_second_moments": True,
-                })
-            if encoder_no_factor:
-                param_groups.append({
-                    "params": encoder_no_factor,
-                    "lr": lr * 0.1, "weight_decay": weight_decay * 0.1,
-                    "factorize_second_moments": False,
-                })
+            append_scaled_groups(
+                adafactor_params, factorize_second_moments=True)
+            append_scaled_groups(
+                no_factor_params, factorize_second_moments=False)
+            append_scaled_groups(
+                encoder_adafactor, encoder=True,
+                factorize_second_moments=True)
+            append_scaled_groups(
+                encoder_no_factor, encoder=True,
+                factorize_second_moments=False)
         else:
-            if adam_other:
-                param_groups.append({"params": adam_other, "lr": lr, "weight_decay": weight_decay})
-            if adam_encoder:
-                param_groups.append({"params": adam_encoder, "lr": lr * 0.1, "weight_decay": weight_decay * 0.1})
+            append_scaled_groups(adam_other)
+            append_scaled_groups(adam_encoder, encoder=True)
+
 
         if optimizer_type.lower() == "adafactor":
             try:
@@ -1419,8 +1687,13 @@ class BrainMoETrainer:
         model: torch.nn.Module,
         checkpoint_state: Dict[str, Any],
     ):
-        """Load exact model state, allowing only an absent SDE head."""
+        """Load state, ignoring legacy batch-shaped KDA runtime buffers."""
         transition_prefix = "transition_diffusion."
+        legacy_runtime_keys = {
+            "velocity_brain.mt_kda.state_a",
+            "velocity_brain.mt_kda.state_b",
+            "velocity_brain.mt_kda.state_c",
+        }
         model_state = model.state_dict()
         model_keys = set(model_state)
         checkpoint_keys = set(checkpoint_state)
@@ -1457,7 +1730,7 @@ class BrainMoETrainer:
             converted[key] = value
 
         missing = model_keys - set(converted)
-        unexpected = checkpoint_keys - model_keys
+        unexpected = checkpoint_keys - model_keys - legacy_runtime_keys
         invalid_missing = [
             key for key in missing
             if not key.startswith(transition_prefix)
@@ -1563,6 +1836,26 @@ class BrainMoETrainer:
             for parameter_id in removed_ids:
                 migrated["state"].pop(parameter_id, None)
         return migrated, added
+
+    def load_model_checkpoint(self, path: str):
+        """Initialize model weights without restoring step or optimizer state."""
+        checkpoint = torch.load(
+            path, map_location=str(self.device), weights_only=True)
+        if (not isinstance(checkpoint, Mapping)
+                or not isinstance(checkpoint.get("model_state"), Mapping)):
+            raise ValueError("checkpoint must contain a model_state mapping")
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        missing, unexpected = self._load_transition_compatible_model_state(
+            model, checkpoint["model_state"])
+        if self.is_main_process and missing:
+            print(
+                "[Checkpoint] Initializing newly added transition diffusion "
+                "parameters")
+        if self.is_main_process and unexpected:
+            print(
+                "[Checkpoint] Ignoring transition diffusion parameters "
+                "for the deterministic ODE model")
+        return missing, unexpected
 
     def load_checkpoint(self, path: str) -> Tuple[int, str]:
         """Load model checkpoint with world-size-aware handling."""
@@ -2141,12 +2434,48 @@ class BrainMoETrainer:
             raise ValueError(
                 f"unsupported phase task: {phase_config['task']!r}")
 
+    @staticmethod
+    def _set_trainable_parameter_prefixes(model, prefixes):
+        """Keep only parameters with an explicitly allowed name prefix."""
+        target = model.module if hasattr(model, "module") else model
+        if isinstance(prefixes, str) or not isinstance(prefixes, (list, tuple)):
+            raise TypeError("trainable parameter prefixes must be a list or tuple")
+        if not prefixes or any(
+                not isinstance(prefix, str) or not prefix
+                for prefix in prefixes):
+            raise ValueError("trainable parameter prefixes must be non-empty")
+        named_parameters = tuple(target.named_parameters())
+        trainable_names = {
+            name for name, _ in named_parameters
+            if any(name.startswith(prefix) for prefix in prefixes)
+        }
+        if not trainable_names:
+            raise ValueError(
+                "trainable parameter prefixes match no model parameters")
+        for name, parameter in named_parameters:
+            parameter.requires_grad = name in trainable_names
+        return trainable_names
+
     def _apply_freeze_policy(self, policy: Mapping[str, Any]) -> None:
         """Apply the phase's explicit freeze policy before optimizer creation."""
         if not isinstance(policy, Mapping):
             raise TypeError("freeze policy must be a mapping")
         model = self.ds_engine if self.ds_engine is not None else self.model
         target = model.module if hasattr(model, "module") else model
+        prefixes = policy.get("trainable_parameter_prefixes")
+        if prefixes is not None:
+            component_keys = {
+                "eeg_encoder", "fmri_encoder", "velocity_brain",
+                "decoder", "moe_router",
+            }
+            if component_keys.intersection(policy):
+                raise ValueError(
+                    "trainable_parameter_prefixes cannot be combined with "
+                    "component freeze settings")
+            self._set_trainable_parameter_prefixes(target, prefixes)
+            self._active_freeze_policy = dict(policy)
+            self._phase_thawed_components = set()
+            return
 
         def set_frozen(component, frozen: bool) -> None:
             if component is None:
@@ -2173,6 +2502,41 @@ class BrainMoETrainer:
             set_frozen(router, bool(policy["moe_router"]))
         self._active_freeze_policy = dict(policy)
         self._phase_thawed_components = set()
+    def _apply_frozen_module_eval_modes(self, model) -> None:
+        """Keep frozen submodules deterministic while an allowlist trains."""
+        if "trainable_parameter_prefixes" not in getattr(
+                self, "_active_freeze_policy", {}):
+            return
+        target = model.module if hasattr(model, "module") else model
+        states = {}
+
+        def summarize(module):
+            parameters = tuple(module.parameters(recurse=False))
+            children = tuple(module.children())
+            child_states = tuple(summarize(child) for child in children)
+            has_trainable = (
+                any(parameter.requires_grad for parameter in parameters)
+                or any(state[0] for state in child_states)
+            )
+            has_frozen = (
+                any(not parameter.requires_grad for parameter in parameters)
+                or any(state[1] for state in child_states)
+            )
+            states[id(module)] = has_trainable, has_frozen
+            return has_trainable, has_frozen
+
+        def apply_modes(module):
+            has_trainable, has_frozen = states[id(module)]
+            if not has_trainable:
+                module.eval()
+                return
+            if not has_frozen:
+                return
+            for child in module.children():
+                apply_modes(child)
+
+        summarize(target)
+        apply_modes(target)
     def _gradient_diagnostics(self, model) -> Dict[str, float]:
         """Summarize trainable parameters and populated gradients.
 
@@ -2327,6 +2691,7 @@ class BrainMoETrainer:
             self.optimizer.zero_grad(set_to_none=True)
         model = self.ds_engine if use_deepspeed else self.model
         model.train()
+        self._apply_frozen_module_eval_modes(model)
         self.magi_pretraining.train()
         iterator = iter(self.train_dataloader)
         step = int(start_step)
@@ -2384,8 +2749,7 @@ class BrainMoETrainer:
             if optimizer is None:
                 optimizer = getattr(model, "optimizer", None)
             if optimizer is not None:
-                for group in optimizer.param_groups:
-                    group["lr"] = lr
+                self._set_optimizer_learning_rate(optimizer, lr)
 
             with autocast_context(self.device, enabled=True):
                 # Call through the wrapped model. DDP/DeepSpeed then observes
@@ -2496,6 +2860,9 @@ class BrainMoETrainer:
                 raise ValueError(
                     "forecast_crps requires at least two stochastic_samples")
         self._apply_freeze_policy(phase_config["freeze_policy"])
+        if self.ds_engine is not None:
+            self._apply_deepspeed_phase_lr_multipliers(
+                phase_name, phase_config["freeze_policy"])
         self._phase_thawed_components = set()
         total_steps = int(phase_config.get("total_steps", 10000))
         self._apply_phase_context(phase_config)
@@ -2629,6 +2996,7 @@ class BrainMoETrainer:
                     print(f"[IMAGINATION] Enabled with interval={imagination_interval}")
 
         model.train()
+        self._apply_frozen_module_eval_modes(model)
 
         if self._train_sampler is not None:
             phase_epoch = start_step // max(1, total_steps) if total_steps > 0 else 0
@@ -2687,12 +3055,7 @@ class BrainMoETrainer:
             self._current_step = step
 
 
-            if use_deepspeed:
-                for param_group in self.optimizer.param_groups:
-                    param_group["lr"] = lr
-            else:
-                for param_group in self.optimizer.param_groups:
-                    param_group["lr"] = lr
+            self._set_optimizer_learning_rate(self.optimizer, lr)
 
             # Generic species runs feed forward_modalities with raw signals
             # per modality; the EEG/fMRI(+MEG) path is unchanged.
@@ -2876,7 +3239,7 @@ class BrainMoETrainer:
                     targets.update(self._standard_contract_targets)
                 total_loss, loss_metrics = self.total_loss(outputs, targets)
                 for metric_name, metric_value in loss_metrics.items():
-                    if not metric_name.startswith("forecast_component_"):
+                    if not metric_name.startswith("forecast_"):
                         continue
                     if isinstance(metric_value, torch.Tensor):
                         metric_value = metric_value.detach().float().item()
@@ -2965,7 +3328,7 @@ class BrainMoETrainer:
                         targets.update(self._standard_contract_targets)
                     total_loss, loss_metrics = self.total_loss(outputs, targets)
                     for metric_name, metric_value in loss_metrics.items():
-                        if not metric_name.startswith("forecast_component_"):
+                        if not metric_name.startswith("forecast_"):
                             continue
                         if isinstance(metric_value, torch.Tensor):
                             metric_value = metric_value.detach().float().item()
@@ -3168,7 +3531,7 @@ class BrainMoETrainer:
                 }
                 for metric_name, metric_value in step_metrics.items():
                     if (
-                        metric_name.startswith("loss_forecast_component_")
+                        metric_name.startswith("loss_forecast_")
                         or metric_name in {
                             "trainable_parameter_count",
                             "gradient_parameter_count",
@@ -3322,7 +3685,8 @@ class BrainMoETrainer:
 
         from ..diagnostics.causal_dynamics import forward_reverse_prediction_gap
         from ..diagnostics.free_run_metrics import (
-            intrinsic_rollout_stats, run_free_run_suite)
+            intrinsic_rollout_stats, run_free_run_suite,
+            sde_transition_diagnostics)
 
         model_was_training = model.training
         model.eval()
@@ -3549,6 +3913,49 @@ class BrainMoETrainer:
                         outputs, targets, update_normalizer=False)
                     total_loss_value += float(batch_loss.item())
                     val_steps += 1
+                    if (self.generic_model
+                            and getattr(
+                                target_model, "transition_mode", "ode")
+                            == "sde"):
+                        sde_outputs = outputs
+                        if "z_next_sequence_samples" not in sde_outputs:
+                            sde_outputs = model.forward_modalities(
+                                signals,
+                                masks=signal_masks,
+                                num_steps=rollout_steps,
+                                return_all=True,
+                                return_sequences=True,
+                                reconstruct=False,
+                                **self._generic_step_kwargs(batch_tensors),
+                                perturbation=perturbation,
+                                sample_transition=True,
+                                num_samples=int(
+                                    target_model.stochastic_samples),
+                            )
+                        diagnostic_dt = self._generic_step_kwargs(
+                            batch_tensors).get("dt", 1.0)
+                        if isinstance(diagnostic_dt, torch.Tensor):
+                            diagnostic_dt = diagnostic_dt.detach().cpu().numpy()
+                        transition_metrics = sde_transition_diagnostics(
+                            sde_outputs["z_global"].detach().cpu().numpy(),
+                            sde_outputs[
+                                "z_next_sequence_samples"
+                            ].detach().cpu().numpy(),
+                            sde_outputs[
+                                "transition_mean_sequence_samples"
+                            ].detach().cpu().numpy(),
+                            sde_outputs[
+                                "transition_factor_sequence_samples"
+                            ].detach().cpu().numpy(),
+                            sde_outputs[
+                                "transition_diag_std_sequence_samples"
+                            ].detach().cpu().numpy(),
+                            target_model.transition_diffusion.factor_basis
+                            .detach().cpu().numpy(),
+                            dt=diagnostic_dt,
+                        )
+                        for name, value in transition_metrics.items():
+                            val_metrics.setdefault(name, []).append(value)
 
                     if "moe_routing" in outputs:
                         for key, value in outputs["moe_routing"].items():
@@ -3659,6 +4066,7 @@ class BrainMoETrainer:
             reset_eval_state()
             if model_was_training:
                 model.train()
+                self._apply_frozen_module_eval_modes(model)
         if val_steps == 0:
             return {}
         prefix = str(label)
@@ -3709,6 +4117,15 @@ class BrainMoETrainer:
         for phase in phases:
             self._validate_runtime_phase(phase)
         self.global_barrier()
+        target_model = (
+            self.model.module if hasattr(self.model, "module") else self.model)
+        enforce_sde_forecast_contract(
+            phases,
+            target_model,
+            generic_model=self.generic_model,
+            component_forecast_spec=self.component_forecast_spec,
+            recon_modalities=self.recon_modalities,
+        )
 
         start_step = 0
         current_phase = 0

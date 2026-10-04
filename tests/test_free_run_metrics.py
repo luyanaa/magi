@@ -296,3 +296,85 @@ def test_fixed_projection_uses_shared_finite_channel_mask():
         signal, coeff, toolbox, valid_channels=valid)
     assert components.shape == (8, 1)
     assert np.isfinite(components).all()
+
+
+def test_sde_transition_diagnostics_uses_realized_noise_and_covariance_rate():
+    initial = np.zeros((1, 2))
+    means = np.array([
+        [[[1.0, 0.0]]],
+        [[[1.0, 0.0]]],
+    ])
+    samples = np.array([
+        [[[2.0, 0.0]]],
+        [[[0.0, 0.0]]],
+    ])
+    factors = np.zeros((2, 1, 1, 2, 1))
+    factors[:, :, :, 0, 0] = 0.3
+    diagonal_std = np.zeros_like(samples)
+    diagonal_std[:, :, :, 0] = 0.4
+
+    result = frm.sde_transition_diagnostics(
+        initial,
+        samples,
+        means,
+        factors,
+        diagonal_std,
+        np.array([[1.0], [0.0]]),
+    )
+
+    assert result["sde_factor_basis_gram_drift"] == pytest.approx(0.0)
+    assert result["sde_drift_increment_rms"] == pytest.approx(np.sqrt(0.5))
+    assert result["sde_noise_increment_rms"] == pytest.approx(np.sqrt(0.5))
+    assert result["sde_noise_drift_ratio"] == pytest.approx(1.0)
+    assert result["sde_trace_q"] == pytest.approx(0.25)
+    assert result["sde_diffusion_rms"] == pytest.approx(np.sqrt(0.125))
+    assert result["sde_standardized_innovation_rms"] == pytest.approx(
+        np.sqrt(2.0))
+    drifted = frm.sde_transition_diagnostics(
+        initial,
+        samples,
+        means,
+        factors,
+        diagonal_std,
+        np.array([[2.0], [0.0]]),
+    )
+    assert drifted["sde_factor_basis_gram_drift"] == pytest.approx(3.0)
+
+
+def test_sde_innovation_autocorrelation_uses_dt_scaled_marginal_variance():
+    innovations = np.tile(
+        np.array([2.0, -2.0, 2.0, -2.0]).reshape(1, 1, 4, 1),
+        (2, 1, 1, 1),
+    )
+    result = frm.sde_transition_diagnostics(
+        np.zeros((1, 1)),
+        innovations,
+        np.zeros_like(innovations),
+        np.ones((2, 1, 4, 1, 1)),
+        np.zeros_like(innovations),
+        np.ones((1, 1)),
+        dt=np.array([4.0]),
+    )
+
+    assert result["sde_standardized_innovation_rms"] == pytest.approx(1.0)
+    assert result["sde_innovation_lag_autocorr_rms_1"] == pytest.approx(1.0)
+    assert result["sde_innovation_lag_autocorr_rms_2"] == pytest.approx(1.0)
+    assert "sde_innovation_lag_autocorr_rms_4" not in result
+    assert result["sde_innovation_autocorrelation_available_lags"] == [1, 2]
+
+
+def test_innovation_whiteness_reports_only_estimable_lags_for_eight_steps():
+    innovations = np.arange(8, dtype=np.float32).reshape(1, 1, 8, 1)
+    result = frm.sde_transition_diagnostics(
+        np.zeros((1, 1)),
+        innovations,
+        np.zeros_like(innovations),
+        np.ones((1, 1, 8, 1, 1)),
+        np.zeros_like(innovations),
+        np.ones((1, 1)),
+    )
+
+    assert result["sde_innovation_autocorrelation_available_lags"] == [
+        1, 2, 4,
+    ]
+    assert "sde_innovation_lag_autocorr_rms_8" not in result
