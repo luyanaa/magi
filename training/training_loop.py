@@ -15,6 +15,7 @@ import json
 import time
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any, Mapping
+from dataclasses import replace
 import math
 
 import torch
@@ -134,6 +135,87 @@ def apply_precision(config: Dict, precision: Optional[str]) -> Dict:
     cfg.pop("fp16", None)
     cfg.pop("bf16", None)
     return cfg
+
+def _load_fixed_component_basis(
+    spec: Mapping[str, Any],
+) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Load a reviewed TDE-RICA basis and its fixed projection matrix."""
+    if not isinstance(spec, Mapping):
+        raise TypeError("component_forecast must be a mapping")
+    raw_path = spec.get("basis_path", spec.get("basis_mat"))
+    if not raw_path:
+        raise ValueError("component forecast requires basis_path")
+    basis_path = Path(str(raw_path))
+    if not basis_path.is_absolute():
+        base_dir = Path(str(spec.get("base_dir", ".")))
+        basis_path = base_dir / basis_path
+    if not basis_path.is_file():
+        raise FileNotFoundError(
+            f"component forecast basis does not exist: {basis_path}")
+
+    suffix = basis_path.suffix.lower()
+    coeff_name = str(spec.get("coeff_variable", "coeffEmbed2"))
+    if suffix == ".npz":
+        values = __import__("numpy").load(basis_path, allow_pickle=False)
+        coeff = values[coeff_name]
+    elif suffix == ".mat":
+        try:
+            from scipy.io import loadmat
+        except ImportError as exc:  # pragma: no cover - environment-specific
+            raise ImportError(
+                "MAT component forecast basis requires scipy") from exc
+        values = loadmat(basis_path, variable_names=[coeff_name])
+        if coeff_name not in values:
+            raise ValueError(
+                f"component forecast basis is missing {coeff_name!r}")
+        coeff = values[coeff_name]
+    else:
+        raise ValueError("component forecast basis must be .mat or .npz")
+
+    np = __import__("numpy")
+    coeff = np.asarray(coeff, dtype=np.float64)
+    if coeff.ndim != 3 or min(coeff.shape) < 1:
+        raise ValueError(
+            "component forecast coefficients must have shape (K,D,N)")
+    if not np.isfinite(coeff).all():
+        raise ValueError("component forecast coefficients must be finite")
+    components, embed_width, channels = coeff.shape
+    expected = spec.get("channels")
+    if expected is not None and int(expected) != channels:
+        raise ValueError(
+            f"component basis has {channels} channels; expected {expected}")
+    expected = spec.get("components")
+    if expected is not None and int(expected) != components:
+        raise ValueError(
+            f"component basis has {components} components; expected {expected}")
+    expected = spec.get("embed_width")
+    if expected is not None and int(expected) != embed_width:
+        raise ValueError(
+            f"component basis has embed width {embed_width}; expected {expected}")
+
+    # TDE-RICA's project() solves X ~= comp @ C, where C is the flattened
+    # motif matrix. The returned matrix maps flattened delay windows to
+    # component occurrences: X @ pinv(C.T).T.
+    design = coeff.transpose(1, 2, 0).reshape(
+        embed_width * channels, components)
+    projection = np.linalg.pinv(design).T.astype(np.float32, copy=False)
+    coefficient_tensor = torch.from_numpy(
+        coeff.astype(np.float32, copy=False))
+    return (
+        torch.from_numpy(projection),
+        coefficient_tensor,
+        int(embed_width),
+        int(channels),
+    )
+
+
+def _load_fixed_component_projection(
+    spec: Mapping[str, Any],
+) -> Tuple[torch.Tensor, int, int]:
+    """Load only the reviewed TDE-RICA projection matrix."""
+    projection, _, embed_width, channels = _load_fixed_component_basis(spec)
+    return projection, embed_width, channels
+
 
 def _enable_deepspeed_gradient_overflow_check(engine: Any) -> bool:
     """Make ZeRO reject non-finite autocast gradients before an Adam update.
@@ -584,6 +666,31 @@ def augment_phase_loss_weights(
     return replace(weights, recon_extra=extras, recon_loss_types=types,
                    recon_loss_mix=mixes)
 
+def apply_component_forecast_spec(weights, spec):
+    """Apply a data-profile component objective only to forecast phases."""
+    if weights is None:
+        return None
+    if not spec:
+        return weights
+    if not isinstance(spec, Mapping):
+        raise TypeError("component_forecast must be a mapping")
+    loss_weight = float(spec.get("loss_weight", 0.0))
+    wasserstein_weight = float(spec.get("wasserstein_weight", 1.0))
+    variance_weight = float(spec.get("variance_weight", 0.0))
+    if any(value < 0 or not math.isfinite(value) for value in (
+            loss_weight, wasserstein_weight, variance_weight)):
+        raise ValueError("component forecast weights must be finite and non-negative")
+    if wasserstein_weight == 0 and variance_weight == 0:
+        raise ValueError("component forecast needs a positive criterion weight")
+    if float(getattr(weights, "forecast", 0.0)) <= 0:
+        loss_weight = 0.0
+    return replace(
+        weights,
+        forecast_component=loss_weight,
+        forecast_component_wasserstein=wasserstein_weight,
+        forecast_component_variance=variance_weight,
+    )
+
 
 class MetricsLogger:
     """Logs metrics to console and optionally to file."""
@@ -998,7 +1105,32 @@ class BrainMoETrainer:
             self.wiener_homeostat = None
 
         # TotalLoss with physics constraints (lazily updated per phase)
+        self.component_forecast_spec = config.get("component_forecast")
         self.total_loss = TotalLoss(loss_weights=LossWeights())
+        if self.component_forecast_spec:
+            projection, coefficient_tensor, embed_width, channels = (
+                _load_fixed_component_basis(
+                    self.component_forecast_spec))
+            self.total_loss.configure_component_forecast(
+                projection_matrix=projection,
+                coefficient_tensor=coefficient_tensor,
+                embed_width=embed_width,
+                channels=channels,
+                wasserstein_weight=float(
+                    self.component_forecast_spec.get(
+                        "wasserstein_weight", 1.0)),
+                variance_weight=float(
+                    self.component_forecast_spec.get(
+                        "variance_weight", 0.0)),
+                modality=str(
+                    self.component_forecast_spec.get("modality", "calcium")),
+                missing_channel_as_zero=bool(
+                    self.component_forecast_spec.get(
+                        "missing_channel_as_zero", False)),
+                missing_channel_mode=self.component_forecast_spec.get(
+                    "missing_channel_mode"),
+            )
+            self.total_loss.to(self.device)
         self._loss_weights_cache = None
 
         # Auto-create validation dataloader if data dirs provided
@@ -1282,6 +1414,156 @@ class BrainMoETrainer:
                 if self.is_main_process:
                     print(f"DeepSpeed checkpoint save failed (non-fatal): {e}")
 
+    @staticmethod
+    def _load_transition_compatible_model_state(
+        model: torch.nn.Module,
+        checkpoint_state: Dict[str, Any],
+    ):
+        """Load exact model state, allowing only an absent SDE head."""
+        transition_prefix = "transition_diffusion."
+        model_state = model.state_dict()
+        model_keys = set(model_state)
+        checkpoint_keys = set(checkpoint_state)
+        model_transition_keys = {
+            key for key in model_keys if key.startswith(transition_prefix)
+        }
+        checkpoint_transition_keys = {
+            key for key in checkpoint_keys if key.startswith(transition_prefix)
+        }
+        if (model_transition_keys and checkpoint_transition_keys
+                and model_transition_keys != checkpoint_transition_keys):
+            raise RuntimeError(
+                "checkpoint contains a partial or incompatible "
+                "transition_diffusion state")
+
+        converted = {}
+        shape_mismatches = []
+        for key, value in checkpoint_state.items():
+            if key not in model_state:
+                continue
+            expected = model_state[key]
+            if isinstance(value, torch.Tensor) and isinstance(
+                    expected, torch.Tensor):
+                if value.shape != expected.shape:
+                    shape_mismatches.append(
+                        f"{key}: {tuple(value.shape)} vs "
+                        f"{tuple(expected.shape)}")
+                    continue
+                if value.dtype != expected.dtype:
+                    value = value.to(dtype=expected.dtype)
+            elif type(value) is not type(expected):
+                shape_mismatches.append(f"{key}: state value type mismatch")
+                continue
+            converted[key] = value
+
+        missing = model_keys - set(converted)
+        unexpected = checkpoint_keys - model_keys
+        invalid_missing = [
+            key for key in missing
+            if not key.startswith(transition_prefix)
+        ]
+        invalid_unexpected = [
+            key for key in unexpected
+            if not key.startswith(transition_prefix)
+        ]
+        if shape_mismatches or invalid_missing or invalid_unexpected:
+            details = []
+            if invalid_missing:
+                details.append(f"missing keys: {sorted(invalid_missing)}")
+            if invalid_unexpected:
+                details.append(
+                    f"unexpected keys: {sorted(invalid_unexpected)}")
+            if shape_mismatches:
+                details.append(f"shape/type mismatches: {shape_mismatches}")
+            raise RuntimeError(
+                "checkpoint model_state is incompatible; "
+                + "; ".join(details))
+
+        model.load_state_dict(converted, strict=not (missing or unexpected))
+        return missing, unexpected
+
+    @staticmethod
+    def _extend_optimizer_state_for_transition(
+        optimizer_state: Dict[str, Any],
+        optimizer: torch.optim.Optimizer,
+        model: torch.nn.Module,
+        checkpoint_model_state: Dict[str, Any],
+    ):
+        """Migrate optimizer IDs when adding or removing the diffusion head."""
+        saved_groups = optimizer_state.get("param_groups", ())
+        current_groups = optimizer.param_groups
+        if len(saved_groups) != len(current_groups):
+            raise RuntimeError(
+                "checkpoint optimizer parameter-group count does not match")
+
+        transition_prefix = "transition_diffusion."
+        checkpoint_transition_count = sum(
+            key.startswith(transition_prefix)
+            for key in checkpoint_model_state)
+        model_parameters = list(model.named_parameters())
+        current_transition_count = sum(
+            name.startswith(transition_prefix)
+            for name, _ in model_parameters)
+
+        migrated = dict(optimizer_state)
+        migrated_groups = []
+        for group in saved_groups:
+            copied_group = dict(group)
+            copied_group["params"] = list(group["params"])
+            migrated_groups.append(copied_group)
+        migrated["param_groups"] = migrated_groups
+        migrated["state"] = dict(optimizer_state.get("state", {}))
+
+        parameter_names = {
+            id(parameter): name for name, parameter in model_parameters
+        }
+        saved_ids = [
+            parameter_id
+            for group in migrated_groups
+            for parameter_id in group["params"]
+        ]
+        saved_ids.extend(migrated["state"].keys())
+        next_id = max((int(parameter_id) for parameter_id in saved_ids),
+                      default=-1) + 1
+        added = 0
+        removed_ids = set()
+        for index, (saved_group, current_group) in enumerate(
+                zip(migrated_groups, current_groups)):
+            saved_count = len(saved_group["params"])
+            current_params = current_group["params"]
+            if saved_count > len(current_params):
+                if current_transition_count or not checkpoint_transition_count:
+                    raise RuntimeError(
+                        "checkpoint optimizer contains parameters absent "
+                        f"from current group {index}")
+                excess_ids = saved_group["params"][len(current_params):]
+                saved_group["params"] = saved_group["params"][
+                    :len(current_params)]
+                removed_ids.update(excess_ids)
+                continue
+            new_params = current_params[saved_count:]
+            new_names = [
+                parameter_names.get(id(parameter), "")
+                for parameter in new_params
+            ]
+            if any(not name.startswith(transition_prefix)
+                   for name in new_names):
+                raise RuntimeError(
+                    "checkpoint optimizer is missing non-transition "
+                    f"parameters from group {index}")
+            for _ in new_params:
+                saved_group["params"].append(next_id)
+                next_id += 1
+                added += 1
+        if removed_ids:
+            if len(removed_ids) != checkpoint_transition_count:
+                raise RuntimeError(
+                    "checkpoint optimizer extra parameter count does not "
+                    "match transition diffusion state")
+            for parameter_id in removed_ids:
+                migrated["state"].pop(parameter_id, None)
+        return migrated, added
+
     def load_checkpoint(self, path: str) -> Tuple[int, str]:
         """Load model checkpoint with world-size-aware handling."""
         checkpoint = torch.load(path, map_location=str(self.device))
@@ -1291,35 +1573,30 @@ class BrainMoETrainer:
             if self.is_main_process:
                 print(f"[Elastic] World size changed: {saved_world_size} → {self.world_size}. "
                       f"Checkpoint was saved on {saved_world_size} ranks, now running on {self.world_size}.")
-        # Load the raw module state even when DeepSpeed wraps it. Checkpoints
-        # written by the native trainer use unprefixed keys, while
-        # ``DeepSpeedEngine.state_dict()`` exposes ``module.``-prefixed keys.
-        # ``self.model`` is the same module passed to DeepSpeed at init and is
-        # therefore the portable checkpoint boundary.
-        model = self.model
-        try:
-            model.load_state_dict(checkpoint["model_state"])
-        except RuntimeError:
-            ckpt = checkpoint["model_state"]
-            model_dict = model.state_dict()
-            converted = {}
-            skipped = 0
-            for k, v in ckpt.items():
-                if k in model_dict:
-                    if v.dtype != model_dict[k].dtype:
-                        converted[k] = v.to(model_dict[k].dtype)
-                    elif v.shape != model_dict[k].shape:
-                        if self.is_main_process:
-                            print(f"[Elastic] Skipping key {k}: shape mismatch {v.shape} vs {model_dict[k].shape}")
-                        skipped += 1
-                    else:
-                        converted[k] = v
-            if self.is_main_process and skipped > 0:
-                print(f"[Elastic] Skipped {skipped} keys due to shape mismatch")
-            model.load_state_dict(converted)
+        # Checkpoints use the raw module's unprefixed state keys, including
+        # when the training model is wrapped by DDP.
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        missing, unexpected = self._load_transition_compatible_model_state(
+            model, checkpoint["model_state"])
+        if self.is_main_process and missing:
+            print(
+                "[Checkpoint] Initializing newly added transition diffusion "
+                "parameters")
+        if self.is_main_process and unexpected:
+            print(
+                "[Checkpoint] Ignoring transition diffusion parameters "
+                "for the deterministic ODE model")
         if (self.ds_engine is None and self.optimizer is not None
                 and "optimizer_state" in checkpoint):
-            self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+            optimizer_state, added = (
+                self._extend_optimizer_state_for_transition(
+                    checkpoint["optimizer_state"], self.optimizer, model,
+                    checkpoint["model_state"]))
+            if self.is_main_process and added:
+                print(
+                    f"[Checkpoint] Added {added} fresh optimizer slots for "
+                    "transition diffusion parameters")
+            self.optimizer.load_state_dict(optimizer_state)
 
         return checkpoint["step"], checkpoint["phase"]
 
@@ -1809,6 +2086,30 @@ class BrainMoETrainer:
             kwargs["species_names"] = [str(tag) for tag in species_tags]
         return kwargs
 
+    def _generic_forecast_sampling_kwargs(self) -> Dict[str, Any]:
+        """Sample the generic rollout only when empirical CRPS is active."""
+        crps_weight = float(getattr(
+            self.total_loss.loss_weights, "forecast_crps", 0.0))
+        if crps_weight < 0:
+            raise ValueError("forecast_crps weight must be non-negative")
+        if crps_weight == 0:
+            return {}
+        if not self.generic_model:
+            raise ValueError(
+                "forecast_crps is supported only for generic SDE forecasts")
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        if getattr(model, "transition_mode", "ode") != "sde":
+            raise ValueError(
+                "forecast_crps requires model transition_mode='sde'")
+        sample_count = int(getattr(model, "stochastic_samples", 0))
+        if sample_count < 2:
+            raise ValueError(
+                "forecast_crps requires at least two stochastic_samples")
+        return {
+            "sample_transition": True,
+            "num_samples": sample_count,
+        }
+
     @staticmethod
     def _validate_runtime_phase(phase_config: Mapping[str, Any]) -> None:
         """Reject legacy dataclass/partial phase objects at the boundary."""
@@ -1872,6 +2173,47 @@ class BrainMoETrainer:
             set_frozen(router, bool(policy["moe_router"]))
         self._active_freeze_policy = dict(policy)
         self._phase_thawed_components = set()
+    def _gradient_diagnostics(self, model) -> Dict[str, float]:
+        """Summarize trainable parameters and populated gradients.
+
+        ZeRO-2 removes ``param.grad`` after partitioning it.  When the
+        DeepSpeed optimizer exposes its post-step global norm, report that
+        partitioned value instead of treating the cleared parameter
+        gradients as an optimizer failure.
+        """
+        target = model.module if hasattr(model, "module") else model
+        parameters = [
+            parameter for parameter in target.parameters()
+            if parameter.requires_grad
+        ]
+        gradient_parameters = [
+            parameter for parameter in parameters
+            if parameter.grad is not None
+        ]
+        diagnostics = {
+            "trainable_parameter_count": float(
+                sum(parameter.numel() for parameter in parameters)),
+            "gradient_parameter_count": float(
+                len(gradient_parameters)),
+            "gradient_partitioned": 0.0,
+        }
+        if gradient_parameters:
+            squared_norm = torch.zeros((), device=self.device)
+            for parameter in gradient_parameters:
+                squared_norm = squared_norm + (
+                    parameter.grad.detach().float().square().sum())
+            diagnostics["gradient_norm"] = float(
+                torch.sqrt(squared_norm).item())
+            return diagnostics
+
+        optimizer = getattr(model, "optimizer", None) or self.optimizer
+        partitioned_norm = getattr(optimizer, "_global_grad_norm", None)
+        if partitioned_norm is not None:
+            diagnostics["gradient_norm"] = float(partitioned_norm)
+            diagnostics["gradient_partitioned"] = 1.0
+        else:
+            diagnostics["gradient_norm"] = 0.0
+        return diagnostics
 
     def _apply_timed_freeze_policy(
         self,
@@ -2121,8 +2463,13 @@ class BrainMoETrainer:
                 phase_config, start_step=start_step)
         phase_name = phase_config.get("name", "unknown")
         loss_weights = phase_config.get("loss_weights")
-        forecast_requested = bool(
-            getattr(loss_weights, "forecast", 0.0) > 0)
+        forecast_crps_weight = float(
+            getattr(loss_weights, "forecast_crps", 0.0))
+        if forecast_crps_weight < 0:
+            raise ValueError("forecast_crps weight must be non-negative")
+        forecast_requested = (
+            getattr(loss_weights, "forecast", 0.0) > 0
+            or forecast_crps_weight > 0)
         self.reset_loss_normalizer()
         self._validate_context_settings(phase_config)
         rollout_steps = max(1, int(
@@ -2130,10 +2477,24 @@ class BrainMoETrainer:
             if getattr(self, "_rollout_steps_override", None)
             else phase_config.get("rollout_steps", 1)))
         self._forecast_enabled = forecast_requested and rollout_steps > 1
-        if self._forecast_enabled and not self.require_future_targets:
+        if ((self._forecast_enabled or forecast_crps_weight > 0)
+                and not self.require_future_targets):
             raise ValueError(
                 f"phase {phase_name!r} enables forecast supervision but "
                 "the data contract does not enable explicit future targets")
+        if forecast_crps_weight > 0:
+            if not self.generic_model:
+                raise ValueError(
+                    "forecast_crps is supported only for generic SDE forecasts")
+            target_model = (
+                self.model.module if hasattr(self.model, "module")
+                else self.model)
+            if getattr(target_model, "transition_mode", "ode") != "sde":
+                raise ValueError(
+                    "forecast_crps requires model transition_mode='sde'")
+            if int(getattr(target_model, "stochastic_samples", 0)) < 2:
+                raise ValueError(
+                    "forecast_crps requires at least two stochastic_samples")
         self._apply_freeze_policy(phase_config["freeze_policy"])
         self._phase_thawed_components = set()
         total_steps = int(phase_config.get("total_steps", 10000))
@@ -2194,6 +2555,8 @@ class BrainMoETrainer:
             phase_loss_weights = augment_phase_loss_weights(
                 phase_loss_weights, self.recon_modalities,
                 self.recon_loss_types, self.recon_loss_mix)
+        phase_loss_weights = apply_component_forecast_spec(
+            phase_loss_weights, self.component_forecast_spec)
         if phase_loss_weights is not None:
             self.total_loss.loss_weights = phase_loss_weights
         elif phase_name != "Magi EEG Encoder Pretraining":
@@ -2225,6 +2588,8 @@ class BrainMoETrainer:
         self._current_optimizer_type = phase_config.get("optimizer", "adamw")
 
         model = self.ds_engine if use_deepspeed else self.model
+        forecast_sampling_kwargs = (
+            self._generic_forecast_sampling_kwargs())
 
         noise_mode = phase_config.get("noise_mode", None)
         if noise_mode is not None:
@@ -2454,11 +2819,15 @@ class BrainMoETrainer:
                     outputs = model.forward_modalities(
                         signals, masks=signal_masks,
                         num_steps=rollout_steps,
-                        return_sequences=rollout_steps > 1,
+                        return_sequences=(
+                            rollout_steps > 1
+                            or bool(forecast_sampling_kwargs)),
                         reconstruct=True,
                         perturbation=perturbation,
                         **self._generic_step_kwargs(
-                            self._generic_batch_tensors))
+                            self._generic_batch_tensors),
+                        **forecast_sampling_kwargs,
+                    )
                 else:
                     outputs = model(
                         dummy_eeg, dummy_fmri,
@@ -2492,7 +2861,7 @@ class BrainMoETrainer:
                         cross_modal_labels=(
                             self._standard_contract_targets.get(
                                 "cross_modal_labels")
-                            if not self.generic_model else None),
+                        )
                     )
                     target_effect = (
                         raw_targets["intervention_target"]
@@ -2506,8 +2875,17 @@ class BrainMoETrainer:
                 if not self.generic_model:
                     targets.update(self._standard_contract_targets)
                 total_loss, loss_metrics = self.total_loss(outputs, targets)
+                for metric_name, metric_value in loss_metrics.items():
+                    if not metric_name.startswith("forecast_component_"):
+                        continue
+                    if isinstance(metric_value, torch.Tensor):
+                        metric_value = metric_value.detach().float().item()
+                    if isinstance(metric_value, (int, float)):
+                        step_metrics[f"loss_{metric_name}"] = float(metric_value)
                 model.backward(total_loss)
                 model.step()
+                if step % 10 == 0:
+                    step_metrics.update(self._gradient_diagnostics(model))
             else:
                 is_accum_boundary = (micro_step_count + 1) % gradient_accumulation == 0
                 sync_context = self.model.no_sync() if hasattr(self.model, "no_sync") and not is_accum_boundary else None
@@ -2527,12 +2905,16 @@ class BrainMoETrainer:
                         outputs = model.forward_modalities(
                             signals, masks=signal_masks,
                             num_steps=rollout_steps,
-                            return_sequences=rollout_steps > 1,
+                            return_sequences=(
+                                rollout_steps > 1
+                                or bool(forecast_sampling_kwargs)),
                             reconstruct=True,
                             recon_max_channels=self.recon_max_channels,
                             perturbation=perturbation,
                             **self._generic_step_kwargs(
-                                self._generic_batch_tensors))
+                                self._generic_batch_tensors),
+                            **forecast_sampling_kwargs,
+                        )
                     else:
                         outputs = model(
                             dummy_eeg, dummy_fmri,
@@ -2582,6 +2964,13 @@ class BrainMoETrainer:
                     if not self.generic_model:
                         targets.update(self._standard_contract_targets)
                     total_loss, loss_metrics = self.total_loss(outputs, targets)
+                    for metric_name, metric_value in loss_metrics.items():
+                        if not metric_name.startswith("forecast_component_"):
+                            continue
+                        if isinstance(metric_value, torch.Tensor):
+                            metric_value = metric_value.detach().float().item()
+                        if isinstance(metric_value, (int, float)):
+                            step_metrics[f"loss_{metric_name}"] = float(metric_value)
                     if not torch.isfinite(total_loss):
                         raise FloatingPointError(
                             f"non-finite loss at training step {step}")
@@ -2596,6 +2985,8 @@ class BrainMoETrainer:
 
                 if micro_step_count % gradient_accumulation == 0:
                     self.scaler.unscale_(self.optimizer)
+                    if step % 10 == 0:
+                        step_metrics.update(self._gradient_diagnostics(self.model))
                     grad_clip = getattr(self, "_grad_clip", 1.0)
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), grad_clip)
@@ -2775,6 +3166,17 @@ class BrainMoETrainer:
                     "lr": lr,
                     "curriculum": curriculum_progress,
                 }
+                for metric_name, metric_value in step_metrics.items():
+                    if (
+                        metric_name.startswith("loss_forecast_component_")
+                        or metric_name in {
+                            "trainable_parameter_count",
+                            "gradient_parameter_count",
+                            "gradient_norm",
+                            "gradient_partitioned",
+                        }
+                    ):
+                        metrics[metric_name] = float(metric_value)
                 # Wiener monitor logging (every 100 steps to reduce noise)
                 if step % 100 == 0:
                     q_report = self.q_factor_monitor.get_report()
@@ -2956,6 +3358,9 @@ class BrainMoETrainer:
                 phase_weights or LossWeights(), self.recon_modalities,
                 getattr(self, "recon_loss_types", {}),
                 getattr(self, "recon_loss_mix", {}))
+        phase_weights = apply_component_forecast_spec(
+            phase_weights, self.component_forecast_spec)
+        if phase_weights is not None:
             self.total_loss.loss_weights = phase_weights
         self.total_loss.configure_forecast(
             self.total_loss.loss_weights, rollout_steps=rollout_steps)
@@ -3012,14 +3417,20 @@ class BrainMoETrainer:
                         }
                         perturbation = self._sanitize_perturbation(
                             perturbation, model)
+                        forecast_sampling_kwargs = (
+                            self._generic_forecast_sampling_kwargs())
                         outputs = model.forward_modalities(
                             signals, masks=signal_masks,
                             num_steps=rollout_steps, return_all=True,
-                            return_sequences=rollout_steps > 1,
+                            return_sequences=(
+                                rollout_steps > 1
+                                or bool(forecast_sampling_kwargs)),
                             reconstruct=True,
                             recon_max_channels=self.recon_max_channels,
                             **self._generic_step_kwargs(batch_tensors),
-                            perturbation=perturbation)
+                            perturbation=perturbation,
+                            **forecast_sampling_kwargs,
+                        )
                     else:
                         self._capture_standard_batch(batch)
                         eeg = batch.get("eeg", batch.get("eeg_data"))
@@ -3309,12 +3720,23 @@ class BrainMoETrainer:
                 loaded_phase = None
             loaded_phase = self.broadcast_object(loaded_phase if self.is_main_process else None)
             start_step = self.broadcast_object(start_step if self.is_main_process else 0)
+            matched_phase = None
             for i, p in enumerate(phases):
                 if p["name"] == loaded_phase:
                     current_phase = i
+                    matched_phase = i
                     break
             if self.is_main_process:
-                print(f"Resuming from {loaded_phase} at step {start_step}")
+                if matched_phase is None:
+                    start_step = 0
+                    print(
+                        f"Loaded {loaded_phase}; starting selected phase "
+                        f"{phases[0]['name']} at step 0")
+                else:
+                    print(f"Resuming from {loaded_phase} at step {start_step}")
+            if matched_phase is None:
+                start_step = self.broadcast_object(
+                    0 if self.is_main_process else start_step)
 
         for i in range(current_phase, len(phases)):
             phase = phases[i]

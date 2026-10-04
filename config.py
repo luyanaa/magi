@@ -212,6 +212,13 @@ class FeatureConfig:
     noise_mode: str = "off"
     """SDE noise policy: off | rollout | train | always (see
     BrainMoEPINN docstring; default preserves deterministic steps)."""
+    transition_mode: str = "ode"
+    """Latent transition law: deterministic Euler ODE or sampled SDE."""
+    diffusion_rank: Optional[int] = None
+    diffusion_floor: float = 1e-4
+    diffusion_scale: float = 1e-2
+    stochastic_samples: int = 4
+    """Low-rank transition covariance settings; SDE is opt-in."""
     control_gating: bool = True
     use_meg: bool = False
     use_channel_type_embed: bool = True

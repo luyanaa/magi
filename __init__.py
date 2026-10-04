@@ -25,6 +25,8 @@ from .encoders.fmri_encoder import NeuroSTORMEncoder, BrainLMEncoder, create_fmr
 from .encoders.meg_encoder import MEGEncoderWrapper, MEGProjection
 from .encoders.hub_fusion import HubTokenFusion, CrossModalAdapter
 from .core.velocity_brain import VelocityBrain, MultiTimeScaleKDA, as_step_dt
+from .core.stochastic_transition import LowRankDiffusionHead
+from .physics.stochastic_process import sample_low_rank_transition
 from .runtime.device_utils import safe_epsilon
 from .core.moe import (
     MoEVelocityField,
@@ -76,7 +78,8 @@ from .data.data_loader import (
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List
+import math
 from .config import (
     ExperimentConfig,
     SUPPORTED_MODALITIES,
@@ -196,6 +199,11 @@ class BrainMoEPINN(nn.Module):
         initial_context_length: int = 256,
         max_context_length: int = 1024,
         context_expansion_steps: int = 10000,
+        transition_mode: str = "ode",
+        diffusion_rank: Optional[int] = None,
+        diffusion_floor: float = 1e-4,
+        diffusion_scale: float = 1e-2,
+        stochastic_samples: int = 4,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -208,6 +216,25 @@ class BrainMoEPINN(nn.Module):
         if noise_mode not in ("off", "rollout", "train", "always"):
             raise ValueError("noise_mode must be off|rollout|train|always")
         self.noise_mode = noise_mode
+        if transition_mode not in ("ode", "sde"):
+            raise ValueError("transition_mode must be 'ode' or 'sde'")
+        diffusion_rank = (
+            min(16, latent_dim) if diffusion_rank is None
+            else int(diffusion_rank))
+        if not 0 < diffusion_rank <= latent_dim:
+            raise ValueError("diffusion_rank must be in 1..latent_dim")
+        if not math.isfinite(diffusion_floor) or diffusion_floor <= 0:
+            raise ValueError("diffusion_floor must be finite and positive")
+        if not math.isfinite(diffusion_scale) or diffusion_scale < 0:
+            raise ValueError(
+                "diffusion_scale must be finite and non-negative")
+        if stochastic_samples < 2:
+            raise ValueError("stochastic_samples must be at least 2")
+        self.transition_mode = transition_mode
+        self.diffusion_rank = int(diffusion_rank)
+        self.diffusion_floor = float(diffusion_floor)
+        self.diffusion_scale = float(diffusion_scale)
+        self.stochastic_samples = int(stochastic_samples)
         self.control_gating = bool(control_gating)
         self.use_kda_decoder = use_kda_decoder
         self.use_active_inference = use_active_inference
@@ -497,6 +524,18 @@ class BrainMoEPINN(nn.Module):
         self.max_history = 100
         self._replay_buffer = []
         self.total_loss = TotalLoss(loss_weights=LossWeights())
+        # Keep the default ODE module graph and parameter set unchanged. This
+        # also avoids unused trainable diffusion parameters under DDP.
+        self.transition_diffusion = (
+            LowRankDiffusionHead(
+                latent_dim=latent_dim,
+                rank=self.diffusion_rank,
+                control_dim=perturbation_dim,
+                floor=self.diffusion_floor,
+                scale=self.diffusion_scale,
+            )
+            if transition_mode == "sde" else None
+        )
 
         if use_torch_compile and hasattr(torch, "compile"):
             if self.moe_velocity is not None:
@@ -669,6 +708,7 @@ class BrainMoEPINN(nn.Module):
             "vb_out": vb_out,
             "generic_delta_z": generic_delta_z,
             "delta_z": delta_z,
+            "control": perturbation,
             "noise_state": vb_out.get("new_noise_state"),
             "moe_routing": routing_metrics,
             "grad_E": vb_out["grad_E"],
@@ -680,6 +720,117 @@ class BrainMoEPINN(nn.Module):
             "generic_constraint_residual": constraint_residual,
             "grassmannian_loss": grassmannian_loss,
         }
+
+    def _advance_latent(
+        self,
+        z: torch.Tensor,
+        drift: torch.Tensor,
+        dt,
+        *,
+        control: Optional[torch.Tensor] = None,
+        sample_transition: bool = False,
+        extra_increment: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        """Advance one latent window with the configured transition law."""
+        step_dt = self.latent_step_dt(dt, z)
+        transition_mean = z + step_dt * drift
+        if extra_increment is not None:
+            transition_mean = transition_mean + extra_increment
+
+        if self.transition_mode == "ode":
+            if sample_transition:
+                raise ValueError(
+                    "sample_transition requires transition_mode='sde'")
+            return {
+                "z_next": transition_mean,
+                "transition_mean": transition_mean,
+                "factor": None,
+                "diagonal_std": None,
+            }
+
+        if self.transition_diffusion is None:
+            raise RuntimeError("SDE transition head was not initialized")
+        factor, diagonal_std = self.transition_diffusion(z, control)
+        z_next = (
+            sample_low_rank_transition(
+                transition_mean, factor, diagonal_std, step_dt)
+            if sample_transition else transition_mean)
+        return {
+            "z_next": z_next,
+            "transition_mean": transition_mean,
+            "factor": factor,
+            "diagonal_std": diagonal_std,
+        }
+
+    @staticmethod
+    def _repeat_batch_value(value, batch_size: int, repeats: int):
+        if (isinstance(value, torch.Tensor) and value.dim() > 0
+                and value.shape[0] == batch_size):
+            return value.repeat(
+                (repeats,) + (1,) * (value.dim() - 1))
+        return value
+
+    @staticmethod
+    def _reduce_sampled_batch_value(value, sample_count: int, batch_size: int):
+        if isinstance(value, torch.Tensor):
+            if (value.dim() > 0
+                    and value.shape[0] == sample_count * batch_size):
+                grouped = value.reshape(
+                    sample_count, batch_size, *value.shape[1:])
+                if value.is_floating_point() or value.is_complex():
+                    return grouped.mean(dim=0)
+                return grouped[0]
+            return value
+        if isinstance(value, dict):
+            return {
+                key: BrainMoEPINN._reduce_sampled_batch_value(
+                    nested, sample_count, batch_size)
+                for key, nested in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                BrainMoEPINN._reduce_sampled_batch_value(
+                    nested, sample_count, batch_size)
+                for nested in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                BrainMoEPINN._reduce_sampled_batch_value(
+                    nested, sample_count, batch_size)
+                for nested in value
+            )
+        return value
+
+    @staticmethod
+    def _aggregate_sampled_batch_outputs(
+        outputs: Dict[str, Any],
+        sample_count: int,
+        batch_size: int,
+    ) -> Dict[str, Any]:
+        reconstruction_sequences = {
+            key for key in outputs if key.endswith("_recon_sequence")
+        }
+        for key, value in tuple(outputs.items()):
+            if (not isinstance(value, torch.Tensor) or value.dim() == 0
+                    or value.shape[0] != sample_count * batch_size):
+                continue
+            samples = value.reshape(
+                sample_count, batch_size, *value.shape[1:])
+            if key.endswith("_recon_sequence"):
+                sample_key = f"{key[:-len('_sequence')]}_samples"
+            elif key.endswith("_recon") and f"{key}_sequence" in (
+                    reconstruction_sequences):
+                sample_key = f"{key}_last_samples"
+            else:
+                sample_key = f"{key}_samples"
+            outputs[sample_key] = samples
+            outputs[key] = samples.mean(dim=0)
+
+        for key, value in tuple(outputs.items()):
+            if not key.endswith("_samples"):
+                outputs[key] = BrainMoEPINN._reduce_sampled_batch_value(
+                    value, sample_count, batch_size)
+        return outputs
 
 
     def forward_modalities(
@@ -698,6 +849,8 @@ class BrainMoEPINN(nn.Module):
         dt=None,
         frame_dt=None,
         step_dt=None,
+        sample_transition: bool = False,
+        num_samples: int = 1,
     ) -> Dict[str, torch.Tensor]:
         """Run the shared latent dynamics on arbitrary neural modalities.
 
@@ -722,11 +875,24 @@ class BrainMoEPINN(nn.Module):
         basis, no current-window tokens), emitting ``{modality}_recon`` so
         ``TotalLoss`` can supervise ANY neural signal through
         ``LossWeights.recon_extra``.
+        ``sample_transition`` draws state-level Euler--Maruyama increments in
+        ``sde`` mode. ``num_samples`` requests independent trajectories from
+        the same encoded context; original output keys hold their ensemble
+        means and sampled outputs are available under ``*_samples`` keys.
         """
         if not signals:
             raise ValueError("signals must contain at least one modality")
         if num_steps < 1:
             raise ValueError("num_steps must be at least 1")
+        if (not isinstance(num_samples, int) or isinstance(num_samples, bool)
+                or num_samples < 1):
+            raise ValueError("num_samples must be a positive integer")
+        if num_samples > 1:
+            if self.transition_mode != "sde":
+                raise ValueError("num_samples > 1 requires transition_mode='sde'")
+            if not sample_transition:
+                raise ValueError(
+                    "num_samples > 1 requires sample_transition=True")
 
         masks = masks or {}
         batch_size = None
@@ -773,15 +939,27 @@ class BrainMoEPINN(nn.Module):
         z_global = self._apply_species_conditioning(
             z_global, species_ids=species_ids, species_names=species_names)
         z_t = z_global
+        trajectory_perturbation = perturbation
+        if num_samples > 1:
+            z_t = z_global.repeat((num_samples, 1))
+            trajectory_perturbation = self._repeat_batch_value(
+                perturbation, batch_size, num_samples)
         states = [z_t] if return_all else []
         control_terms = []
         delta_z_seq = []
+        transition_means = []
+        transition_factors = []
+        transition_diag_stds = []
         emit_sequences = bool(return_sequences or num_steps > 1)
         rollout_states = []
         use_noise = (self.noise_mode == "always"
                      or (self.noise_mode == "train" and self.training)
                      or (self.noise_mode == "rollout" and self.training
                          and num_steps > 1))
+        if self.transition_mode == "sde" and use_noise:
+            raise ValueError(
+                "SDE transitions cannot be combined with legacy OU noise; "
+                "set noise_mode='off'")
         noise_state = None
         # ``dt`` is the total physical time for one context window.  The
         # legacy multi-step mode divides it into substeps; ``step_dt`` is
@@ -793,13 +971,30 @@ class BrainMoEPINN(nn.Module):
                 dt / float(num_steps)
                 if not isinstance(dt, torch.Tensor)
                 else dt / float(num_steps))
+        if num_samples > 1:
+            substep_dt = self._repeat_batch_value(
+                substep_dt, batch_size, num_samples)
+            frame_dt = self._repeat_batch_value(
+                frame_dt, batch_size, num_samples)
         for k in range(num_steps):
             step_out = self._latent_step(
-                z_t, perturbation=perturbation, apply_noise=use_noise,
+                z_t, perturbation=trajectory_perturbation,
+                apply_noise=use_noise,
                 step_index=k, noise_state=noise_state, dt=substep_dt)
             noise_state = step_out.get("noise_state")
             delta_z_seq.append(step_out["delta_z"])
-            z_t = z_t + self.latent_step_dt(substep_dt, z_t) * step_out["delta_z"]
+            advance = self._advance_latent(
+                z_t,
+                step_out["delta_z"],
+                substep_dt,
+                control=step_out["control"],
+                sample_transition=sample_transition,
+            )
+            z_t = advance["z_next"]
+            if self.transition_mode == "sde":
+                transition_means.append(advance["transition_mean"])
+                transition_factors.append(advance["factor"])
+                transition_diag_stds.append(advance["diagonal_std"])
             control_terms.append(step_out["vb_out"]["control_term"])
             if emit_sequences:
                 rollout_states.append(z_t)
@@ -824,6 +1019,16 @@ class BrainMoEPINN(nn.Module):
                 "generic_constraint_residual"],
             "grassmannian_loss": step_out["grassmannian_loss"],
         }
+        if self.transition_mode == "sde":
+            result["transition_mean_sequence"] = torch.stack(
+                transition_means, dim=1)
+            result["transition_factor_sequence"] = torch.stack(
+                transition_factors, dim=1)
+            result["transition_diag_std_sequence"] = torch.stack(
+                transition_diag_stds, dim=1)
+            result["transition_mean"] = transition_means[-1]
+            result["transition_factor"] = transition_factors[-1]
+            result["transition_diag_std"] = transition_diag_stds[-1]
         if len(delta_z_seq) > 1:
             result["delta_z_sequence"] = torch.stack(delta_z_seq, dim=1)
         if emit_sequences:
@@ -847,13 +1052,11 @@ class BrainMoEPINN(nn.Module):
                         decoded,
                         dt=(frame_dt if frame_dt is not None
                             else self.latent_dt))
-                # The observable reconstruction must stay in the raw units
-                # supplied by the loader. Correlation-style supervision is
-                # intentionally gain-invariant, so anchor the decoder's
-                # per-channel gain to the valid context before exposing or
-                # supervising the prediction.
-                decoded = preserve_signal_scale(
-                    decoded, signals[modality], masks.get(modality))
+                if self.transition_mode == "ode":
+                    # The deterministic observation scale anchor is retained
+                    # for compatibility, but would suppress SDE sample spread.
+                    decoded = preserve_signal_scale(
+                        decoded, signals[modality], masks.get(modality))
                 decoded_steps.append(decoded)
             if emission is not None:
                 result[f"{modality}_emission"] = emission.parameter_summary(
@@ -865,6 +1068,9 @@ class BrainMoEPINN(nn.Module):
         if return_all:
             result["states"] = torch.stack(states, dim=1)
             result["control_terms"] = torch.stack(control_terms, dim=1)
+        if sample_transition:
+            result = self._aggregate_sampled_batch_outputs(
+                result, num_samples, batch_size)
         return result
 
     def forward(
@@ -947,6 +1153,10 @@ class BrainMoEPINN(nn.Module):
             raise RuntimeError(
                 "generic_observation_only models require forward_modalities()")
         masks = masks or {}
+        if self.transition_mode == "sde":
+            raise RuntimeError(
+                "transition_mode='sde' is currently supported only by "
+                "forward_modalities()")
         self.reset_runtime_state(batch_size=eeg.shape[0])
 
         def _masked_input(
@@ -1440,6 +1650,11 @@ class BrainMoEPINNConfig:
         initial_context_length: int = 256,
         max_context_length: int = 1024,
         context_expansion_steps: int = 10000,
+        transition_mode: str = "ode",
+        diffusion_rank: Optional[int] = None,
+        diffusion_floor: float = 1e-4,
+        diffusion_scale: float = 1e-2,
+        stochastic_samples: int = 4,
     ):
         self.eeg_channels = eeg_channels
         self.fmri_regions = fmri_regions
@@ -1447,6 +1662,12 @@ class BrainMoEPINNConfig:
         self.latent_dim = latent_dim
         self.latent_dt = latent_dt
         self.noise_mode = noise_mode
+        self.transition_mode = transition_mode
+        self.diffusion_rank = (
+            None if diffusion_rank is None else int(diffusion_rank))
+        self.diffusion_floor = float(diffusion_floor)
+        self.diffusion_scale = float(diffusion_scale)
+        self.stochastic_samples = int(stochastic_samples)
         self.control_gating = bool(control_gating)
         self.use_neurostorm = use_neurostorm
         self.use_kda_decoder = use_kda_decoder
@@ -1493,6 +1714,11 @@ class BrainMoEPINNConfig:
             latent_dim=config.latent_dim,
             latent_dt=1.0 / config.data.sample_rate_hz,
             noise_mode=getattr(features, "noise_mode", "off"),
+            transition_mode=getattr(features, "transition_mode", "ode"),
+            diffusion_rank=getattr(features, "diffusion_rank", None),
+            diffusion_floor=getattr(features, "diffusion_floor", 1e-4),
+            diffusion_scale=getattr(features, "diffusion_scale", 1e-2),
+            stochastic_samples=getattr(features, "stochastic_samples", 4),
             control_gating=getattr(features, "control_gating", True),
             use_kda_decoder=features.use_kda_decoder,
             use_active_inference=features.use_active_inference,
@@ -1536,6 +1762,11 @@ class BrainMoEPINNConfig:
             latent_dim=self.latent_dim,
             latent_dt=self.latent_dt,
             noise_mode=self.noise_mode,
+            transition_mode=self.transition_mode,
+            diffusion_rank=self.diffusion_rank,
+            diffusion_floor=self.diffusion_floor,
+            diffusion_scale=self.diffusion_scale,
+            stochastic_samples=self.stochastic_samples,
             control_gating=self.control_gating,
             use_neurostorm=self.use_neurostorm,
             use_kda_decoder=self.use_kda_decoder,

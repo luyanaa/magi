@@ -7,7 +7,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from train import apply_data_profile_rollout_contract, parse_phases
+from train import (
+    apply_data_profile_loss_overrides,
+    apply_data_profile_rollout_contract,
+    parse_phases,
+)
 from brain_moe_pinn.training.losses import TotalLoss
 from brain_moe_pinn.training.training_loop import (
     BrainMoETrainer,
@@ -73,6 +77,49 @@ def test_data_profile_drives_rollout_and_horizon_weights():
         phase["loss_weights"].forecast_horizon_weights
         == (1.0, 0.5, 0.25)
         for phase in phases)
+
+
+def test_data_profile_can_disable_unstable_autocorrelation():
+    phases = apply_data_profile_loss_overrides(
+        parse_phases("p6"),
+        {"forecast_autocorr": 0.0},
+    )
+
+    assert phases[0]["loss_weights"].forecast_autocorr == 0.0
+
+
+
+def test_data_profile_enables_crps_only_for_forecast_phases():
+    phases = parse_phases("-1,p6")
+
+    resolved = apply_data_profile_loss_overrides(
+        phases, {"forecast_crps": 0.25})
+
+    assert resolved[0]["loss_weights"].forecast_crps == 0.0
+    assert resolved[1]["loss_weights"].forecast_crps == 0.25
+    assert phases[1]["loss_weights"].forecast_crps == 0.0
+
+
+@pytest.mark.parametrize("value", [-0.1, float("nan"), float("inf")])
+def test_data_profile_rejects_invalid_crps_override(value):
+    with pytest.raises(ValueError, match="forecast_crps"):
+        apply_data_profile_loss_overrides(parse_phases("p6"), {
+            "forecast_crps": value,
+        })
+
+
+def test_data_profile_crps_requires_a_forecast_phase():
+    with pytest.raises(ValueError, match="forecast loss enabled"):
+        apply_data_profile_loss_overrides(parse_phases("-1"), {
+            "forecast_crps": 0.25,
+        })
+
+def test_data_profile_rejects_invalid_autocorrelation_override():
+    with pytest.raises(ValueError, match="forecast_autocorr"):
+        apply_data_profile_loss_overrides(
+            parse_phases("p6"),
+            {"forecast_autocorr": -0.1},
+        )
 
 
 def test_data_profile_rejects_inconsistent_rollout_contract():

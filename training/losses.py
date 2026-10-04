@@ -417,6 +417,329 @@ class CompositeForecastLoss(nn.Module):
                 + self.corr_diff_weight * increment
                 + self.variance_weight * scale)
         return total
+class EmpiricalCRPSLoss(nn.Module):
+    """Exact empirical CRPS for sampled multi-horizon forecasts."""
+
+    def __init__(
+        self,
+        horizon_weights: Optional[Union[torch.Tensor, list]] = None,
+    ):
+        super().__init__()
+        self.horizon_weights = (
+            None if horizon_weights is None else torch.as_tensor(
+                horizon_weights, dtype=torch.float32))
+        if self.horizon_weights is not None:
+            if self.horizon_weights.dim() != 1:
+                raise ValueError("horizon_weights must be one-dimensional")
+            if bool((self.horizon_weights < 0).any()):
+                raise ValueError("horizon_weights must be non-negative")
+            if float(self.horizon_weights.sum()) <= 0:
+                raise ValueError("horizon_weights must have positive mass")
+
+    def forward(
+        self,
+        samples: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if samples.dim() != 5 or target.dim() != 4:
+            raise ValueError(
+                "CRPS samples and target must have shapes "
+                "(S,B,K,C,T) and (B,K,C,T)")
+        sample_count = samples.shape[0]
+        if sample_count < 2:
+            raise ValueError("CRPS requires at least two forecast samples")
+        if tuple(samples.shape[1:]) != tuple(target.shape):
+            raise ValueError("CRPS sample and target shapes do not match")
+        if mask is not None and mask.shape != target.shape:
+            raise ValueError("CRPS mask must match target shape")
+
+        valid = torch.isfinite(target) & torch.isfinite(samples).all(dim=0)
+        if mask is not None:
+            valid = valid & mask.to(device=target.device, dtype=torch.bool)
+        clean_target = torch.where(valid, target, torch.zeros_like(target))
+        clean_samples = torch.where(
+            valid.unsqueeze(0), samples, torch.zeros_like(samples))
+        first_term = (
+            clean_samples - clean_target.unsqueeze(0)).abs().mean(dim=0)
+
+        ordered = clean_samples.sort(dim=0).values
+        rank_weights = (
+            2 * torch.arange(
+                sample_count, device=samples.device, dtype=samples.dtype)
+            - sample_count + 1
+        ).reshape(sample_count, 1, 1, 1, 1)
+        pair_term = (
+            rank_weights * ordered).sum(dim=0) / float(sample_count ** 2)
+        elementwise = first_term - pair_term
+
+        horizon_counts = valid.sum(dim=(0, 2, 3))
+        horizon_valid = horizon_counts > 0
+        if self.horizon_weights is None:
+            weights = samples.new_ones(target.shape[1])
+        else:
+            if self.horizon_weights.numel() != target.shape[1]:
+                raise ValueError(
+                    f"horizon_weights has {self.horizon_weights.numel()} "
+                    f"values for {target.shape[1]} horizons")
+            weights = self.horizon_weights.to(samples)
+        weights = weights * horizon_valid.to(weights.dtype)
+        if not bool(horizon_valid.any()):
+            return clean_samples.sum() * 0.0
+        weights = weights / weights.sum().clamp_min(
+            torch.finfo(weights.dtype).eps)
+        horizon_loss = (
+            (elementwise * valid).sum(dim=(0, 2, 3))
+            / horizon_counts.clamp_min(1).to(elementwise.dtype))
+        return (weights * horizon_loss).sum()
+
+
+class FixedComponentProjector(nn.Module):
+    """Differentiable projection through a frozen TDE-RICA basis.
+
+    ``projection_matrix`` is the precomputed right pseudoinverse of a
+    ``(components, embed_width, channels)`` coefficient tensor.  The
+    ``observed_lstsq`` mode instead solves the same fixed basis on the
+    channels observed in each sample, avoiding synthetic zero-filled channel
+    values when union-aligned samples contain channel-level missingness.
+    """
+
+    def __init__(
+        self,
+        projection_matrix: torch.Tensor,
+        embed_width: int,
+        channels: int,
+        missing_channel_as_zero: bool = False,
+        coefficient_tensor: Optional[torch.Tensor] = None,
+        missing_channel_mode: Optional[str] = None,
+    ):
+        super().__init__()
+        if projection_matrix.dim() != 2:
+            raise ValueError("projection_matrix must have shape (D*C, K)")
+        if embed_width < 2 or channels < 1:
+            raise ValueError("embed_width and channels must be positive")
+        expected_rows = int(embed_width) * int(channels)
+        if projection_matrix.shape[0] != expected_rows:
+            raise ValueError(
+                "projection_matrix row count must equal embed_width * channels")
+        if projection_matrix.shape[1] < 1:
+            raise ValueError("projection_matrix must contain one component")
+        if not torch.isfinite(projection_matrix).all():
+            raise ValueError("projection_matrix must be finite")
+        mode = (
+            ("zero" if missing_channel_as_zero else "strict")
+            if missing_channel_mode is None else str(missing_channel_mode)
+        )
+        if mode not in {"strict", "zero", "observed_lstsq"}:
+            raise ValueError(
+                "missing_channel_mode must be 'strict', 'zero', or "
+                "'observed_lstsq'")
+        if mode == "observed_lstsq":
+            if coefficient_tensor is None:
+                raise ValueError(
+                    "observed_lstsq mode requires coefficient_tensor")
+            if coefficient_tensor.dim() != 3:
+                raise ValueError(
+                    "coefficient_tensor must have shape (K, D, C)")
+            expected_shape = (
+                int(projection_matrix.shape[1]), int(embed_width), int(channels))
+            if tuple(coefficient_tensor.shape) != expected_shape:
+                raise ValueError(
+                    "coefficient_tensor shape must match projection dimensions")
+            if not torch.isfinite(coefficient_tensor).all():
+                raise ValueError("coefficient_tensor must be finite")
+        self.embed_width = int(embed_width)
+        self.channels = int(channels)
+        self.missing_channel_mode = mode
+        self.missing_channel_as_zero = mode == "zero"
+        self.components = int(projection_matrix.shape[1])
+        self.register_buffer(
+            "projection_matrix",
+            projection_matrix.detach().float().contiguous(),
+        )
+        self.register_buffer(
+            "coefficient_tensor",
+            None if coefficient_tensor is None
+            else coefficient_tensor.detach().float().contiguous(),
+        )
+        self._observed_projection_cache: Dict[bytes, torch.Tensor] = {}
+
+    def _observed_projection(
+        self,
+        observed_channels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a cached pseudoinverse for one sample's channel subset."""
+        key = observed_channels.detach().cpu().numpy().tobytes()
+        cached = self._observed_projection_cache.get(key)
+        if cached is not None:
+            return cached
+        coeff = self.coefficient_tensor[:, :, observed_channels]
+        design = coeff.reshape(self.components, -1)
+        projection = torch.linalg.pinv(design.transpose(0, 1)).transpose(0, 1)
+        projection = projection.detach().contiguous()
+        self._observed_projection_cache[key] = projection
+        return projection
+
+    def forward(
+        self,
+        signal: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project ``(B,C,T)`` signals to ``(B,K,T_embed)`` components.
+
+        The returned mask marks delay windows whose every selected channel and
+        frame is valid.  ``observed_lstsq`` excludes channels with any invalid
+        frame from a sample-specific fixed-basis least-squares projection;
+        this is intended for channel-level union-alignment masks.
+        """
+        if signal.dim() != 3:
+            raise ValueError("signal must have shape (B,C,T)")
+        batch, channels, time = signal.shape
+        if channels != self.channels:
+            raise ValueError(
+                f"signal has {channels} channels; fixed basis requires "
+                f"{self.channels}")
+        if time < self.embed_width:
+            raise ValueError(
+                f"signal has {time} frames; fixed basis requires at least "
+                f"{self.embed_width}")
+        if mask is not None and mask.shape != signal.shape:
+            raise ValueError("mask must match signal shape")
+
+        valid = torch.isfinite(signal)
+        if mask is not None:
+            valid = valid & mask.bool()
+        safe_signal = torch.nan_to_num(
+            signal.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        windows = safe_signal.unfold(
+            dimension=-1, size=self.embed_width, step=1)
+        windows = windows.permute(0, 2, 3, 1).contiguous()
+        if self.missing_channel_mode == "observed_lstsq":
+            components = windows.new_zeros(
+                (batch, self.components, windows.shape[1]))
+            component_mask = torch.zeros(
+                (batch, self.components, windows.shape[1]),
+                dtype=torch.bool, device=windows.device)
+            channel_valid = valid.all(dim=-1)
+            for index in range(batch):
+                observed = channel_valid[index]
+                if not bool(observed.any()):
+                    continue
+                projection = self._observed_projection(observed).to(
+                    device=windows.device, dtype=windows.dtype)
+                observed_windows = windows[index, :, :, observed].reshape(
+                    windows.shape[1], -1)
+                components[index] = (
+                    observed_windows @ projection).transpose(0, 1)
+                valid_windows = valid[index, observed].unfold(
+                    dimension=-1, size=self.embed_width, step=1)
+                valid_windows = valid_windows.all(dim=-1).all(dim=0)
+                component_mask[index] = valid_windows.unsqueeze(0).expand(
+                    self.components, -1)
+            return components, component_mask
+
+        if self.missing_channel_mode == "zero":
+            # Union alignment represents globally absent channels as zero with
+            # an all-false mask. The fixed-basis artifact uses that same
+            # zero-filled convention, so those channels remain scoreable.
+            absent_channel = ~valid.any(dim=-1)
+            valid = valid | absent_channel.unsqueeze(-1)
+        flat = windows.reshape(batch, windows.shape[1], -1)
+        projection = self.projection_matrix.to(
+            device=flat.device, dtype=flat.dtype)
+        components = torch.matmul(flat, projection).permute(0, 2, 1)
+        valid_windows = valid.unfold(
+            dimension=-1, size=self.embed_width, step=1)
+        valid_windows = valid_windows.all(dim=-1).all(dim=1)
+        component_mask = valid_windows.unsqueeze(1).expand(
+            -1, self.components, -1)
+        return components, component_mask
+
+
+class ComponentForecastLoss(nn.Module):
+    """Match forecast marginals after a frozen TDE-RICA projection."""
+
+    def __init__(
+        self,
+        projection_matrix: torch.Tensor,
+        embed_width: int,
+        channels: int,
+        wasserstein_weight: float = 1.0,
+        variance_weight: float = 0.0,
+        missing_channel_as_zero: bool = False,
+        coefficient_tensor: Optional[torch.Tensor] = None,
+        missing_channel_mode: Optional[str] = None,
+    ):
+        super().__init__()
+        if wasserstein_weight < 0 or variance_weight < 0:
+            raise ValueError("component forecast weights must be non-negative")
+        if wasserstein_weight == 0 and variance_weight == 0:
+            raise ValueError("at least one component forecast criterion is required")
+        self.projector = FixedComponentProjector(
+            projection_matrix, embed_width, channels,
+            missing_channel_as_zero=missing_channel_as_zero,
+            coefficient_tensor=coefficient_tensor,
+            missing_channel_mode=missing_channel_mode)
+        self.wasserstein_weight = float(wasserstein_weight)
+        self.variance_weight = float(variance_weight)
+        self.wasserstein = ReconstructionLoss("wasserstein1")
+        self.log_variance = ReconstructionLoss("log_variance")
+
+    def forward(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Return a normalized component-space loss and raw diagnostics."""
+        if prediction.dim() != 4 or target.dim() != 4:
+            raise ValueError(
+                "component forecast inputs must have shape (B,K,C,T)")
+        if prediction.shape != target.shape:
+            raise ValueError("component forecast input shapes must match")
+        if mask is not None and mask.shape != target.shape:
+            raise ValueError("component forecast mask must match inputs")
+
+        batch, horizons, channels, time = prediction.shape
+        prediction = prediction.permute(0, 2, 1, 3).reshape(
+            batch, channels, horizons * time)
+        target = target.permute(0, 2, 1, 3).reshape(
+            batch, channels, horizons * time)
+        if mask is not None:
+            mask = mask.permute(0, 2, 1, 3).reshape(
+                batch, channels, horizons * time)
+
+        projected_prediction, prediction_mask = self.projector(
+            prediction, mask=mask)
+        projected_target, target_mask = self.projector(target, mask=mask)
+        component_mask = prediction_mask & target_mask
+        if not bool(component_mask.any()):
+            zero = prediction.sum() * 0.0
+            return zero, {
+                "wasserstein": zero.detach(),
+                "variance": zero.detach(),
+            }
+
+        total_weight = self.wasserstein_weight + self.variance_weight
+        metrics: Dict[str, torch.Tensor] = {}
+        zero_metric = prediction.new_zeros(())
+        total = prediction.sum() * 0.0
+        if self.wasserstein_weight > 0:
+            wasserstein = self.wasserstein(
+                projected_prediction, projected_target, mask=component_mask)
+            total = total + self.wasserstein_weight * wasserstein
+            metrics["wasserstein"] = wasserstein.detach()
+        else:
+            metrics["wasserstein"] = zero_metric
+        if self.variance_weight > 0:
+            variance = self.log_variance(
+                projected_prediction, projected_target, mask=component_mask)
+            total = total + self.variance_weight * variance
+            metrics["variance"] = variance.detach()
+        else:
+            metrics["variance"] = zero_metric
+        return total / total_weight, metrics
+
 
 class RolloutAutocorrelationLoss(nn.Module):
     """Match normalized temporal autocorrelation across forecast horizons.
@@ -1755,7 +2078,36 @@ class TotalLoss(nn.Module):
         self.normalizer = LossNormalizer(beta=0.99)
         self.use_loss_normalization = getattr(
             loss_weights, "use_loss_normalization", True)
+        self.component_forecast: Optional[ComponentForecastLoss] = None
+        self.component_forecast_modality: Optional[str] = None
         self.configure_forecast(loss_weights)
+
+    def configure_component_forecast(
+        self,
+        projection_matrix: torch.Tensor,
+        embed_width: int,
+        channels: int,
+        wasserstein_weight: float = 1.0,
+        variance_weight: float = 0.0,
+        modality: str = "calcium",
+        missing_channel_as_zero: bool = False,
+        coefficient_tensor: Optional[torch.Tensor] = None,
+        missing_channel_mode: Optional[str] = None,
+    ) -> None:
+        """Install a frozen component-space forecast objective."""
+        if not modality:
+            raise ValueError("component forecast modality must be non-empty")
+        self.component_forecast = ComponentForecastLoss(
+            projection_matrix=projection_matrix,
+            embed_width=embed_width,
+            channels=channels,
+            wasserstein_weight=wasserstein_weight,
+            variance_weight=variance_weight,
+            missing_channel_as_zero=missing_channel_as_zero,
+            coefficient_tensor=coefficient_tensor,
+            missing_channel_mode=missing_channel_mode,
+        )
+        self.component_forecast_modality = str(modality)
 
     def configure_forecast(
         self,
@@ -1792,6 +2144,8 @@ class TotalLoss(nn.Module):
                 loss_weights, "forecast_variance", 0.0),
             horizon_weights=effective,
         )
+        self.forecast_crps = EmpiricalCRPSLoss(
+            horizon_weights=effective)
         return None
 
     def reset_loss_normalizer(self) -> None:
@@ -1868,13 +2222,57 @@ class TotalLoss(nn.Module):
         )
         metrics = {}
 
-        for modality, weight in self._iter_recon_weights():
-            if weight <= 0:
+        forecast_crps_weight = float(
+            getattr(self.loss_weights, "forecast_crps", 0.0))
+        if forecast_crps_weight < 0:
+            raise ValueError("forecast_crps weight must be non-negative")
+        recon_weights = dict(self._iter_recon_weights())
+        sample_modalities = {
+            key[:-len("_recon_samples")]
+            for key in predictions
+            if key.endswith("_recon_samples")
+        }
+        if forecast_crps_weight > 0 and not sample_modalities:
+            raise ValueError(
+                "forecast CRPS requires at least one "
+                "*_recon_samples prediction")
+        for modality in sample_modalities:
+            recon_weights.setdefault(modality, 0.0)
+
+        for modality, weight in recon_weights.items():
+            if weight <= 0 and forecast_crps_weight <= 0:
                 continue
             pred_key = f"{modality}_recon"
-            if pred_key not in predictions or modality not in targets:
+            samples_key = f"{modality}_recon_samples"
+            if pred_key not in predictions:
+                if forecast_crps_weight > 0 and samples_key in predictions:
+                    raise KeyError(
+                        f"forecast CRPS requires prediction {pred_key!r}")
+                continue
+            if modality not in targets:
+                if forecast_crps_weight > 0 and weight > 0:
+                    raise KeyError(
+                        f"forecast CRPS requires target {modality!r}")
                 continue
             target_value = targets[modality]
+            if forecast_crps_weight > 0:
+                if target_value.dim() != 4:
+                    raise ValueError(
+                        "forecast CRPS requires targets shaped (B,K,C,T)")
+                samples = predictions.get(samples_key)
+                if not isinstance(samples, torch.Tensor):
+                    raise ValueError(
+                        f"forecast CRPS requires {samples_key}")
+                crps_value = self.forecast_crps(
+                    samples, target_value,
+                    mask=targets.get(f"{modality}_mask"))
+                total_loss = self._add_loss(
+                    total_loss, crps_value, forecast_crps_weight,
+                    f"forecast_crps_{modality}", metrics)
+                metrics[f"forecast_crps_{modality}"] = (
+                    crps_value.item())
+            if weight <= 0:
+                continue
             sequence_prediction = predictions.get(
                 f"{modality}_recon_sequence")
             criteria = (getattr(self.loss_weights, "recon_loss_types", None)
@@ -1905,6 +2303,26 @@ class TotalLoss(nn.Module):
                         metrics[
                             f"forecast_autocorr_{modality}"] = (
                                 autocorr_value.item())
+                    component_weight = float(
+                        getattr(self.loss_weights, "forecast_component", 0.0))
+                    if (component_weight > 0
+                            and self.component_forecast is not None
+                            and modality == self.component_forecast_modality):
+                        component_value, component_metrics = (
+                            self.component_forecast(
+                                sequence_prediction,
+                                target_value,
+                                mask=targets.get(f"{modality}_mask")))
+                        total_loss = self._add_loss(
+                            total_loss, component_value, component_weight,
+                            f"forecast_component_{modality}", metrics)
+                        metrics[
+                            f"forecast_component_{modality}"] = (
+                                component_value.item())
+                        for name, value in component_metrics.items():
+                            metrics[
+                                f"forecast_component_{modality}_{name}"] = (
+                                    value.item())
                     # An explicit reconstruction mix is the scale anchor for
                     # generic signals. Keep it alongside forecast supervision;
                     # modalities without a mix retain forecast-only behavior.

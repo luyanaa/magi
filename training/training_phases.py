@@ -94,8 +94,12 @@ class LossWeights:
     forecast_huber: float = 1.0
     forecast_corr_diff: float = 1.0
     forecast_variance: float = 0.0      # per-channel log-variance RMSE
+    forecast_crps: float = 0.0      # empirical CRPS over sampled forecasts
     forecast_autocorr: float = 0.0      # concatenated rollout autocorrelation
     forecast_horizon_weights: Optional[Tuple[float, ...]] = None
+    forecast_component: float = 0.0     # fixed TDE-RICA component forecast
+    forecast_component_wasserstein: float = 1.0
+    forecast_component_variance: float = 0.0
     velocity_smooth: float = 0.0    # monitor: batch-axis TV; needs time axis
     generic_constraint: float = 0.0  # enforced by projection, not by penalty:
                                      # (P_S L P_S) grad_S == 0 and

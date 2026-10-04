@@ -170,6 +170,7 @@ class SpeciesSignalDataset(Dataset):
         align_channels: bool = False,
         max_union_channels: int = 4096,
         region_map: Union[str, Path, None] = None,
+        channel_order: Optional[Sequence[str]] = None,
         load_graphs: bool = False,
         return_masks: bool = True,
         use_trials: bool = True,
@@ -244,6 +245,15 @@ class SpeciesSignalDataset(Dataset):
             }
             for modality, values in (normalization_stats or {}).items()
         }
+        if channel_order is not None:
+            ordered = [str(channel).strip() for channel in channel_order]
+            if not ordered or any(not channel for channel in ordered):
+                raise ValueError("channel_order must contain non-empty ids")
+            if len(set(ordered)) != len(ordered):
+                raise ValueError("channel_order must not contain duplicates")
+            self.channel_order = ordered
+        else:
+            self.channel_order = None
         self.regions = _region_map(Path(region_map) if region_map else None)
         self._mod_files: Dict[str, Path] = {}
 
@@ -274,7 +284,9 @@ class SpeciesSignalDataset(Dataset):
         self._ids: Dict[str, Optional[List[str]]] = {}
         self._global_ids: Optional[List[str]] = None
         self._regions: Optional[List[str]] = None
-        if self.load_ids or self.align_channels or self.regions is not None:
+        if (self.load_ids or self.align_channels
+                or self.regions is not None
+                or self.channel_order is not None):
             self._index_channels()
 
     # ------------------------------------------------------------------ rows
@@ -327,7 +339,12 @@ class SpeciesSignalDataset(Dataset):
         return _read_ids(fpath)
 
     def _channel_index(self) -> None:
-        # union of per-sample ids over all rows (only when ids requested)
+        # A declared order is used for basis-aligned objectives and also
+        # guarantees identical channel widths across train/validation splits.
+        if self.channel_order is not None:
+            self._global_ids = list(self.channel_order)
+            return
+        # Otherwise use the first-seen union of per-sample ids.
         if self._global_ids is not None:
             return
         union: List[str] = []
@@ -928,6 +945,7 @@ def build_species_dataloaders(
     align_channels: bool = False,
     max_union_channels: int = 4096,
     region_map: Union[str, Path, None] = None,
+    channel_order: Optional[Sequence[str]] = None,
     load_graphs: bool = False,
     use_trials: bool = True,
     return_masks: bool = True,
@@ -985,10 +1003,11 @@ def build_species_dataloaders(
         seq_len=seq_len, seq_seconds=seq_seconds, manifest=manifest,
         load_ids=load_ids, align_channels=align_channels,
         max_union_channels=max_union_channels, region_map=region_map,
-        load_graphs=load_graphs, return_masks=return_masks,
-        use_trials=use_trials, rate_default=rate_default,
-        return_next_step_targets=return_next_step_targets, roles=roles,
-        species=species, expected_rate_hz=expected_rate_hz,
+        channel_order=channel_order, load_graphs=load_graphs,
+        use_trials=use_trials, return_masks=return_masks,
+        rate_default=rate_default,
+        return_next_step_targets=return_next_step_targets,
+        roles=roles, species=species, expected_rate_hz=expected_rate_hz,
         strict_rate=strict_rate, normalization=normalization_mode,
         future_steps=future_steps,
         normalization_stats={})

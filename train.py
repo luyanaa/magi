@@ -304,6 +304,20 @@ def build_data_loaders(profile_path: Path, leave_subject_out=None, *,
         region = Path(profile["region_map"])
         loader_kwargs["region_map"] = (
             region if region.is_absolute() else profile_path.parent / region)
+    if profile.get("channel_order_file"):
+        order_path = Path(profile["channel_order_file"])
+        if not order_path.is_absolute():
+            order_path = profile_path.parent / order_path
+        if not order_path.is_file():
+            raise FileNotFoundError(
+                f"channel order file does not exist: {order_path}")
+        channel_order = [
+            line.strip() for line in order_path.read_text().splitlines()
+            if line.strip()
+        ]
+        if not channel_order:
+            raise ValueError("channel_order_file contains no channel ids")
+        loader_kwargs["channel_order"] = channel_order
     loaders = build_species_dataloaders(root, **loader_kwargs)
     if len(loaders) == 3:
         print(f"[Data] Test loader built ({len(loaders[2].dataset)} samples)")
@@ -311,10 +325,11 @@ def build_data_loaders(profile_path: Path, leave_subject_out=None, *,
 
 
 def parse_phases(phase_str: str):
-    """Parse CLI selections into normalized runtime phase mappings.
+    """Normalize phase selectors into runtime phase mappings.
 
-    ``1`` is intentionally a selector for the concrete Stage 1 P1-P6
-    schedule, never a synthetic flat phase with one averaged configuration.
+    ``1`` expands to the concrete Stage 1 P1-P6 schedule. ``p6`` selects
+    only the long-context phase, which is useful when a prior checkpoint is
+    being used as the initialization for an isolated objective pilot.
     """
     selectors = {
         "-1": (get_phase_neg_1,),
@@ -322,6 +337,7 @@ def parse_phases(phase_str: str):
             get_stage_1_p1, get_stage_1_p2, get_stage_1_p3,
             get_stage_1_p4, get_stage_1_p5, get_stage_1_p6,
         ),
+        "p6": (get_stage_1_p6,),
         "2": (lambda: STAGE_TWO_PHASE,),
         "3": (lambda: STAGE_THREE_PHASE,),
     }
@@ -421,6 +437,45 @@ def apply_data_profile_rollout_contract(phases, data_profile):
                 forecast_horizon_weights=horizon_weights,
             )
         resolved.append(runtime_phase)
+    return resolved
+
+
+def apply_data_profile_loss_overrides(phases, data_profile):
+    """Apply bounded objective overrides declared by a data profile."""
+    if not isinstance(data_profile, dict):
+        raise TypeError("data_profile must be a mapping")
+    overrides = {}
+    for name in ("forecast_autocorr", "forecast_crps"):
+        if name not in data_profile:
+            continue
+        value = float(data_profile[name])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"data-profile {name} must be finite and non-negative")
+        overrides[name] = value
+    if not overrides:
+        return phases
+
+    resolved = []
+    crps_enabled = False
+    for phase in phases:
+        runtime_phase = dict(phase)
+        loss_weights = runtime_phase.get("loss_weights")
+        if loss_weights is not None:
+            phase_overrides = dict(overrides)
+            if "forecast_crps" in phase_overrides:
+                if loss_weights.forecast > 0:
+                    crps_enabled |= phase_overrides["forecast_crps"] > 0
+                else:
+                    del phase_overrides["forecast_crps"]
+            if phase_overrides:
+                runtime_phase["loss_weights"] = replace(
+                    loss_weights, **phase_overrides)
+        resolved.append(runtime_phase)
+    if overrides.get("forecast_crps", 0.0) > 0 and not crps_enabled:
+        raise ValueError(
+            "data-profile forecast_crps requires a selected phase with "
+            "forecast loss enabled")
     return resolved
 
 
@@ -618,7 +673,11 @@ def main():
         trainer_config["use_mixer"] = False
         with open(data_path) as fh:
             data_profile = json.load(fh)
+        if data_profile.get("modalities"):
+            trainer_config.setdefault("experiment_data", {})["modalities"] = list(
+                data_profile["modalities"])
         phases = apply_data_profile_rollout_contract(phases, data_profile)
+        phases = apply_data_profile_loss_overrides(phases, data_profile)
         if data_profile.get("roles"):
             trainer_config["modality_roles"] = dict(data_profile["roles"])
             trainer_config.setdefault("experiment_data", {})["roles"] = dict(
@@ -661,6 +720,10 @@ def main():
                 data_profile["recon_loss_types"])
             trainer_config.setdefault("experiment_data", {})[
                 "recon_loss_types"] = dict(data_profile["recon_loss_types"])
+        if data_profile.get("component_forecast"):
+            component_spec = dict(data_profile["component_forecast"])
+            component_spec.setdefault("base_dir", str(data_path.parent))
+            trainer_config["component_forecast"] = component_spec
         summary = (f"{len(train_loader.dataset)} train / "
                    f"{len(val_loader.dataset)} val")
         if test_loader is not None:

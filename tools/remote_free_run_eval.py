@@ -293,6 +293,75 @@ def _fit_tderica_context(context, real, generated, *, dim_embed,
         "motif_roughness_mean": float(np.mean(roughness)) if roughness else None,
         "motif_spatial_coherence_mean": float(np.mean(spatial)) if spatial else None,
     }
+def _load_recording_basis(
+        basis_bank: Path,
+        sample_id: str,
+) -> Tuple[Path, np.ndarray, np.ndarray]:
+    """Load one recording-local basis from a Randi basis bank."""
+    recording_id = str(sample_id).rsplit("__", 1)[-1]
+    candidates = (
+        basis_bank / f"randi_{recording_id}.npz",
+        basis_bank / f"{sample_id}.npz",
+    )
+    basis_path = next((path for path in candidates if path.exists()), None)
+    if basis_path is None:
+        raise FileNotFoundError(
+            f"no recording-local TDE-RICA basis for sample {sample_id!r}; "
+            f"checked {[str(path) for path in candidates]}"
+        )
+    with np.load(basis_path, allow_pickle=False) as values:
+        required = {"coeffEmbed2", "channel_indices"}
+        missing = required.difference(values.files)
+        if missing:
+            raise ValueError(
+                f"{basis_path} is missing basis arrays {sorted(missing)}"
+            )
+        coeff = np.asarray(values["coeffEmbed2"], dtype=float)
+        indices = np.asarray(values["channel_indices"], dtype=np.int64).reshape(-1)
+    if coeff.ndim != 3 or coeff.shape[0] < 1 or coeff.shape[1] < 2:
+        raise ValueError(f"{basis_path} has invalid coefficient shape {coeff.shape}")
+    if coeff.shape[2] != indices.size or indices.size < 2:
+        raise ValueError(
+            f"{basis_path} has incompatible basis channels: "
+            f"{coeff.shape} and {indices.shape}"
+        )
+    if indices.min() < 0 or not np.isfinite(coeff).all():
+        raise ValueError(f"{basis_path} contains invalid indices or coefficients")
+    return basis_path, coeff, indices
+
+
+def _project_recording_basis(
+        signal: np.ndarray,
+        coeff: np.ndarray,
+        channel_indices: np.ndarray,
+        valid_channels: np.ndarray,
+        toolbox_path: Path,
+) -> Tuple[np.ndarray, int]:
+    """Project one signal through a recording-local basis and valid mask."""
+    if signal.ndim != 2:
+        raise ValueError(f"signal must be (T, C); got {signal.shape}")
+    valid_channels = np.asarray(valid_channels, dtype=bool).reshape(-1)
+    if channel_indices.max() >= valid_channels.size:
+        raise ValueError(
+            f"basis channel index {int(channel_indices.max())} exceeds "
+            f"signal channel count {valid_channels.size}"
+        )
+    keep = valid_channels[channel_indices]
+    if int(keep.sum()) < 2:
+        raise ValueError("fewer than two fully observed basis channels")
+    path = str(toolbox_path)
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    from tderica import delayembed, project
+    selected = signal[:, channel_indices[keep]]
+    selected_coeff = coeff[:, :, keep]
+    embedded = delayembed(selected, int(coeff.shape[1]))
+    projected = project(embedded, selected_coeff)
+    if not np.isfinite(projected).all():
+        raise FloatingPointError("recording-local TDE-RICA projection is non-finite")
+    return projected, int(keep.sum())
+
+
 
 
 def main() -> None:
@@ -304,7 +373,11 @@ def main() -> None:
     parser.add_argument("--split", choices=("val", "test"), default="val")
     parser.add_argument("--max-samples", type=int, default=16)
     parser.add_argument("--rollout", type=int, default=3)
-    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
+    parser.add_argument("--device", default="auto", choices=("auto", "cuda"))
+    parser.add_argument(
+        "--tderica-basis-bank", type=Path, default=None,
+        help="recording-local fixed basis bank; bypasses per-window fitting",
+    )
     parser.add_argument("--tderica", type=Path, default=ROOT.parent / "TDE-RICA")
     parser.add_argument("--tderica-dim-embed", type=int, default=12)
     parser.add_argument("--tderica-components", type=int, default=5)
@@ -317,6 +390,10 @@ def main() -> None:
         raise ValueError("max-samples and rollout must be positive")
     if args.tderica_dim_embed < 2 or args.tderica_components < 1:
         raise ValueError("TDE-RICA dimensions must be positive")
+    if args.tderica_basis_bank is not None and not args.tderica_basis_bank.is_dir():
+        raise ValueError(
+            f"TDE-RICA basis bank is not a directory: {args.tderica_basis_bank}"
+        )
 
     device = _device(args.device)
     experiment_config = BrainMoEPINNConfig.from_file(str(args.config))
@@ -409,10 +486,63 @@ def main() -> None:
                 np.std(generated[-tail_frames:], axis=0).mean()
                 / max(np.std(generated[:tail_frames], axis=0).mean(), 1e-12))
             frame_dt_s = float(dt_frame.item())
-            if args.no_tderica_fit:
+            sample_id = _first(batch.get("sample_id"), str(sample_index))
+            origin = _first(batch.get("origin"), "")
+            subject = _first(batch.get("subject"), "")
+            basis_metadata = None
+            if args.tderica_basis_bank is not None:
+                basis_path, basis_coeff, basis_indices = _load_recording_basis(
+                    args.tderica_basis_bank, str(sample_id)
+                )
+                comp_real, basis_used = _project_recording_basis(
+                    real_all, basis_coeff, basis_indices, fit_valid_channels,
+                    args.tderica,
+                )
+                comp_generated, generated_basis_used = _project_recording_basis(
+                    generated_all, basis_coeff, basis_indices, fit_valid_channels,
+                    args.tderica,
+                )
+                comp_persistence, persistence_basis_used = _project_recording_basis(
+                    np.tile(context_all, (args.rollout, 1)), basis_coeff,
+                    basis_indices, fit_valid_channels, args.tderica,
+                )
+                if len({basis_used, generated_basis_used, persistence_basis_used}) != 1:
+                    raise ValueError(
+                        f"basis channel masks diverged for sample {sample_id}: "
+                        f"{basis_used}, {generated_basis_used}, "
+                        f"{persistence_basis_used}"
+                    )
+                projected_model = tderica_biological_report(
+                    comp_real, comp_generated, dt_s=frame_dt_s,
+                    include_d3=not args.no_d3, d3_fast=not args.full_d3,
+                    tderica_path=str(args.tderica),
+                )
+                projected_persistence = tderica_biological_report(
+                    comp_real, comp_persistence, dt_s=frame_dt_s,
+                    include_d3=False, tderica_path=str(args.tderica),
+                )
+                tderica_report = {
+                    **projected_model,
+                    "native": run_free_run_suite(real, generated),
+                }
+                persistence_report = {
+                    **projected_persistence,
+                    "native": run_free_run_suite(real, persistence),
+                }
+                basis_metadata = {
+                    "path": str(basis_path),
+                    "components": int(basis_coeff.shape[0]),
+                    "embed_width": int(basis_coeff.shape[1]),
+                    "basis_channels": int(basis_coeff.shape[2]),
+                    "basis_channels_used": int(basis_used),
+                }
+            elif args.no_tderica_fit:
                 tderica_report = tderica_biological_report(
                     real, generated, dt_s=frame_dt_s, include_d3=not args.no_d3,
                     d3_fast=not args.full_d3, tderica_path=str(args.tderica))
+                persistence_report = tderica_biological_report(
+                    real, persistence, dt_s=frame_dt_s, include_d3=False,
+                    tderica_path=str(args.tderica))
             else:
                 fit_dim = min(args.tderica_dim_embed, max(2, context.shape[0] - 3))
                 fit_points = context.shape[0] - fit_dim + 1
@@ -422,12 +552,9 @@ def main() -> None:
                     context, real, generated, dim_embed=fit_dim,
                     n_components=max(1, fit_components), include_d3=not args.no_d3,
                     d3_fast=not args.full_d3, toolbox_path=args.tderica)
-            persistence_report = tderica_biological_report(
-                real, persistence, dt_s=frame_dt_s, include_d3=False,
-                tderica_path=str(args.tderica))
-            sample_id = _first(batch.get("sample_id"), str(sample_index))
-            origin = _first(batch.get("origin"), "")
-            subject = _first(batch.get("subject"), "")
+                persistence_report = tderica_biological_report(
+                    real, persistence, dt_s=frame_dt_s, include_d3=False,
+                    tderica_path=str(args.tderica))
             reports.append({
                 "index": sample_index, "sample_id": str(sample_id),
                 "origin": str(origin), "subject": str(subject),
@@ -441,6 +568,7 @@ def main() -> None:
                 "generated_tail_std_ratio": generated_tail_ratio,
                 "horizons": _horizon_reports(real_all, generated_all, args.rollout),
                 "model": tderica_report, "persistence": persistence_report,
+                "tderica_basis": basis_metadata,
             })
             if args.save_arrays is not None:
                 np.save(args.save_arrays / f"{sample_index:04d}_real.npy", real.astype("float32"))
@@ -457,7 +585,7 @@ def main() -> None:
         "generated_tail_std_ratio": ("generated_tail_std_ratio",),
         "persistence_native_corr_matrix_mse": ("persistence", "native", "corr_matrix_mse"),
     }
-    if args.no_tderica_fit:
+    if args.no_tderica_fit or args.tderica_basis_bank is not None:
         aggregate_paths.update({
             "tderica_dtw": ("model", "tderica", "time_alignment", "dtw_distance"),
             "tderica_frechet": ("model", "tderica", "time_alignment", "frechet_distance"),
@@ -475,6 +603,12 @@ def main() -> None:
                 "model", "tderica", "dynamics", "transfer_entropy_a_to_b"),
             "tderica_transfer_entropy_b_to_a": (
                 "model", "tderica", "dynamics", "transfer_entropy_b_to_a"),
+            "tderica_jacobian_distance": (
+                "model", "tderica", "dynamics", "local_jacobian", "jacobian_distance"),
+            "tderica_expansion_diff": (
+                "model", "tderica", "dynamics", "local_jacobian", "expansion_diff"),
+            "tderica_rotation_diff": (
+                "model", "tderica", "dynamics", "local_jacobian", "rotation_diff"),
         })
     else:
         aggregate_paths.update({
@@ -511,7 +645,18 @@ def main() -> None:
     output = {
         "checkpoint": str(args.checkpoint), "split": args.split,
         "device": str(device), "rollout_windows": args.rollout,
-        "n_samples": len(reports), "tderica_context_fit": not args.no_tderica_fit,
+        "n_samples": len(reports),
+        "tderica_context_fit": (
+            not args.no_tderica_fit and args.tderica_basis_bank is None
+        ),
+        "tderica_basis_mode": (
+            "recording_local_fixed"
+            if args.tderica_basis_bank is not None else None
+        ),
+        "tderica_basis_bank": (
+            str(args.tderica_basis_bank)
+            if args.tderica_basis_bank is not None else None
+        ),
         "checkpoint_info": checkpoint_info,
         "n_skipped": len(skipped),
         "skipped": skipped,

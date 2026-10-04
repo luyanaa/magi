@@ -6,10 +6,84 @@ reverse process, diffusion convention, reversal map, and boundary densities.
 """
 
 from dataclasses import dataclass
+import math
 from typing import Callable, Dict, Optional
 
 import torch
 from torch import Tensor
+
+
+
+def sample_low_rank_transition(
+    mean: Tensor,
+    factor: Tensor,
+    diagonal_std: Tensor,
+    dt,
+    *,
+    factor_noise: Optional[Tensor] = None,
+    diagonal_noise: Optional[Tensor] = None,
+) -> Tensor:
+    """Sample ``N(mean, dt * (factor factor.T + diag(diagonal_std**2)))``.
+
+    ``factor`` is a covariance square-root factor ``(B,D,R)``, not a
+    covariance-rate matrix. ``diagonal_std`` is the residual standard-
+    deviation rate ``(B,D)``. ``dt`` may be a positive scalar or one positive
+    duration per batch row, shaped ``(B,)`` or ``(B,1)``.
+    """
+    if mean.dim() != 2:
+        raise ValueError("mean must have shape (B, D)")
+    batch_size = mean.shape[0]
+    if (factor.dim() != 3 or factor.shape[:2] != mean.shape
+            or factor.shape[-1] <= 0):
+        raise ValueError("factor must have shape (B, D, R)")
+    if diagonal_std.shape != mean.shape:
+        raise ValueError("diagonal_std must have shape (B, D)")
+    if factor.device != mean.device or factor.dtype != mean.dtype:
+        raise ValueError("factor must match mean device and dtype")
+    if diagonal_std.device != mean.device or diagonal_std.dtype != mean.dtype:
+        raise ValueError("diagonal_std must match mean device and dtype")
+
+    if isinstance(dt, Tensor):
+        step = dt.detach().to(device=mean.device, dtype=mean.dtype)
+        if step.dim() == 1:
+            if step.shape[0] != batch_size:
+                raise ValueError(
+                    "dt must be scalar or have one value per batch row")
+            step = step.unsqueeze(-1)
+        elif step.dim() == 2 and step.shape != (batch_size, 1):
+            raise ValueError("dt must be scalar or have one value per batch row")
+        elif step.dim() > 2:
+            raise ValueError("dt must be scalar or have one value per batch row")
+        if not bool(torch.isfinite(step).all() and (step > 0).all()):
+            raise ValueError("dt values must be finite and positive")
+        root_dt = torch.sqrt(step)
+    else:
+        step = float(dt)
+        if not math.isfinite(step) or step <= 0:
+            raise ValueError("dt must be finite and positive")
+        root_dt = math.sqrt(step)
+
+    rank = factor.shape[-1]
+    if factor_noise is None:
+        factor_noise = torch.randn(
+            batch_size, rank, device=mean.device, dtype=mean.dtype)
+    if diagonal_noise is None:
+        diagonal_noise = torch.randn_like(mean)
+    if factor_noise.shape != (batch_size, rank):
+        raise ValueError("factor_noise must have shape (B, R)")
+    if diagonal_noise.shape != mean.shape:
+        raise ValueError("diagonal_noise must have shape (B, D)")
+    if factor_noise.device != mean.device or factor_noise.dtype != mean.dtype:
+        raise ValueError("factor_noise must match mean device and dtype")
+    if (diagonal_noise.device != mean.device
+            or diagonal_noise.dtype != mean.dtype):
+        raise ValueError("diagonal_noise must match mean device and dtype")
+
+    correlated_noise = torch.bmm(
+        factor, factor_noise.unsqueeze(-1)).squeeze(-1)
+    increment = correlated_noise + diagonal_std * diagonal_noise
+    return mean + root_dt * increment
+
 
 
 @dataclass(frozen=True)
